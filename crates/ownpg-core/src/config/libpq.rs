@@ -22,6 +22,8 @@ pub struct LibpqLayer {
     pub service: Option<String>,
     pub sslmode: Option<SslMode>,
     pub sslrootcert: Option<PathBuf>,
+    pub sslcert: Option<PathBuf>,
+    pub sslkey: Option<PathBuf>,
     pub connect_timeout: Option<Duration>,
     pub channel_binding: Option<ChannelBinding>,
     pub application_name: Option<String>,
@@ -44,6 +46,8 @@ impl LibpqLayer {
             ("PGSERVICE", "service"),
             ("PGSSLMODE", "sslmode"),
             ("PGSSLROOTCERT", "sslrootcert"),
+            ("PGSSLCERT", "sslcert"),
+            ("PGSSLKEY", "sslkey"),
             ("PGCONNECT_TIMEOUT", "connect_timeout"),
             ("PGCHANNELBINDING", "channel_binding"),
             ("PGAPPNAME", "application_name"),
@@ -83,6 +87,8 @@ impl LibpqLayer {
                     })?);
                 }
                 "sslrootcert" => layer.sslrootcert = Some(PathBuf::from(value)),
+                "sslcert" => layer.sslcert = Some(PathBuf::from(value)),
+                "sslkey" => layer.sslkey = Some(PathBuf::from(value)),
                 "connect_timeout" => {
                     let seconds: u64 = value.parse().map_err(|_| Error::ConfigInvalid {
                         setting: "connect_timeout".to_owned(),
@@ -122,6 +128,8 @@ impl LibpqLayer {
             service: self.service.or(lower.service),
             sslmode: self.sslmode.or(lower.sslmode),
             sslrootcert: self.sslrootcert.or(lower.sslrootcert),
+            sslcert: self.sslcert.or(lower.sslcert),
+            sslkey: self.sslkey.or(lower.sslkey),
             connect_timeout: self.connect_timeout.or(lower.connect_timeout),
             channel_binding: self.channel_binding.or(lower.channel_binding),
             application_name: self.application_name.or(lower.application_name),

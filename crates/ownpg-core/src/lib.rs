@@ -1,5 +1,6 @@
 pub mod classify;
 pub mod config;
+pub mod connect;
 pub mod error;
 
 pub use classify::statement_count;

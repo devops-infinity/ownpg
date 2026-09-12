@@ -333,6 +333,8 @@ pub struct ConnectionSettings {
     pub password: Option<Resolved<Secret>>,
     pub sslmode: Resolved<SslMode>,
     pub sslrootcert: Option<Resolved<PathBuf>>,
+    pub sslcert: Option<Resolved<PathBuf>>,
+    pub sslkey: Option<Resolved<PathBuf>>,
     pub channel_binding: Resolved<ChannelBinding>,
     pub connect_timeout: Resolved<Duration>,
     pub application_name: Resolved<String>,

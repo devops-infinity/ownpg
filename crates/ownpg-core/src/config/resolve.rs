@@ -394,6 +394,16 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
     )
     .with_libpq(libpq_layer.sslrootcert.clone())
     .resolve();
+    let sslcert = Pick::new(
+        None,
+        env_path(env, "OWNPG_SSLCERT"),
+        profile.sslcert.clone(),
+    )
+    .with_libpq(libpq_layer.sslcert.clone())
+    .resolve();
+    let sslkey = Pick::new(None, env_path(env, "OWNPG_SSLKEY"), profile.sslkey.clone())
+        .with_libpq(libpq_layer.sslkey.clone())
+        .resolve();
     let channel_binding = Pick::new(None, None, profile.channel_binding)
         .with_libpq(libpq_layer.channel_binding)
         .or_preset(ChannelBinding::Prefer);
@@ -549,6 +559,8 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
             password,
             sslmode,
             sslrootcert,
+            sslcert,
+            sslkey,
             channel_binding,
             connect_timeout,
             application_name,

@@ -51,6 +51,10 @@ pub struct ProfileEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sslrootcert: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sslcert: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sslkey: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_binding: Option<ChannelBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_timeout_seconds: Option<u64>,
