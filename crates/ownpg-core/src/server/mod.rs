@@ -52,6 +52,7 @@ pub struct RoundTrip {
     pub request_state: Option<String>,
     pub input_responses: Option<rmcp::model::InputResponses>,
     pub elicitation: bool,
+    pub progress: Option<tools::Progress>,
 }
 
 pub struct Server {
@@ -150,6 +151,7 @@ impl Server {
             request_state: round_trip.request_state,
             input_responses: round_trip.input_responses,
             elicitation: round_trip.elicitation,
+            progress: round_trip.progress,
         };
         let mut work = std::pin::pin!((route.handler)(call));
         let outcome = tokio::select! {
@@ -315,10 +317,18 @@ impl ServerHandler for Server {
             && context
                 .client_capabilities()
                 .is_some_and(|capabilities| capabilities.elicitation.is_some());
+        let progress = context
+            .meta
+            .get_progress_token()
+            .map(|token| tools::Progress {
+                peer: context.peer.clone(),
+                token,
+            });
         let round_trip = RoundTrip {
             request_state: request.request_state,
             input_responses: request.input_responses,
             elicitation,
+            progress,
         };
         let outcome = self
             .call(&name, arguments, request_id, context.ct.clone(), round_trip)

@@ -2,6 +2,8 @@ pub mod catalog;
 pub mod confirm;
 pub mod ddl;
 pub mod health;
+pub mod maintenance;
+pub mod monitoring;
 pub mod objects;
 pub mod read;
 pub mod roles;
@@ -37,6 +39,23 @@ pub struct Context {
 }
 
 #[derive(Debug, Clone)]
+pub struct Progress {
+    pub peer: rmcp::service::Peer<rmcp::RoleServer>,
+    pub token: rmcp::model::ProgressToken,
+}
+
+impl Progress {
+    pub async fn report(&self, progress: f64, total: Option<f64>, message: String) {
+        let mut param = rmcp::model::ProgressNotificationParam::new(self.token.clone(), progress);
+        param.total = total;
+        param.message = Some(message);
+        if let Err(error) = self.peer.notify_progress(param).await {
+            tracing::debug!(%error, "a progress notification was not delivered");
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Call {
     pub context: Context,
     pub arguments: JsonObject,
@@ -44,6 +63,7 @@ pub struct Call {
     pub request_state: Option<String>,
     pub input_responses: Option<InputResponses>,
     pub elicitation: bool,
+    pub progress: Option<Progress>,
 }
 
 impl Call {
@@ -323,6 +343,8 @@ pub fn all_routes() -> Result<Vec<Route>, Error> {
     routes.extend(transaction::routes()?);
     routes.extend(ddl::routes()?);
     routes.extend(roles::routes()?);
+    routes.extend(maintenance::routes()?);
+    routes.extend(monitoring::routes()?);
     Ok(routes)
 }
 

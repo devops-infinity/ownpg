@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -684,6 +685,19 @@ impl Engine {
         handle: Option<&str>,
         outside_transaction: bool,
     ) -> Result<ResultSet> {
+        self.run_write_with(sql, caps, principal, handle, outside_transaction, None)
+            .await
+    }
+
+    pub async fn run_write_with(
+        &self,
+        sql: &str,
+        caps: Caps,
+        principal: &str,
+        handle: Option<&str>,
+        outside_transaction: bool,
+        timeout: Option<Duration>,
+    ) -> Result<ResultSet> {
         if let Some(id) = handle {
             if outside_transaction {
                 return Err(Error::StatementRefused {
@@ -703,7 +717,10 @@ impl Engine {
                     state: "lost".to_owned(),
                 });
             }
-            let result = guarded_statement(&primary.lane.session, sql, caps).await;
+            let result = timed(&primary.lane.session, timeout, true, || {
+                guarded_statement(&primary.lane.session, sql, caps)
+            })
+            .await;
             let expiry = self.settings.limits.handle_expiry.value;
             if primary.lane.session.client.is_closed() {
                 if let Some(handle) = primary.write.take() {
@@ -727,7 +744,10 @@ impl Engine {
         sweep_expired(&mut primary.lane).await?;
         finish_if_idle(&mut primary.lane).await?;
         if !primary.lane.in_read_transaction {
-            return autocommit_statement(&primary.lane.session, sql, caps).await;
+            return timed(&primary.lane.session, timeout, false, || {
+                autocommit_statement(&primary.lane.session, sql, caps)
+            })
+            .await;
         }
         drop(primary);
         let mut slot = self.secondary.lock().await;
@@ -744,7 +764,40 @@ impl Engine {
                     .to_owned(),
             });
         }
-        autocommit_statement(&lane.session, sql, caps).await
+        timed(&lane.session, timeout, false, || {
+            autocommit_statement(&lane.session, sql, caps)
+        })
+        .await
+    }
+
+    pub async fn primary_backend_pid(&self) -> Result<i32> {
+        let primary = self.primary.lock().await;
+        let rows = query_rows(
+            &primary.lane.session,
+            "SELECT pg_catalog.pg_backend_pid()",
+            &[],
+        )
+        .await?;
+        rows.first()
+            .map(|row| row.try_get::<_, i32>(0))
+            .transpose()
+            .map_err(|error| describe_sqlstate(&error))?
+            .ok_or_else(|| Error::ProtocolFailed {
+                detail: "the backend pid could not be read".to_owned(),
+            })
+    }
+
+    pub async fn secondary_rows(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<tokio_postgres::Row>> {
+        let mut slot = self.secondary.lock().await;
+        self.ensure_secondary(&mut slot).await?;
+        let lane = slot.as_ref().ok_or_else(|| Error::ProtocolFailed {
+            detail: "the second connection is missing".to_owned(),
+        })?;
+        query_rows(&lane.session, sql, params).await
     }
 
     pub async fn copy_in(
@@ -1224,6 +1277,41 @@ async fn guarded_statement(session: &Session, sql: &str, caps: Caps) -> Result<R
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     Ok(collect_messages(messages, caps))
+}
+
+async fn timed<F, Fut>(
+    session: &Session,
+    timeout: Option<Duration>,
+    local: bool,
+    run: F,
+) -> Result<ResultSet>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<ResultSet>>,
+{
+    let Some(timeout) = timeout else {
+        return run().await;
+    };
+    let scope = if local { "SET LOCAL" } else { "SET" };
+    session
+        .client
+        .batch_execute(&format!(
+            "{scope} statement_timeout = '{}ms'",
+            timeout.as_millis()
+        ))
+        .await
+        .map_err(|error| describe_sqlstate(&error))?;
+    let result = run().await;
+    if !local && !session.client.is_closed() {
+        let reset = session
+            .client
+            .batch_execute("RESET statement_timeout")
+            .await;
+        if let Err(error) = reset {
+            tracing::warn!(%error, "statement_timeout could not be reset");
+        }
+    }
+    result
 }
 
 async fn autocommit_statement(session: &Session, sql: &str, caps: Caps) -> Result<ResultSet> {

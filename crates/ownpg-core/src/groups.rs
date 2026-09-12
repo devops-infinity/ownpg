@@ -192,6 +192,53 @@ pub const PG_PRIVILEGES: ToolSpec = write_tool(
     true,
 );
 
+const fn maintenance_tool(name: &'static str, title: &'static str, destructive: bool) -> ToolSpec {
+    write_tool(name, title, ToolGroup::Maintenance, destructive, true)
+}
+
+const fn monitoring_tool(name: &'static str, title: &'static str) -> ToolSpec {
+    ToolSpec {
+        name,
+        title,
+        group: Some(ToolGroup::Monitoring),
+        modes: READ_MODES,
+        scope: SCOPE_READ,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+    }
+}
+
+pub const PG_VACUUM: ToolSpec = maintenance_tool("pg_vacuum", "Run VACUUM or CHECKPOINT", true);
+pub const PG_ANALYZE: ToolSpec = maintenance_tool("pg_analyze", "Run ANALYZE", false);
+pub const PG_REINDEX: ToolSpec = maintenance_tool("pg_reindex", "Rebuild indexes", false);
+pub const PG_REFRESH: ToolSpec =
+    maintenance_tool("pg_refresh", "Refresh a materialized view", false);
+pub const PG_VACUUM_NEEDS: ToolSpec = ToolSpec {
+    name: "pg_vacuum_needs",
+    title: "Report tables that need a vacuum",
+    group: Some(ToolGroup::Maintenance),
+    modes: WRITE_MODES,
+    scope: SCOPE_MAINTENANCE,
+    read_only: true,
+    destructive: false,
+    idempotent: true,
+};
+pub const PG_BACKEND: ToolSpec =
+    maintenance_tool("pg_backend", "Cancel or terminate a backend", true);
+pub const PG_ACTIVITY: ToolSpec = monitoring_tool("pg_activity", "List running sessions");
+pub const PG_LOCKS: ToolSpec = monitoring_tool("pg_locks", "List lock waits and blockers");
+pub const PG_REPLICATION: ToolSpec = monitoring_tool("pg_replication", "Report replication state");
+pub const PG_WAL: ToolSpec = monitoring_tool("pg_wal", "Report WAL and checkpoint activity");
+pub const PG_INDEXES_HEALTH: ToolSpec = monitoring_tool(
+    "pg_indexes_health",
+    "Find invalid, duplicate, and unused indexes",
+);
+pub const PG_BLOAT: ToolSpec = monitoring_tool("pg_bloat", "Estimate table and index bloat");
+pub const PG_SETTINGS: ToolSpec = monitoring_tool("pg_settings", "List server settings");
+pub const PG_TOP_QUERIES: ToolSpec =
+    monitoring_tool("pg_top_queries", "List the most expensive statements");
+
 pub const TOOLS: &[ToolSpec] = &[
     PG_LIST_OBJECTS,
     PG_DESCRIBE,
@@ -222,6 +269,20 @@ pub const TOOLS: &[ToolSpec] = &[
     PG_GRANT,
     PG_POLICY,
     PG_PRIVILEGES,
+    PG_VACUUM,
+    PG_ANALYZE,
+    PG_REINDEX,
+    PG_REFRESH,
+    PG_VACUUM_NEEDS,
+    PG_BACKEND,
+    PG_ACTIVITY,
+    PG_LOCKS,
+    PG_REPLICATION,
+    PG_WAL,
+    PG_INDEXES_HEALTH,
+    PG_BLOAT,
+    PG_SETTINGS,
+    PG_TOP_QUERIES,
 ];
 
 #[must_use]
