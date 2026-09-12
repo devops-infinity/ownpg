@@ -387,6 +387,31 @@ mod tests {
         assert!(lines[0].contains("chain-start"));
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(second["v"], 1);
+        let keys: Vec<&str> = second
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for expected in [
+            "v",
+            "request_id",
+            "timestamp",
+            "tool",
+            "mode",
+            "transport",
+            "principal",
+            "principal_kind",
+            "database",
+            "schema",
+            "decision",
+            "duration_ms",
+            "truncated",
+            "superuser",
+            "prev",
+        ] {
+            assert!(keys.contains(&expected), "{expected} missing from {keys:?}");
+        }
         assert_eq!(second["tool"], "pg_run_query");
         assert_eq!(second["decision"], "allowed");
         assert_eq!(second["principal_kind"], "local");

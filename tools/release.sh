@@ -609,8 +609,76 @@ build_dist_artifacts() {
 				die "that did not match $VERSION; crates.io and the tag are already live, finish the binaries by hand when ready"
 		fi
 	fi
+	build_mcpb_bundles "${built[@]}"
 	run "dist build --artifacts=global" dist build --tag="v$VERSION" --artifacts=global --no-local-paths
 	cp -- "$ATTRIBUTION" target/distrib/ || die "could not place $ATTRIBUTION next to the archives"
+}
+
+mcpb_platform() {
+	case "$1" in
+	aarch64-apple-darwin) printf 'darwin arm64\n' ;;
+	x86_64-apple-darwin) printf 'darwin x64\n' ;;
+	x86_64-unknown-linux-gnu) printf 'linux x64\n' ;;
+	aarch64-unknown-linux-gnu) printf 'linux arm64\n' ;;
+	x86_64-pc-windows-msvc) printf 'win32 x64\n' ;;
+	aarch64-pc-windows-msvc) printf 'win32 arm64\n' ;;
+	*) return 1 ;;
+	esac
+}
+
+build_mcpb_bundles() {
+	local target archive platform arch stage bundle binary
+	local -a bundles=()
+	for target in "$@"; do
+		if ! read -r platform arch < <(mcpb_platform "$target" || true); then
+			say INFO "$target has no MCPB platform; skipping the bundle"
+			continue
+		fi
+		stage="$WORK/mcpb-$target"
+		rm -rf -- "$stage"
+		mkdir -p -- "$stage/bin"
+		case "$platform" in
+		win32)
+			archive="target/distrib/$BIN_CRATE-$target.zip"
+			binary="$BIN_CRATE.exe"
+			[[ -f "$archive" ]] || die "$archive is missing; dist did not produce the Windows archive for $target"
+			unzip -q -o -j "$archive" "$binary" -d "$stage/bin" || die "could not extract $binary from $archive"
+			;;
+		*)
+			archive="target/distrib/$BIN_CRATE-$target.tar.gz"
+			binary="$BIN_CRATE"
+			[[ -f "$archive" ]] || die "$archive is missing; dist did not produce the archive for $target"
+			tar -xzf "$archive" -C "$stage/bin" --strip-components=1 "$BIN_CRATE-$target/$binary" || die "could not extract $binary from $archive"
+			chmod 0755 "$stage/bin/$binary"
+			;;
+		esac
+		jq --arg version "$VERSION" --arg platform "$platform" --arg entry "bin/$binary" \
+			'.version = $version | .compatibility.platforms = [$platform] | .server.entry_point = $entry | .server.mcp_config.command = ("${__dirname}/" + $entry)' \
+			mcpb/manifest.json >"$stage/manifest.json" || die "could not write the manifest for $target"
+		run "mcpb validate ($target)" mcpb validate "$stage/manifest.json"
+		bundle="target/distrib/$BIN_CRATE-$VERSION-$platform-$arch.mcpb"
+		run "mcpb pack ($target)" mcpb pack "$stage" "$bundle"
+		[[ -f "$bundle" ]] || die "mcpb did not write $bundle"
+		bundles+=("$bundle")
+	done
+	[[ ${#bundles[@]} -gt 0 ]] || die "no MCPB bundle was built"
+	say SUCCESS "built ${#bundles[@]} MCPB bundle(s)"
+}
+
+write_server_json() {
+	local bundle name sha packages
+	packages="$(jq -c --arg version "$VERSION" '.packages | map(select(.registryType == "cargo") | .version = $version)' server.json)"
+	shopt -s nullglob
+	for bundle in target/distrib/*.mcpb; do
+		name="$(basename "$bundle")"
+		sha="$(shasum -a 256 "$bundle" | awk '{print $1}')"
+		packages="$(jq -c --arg version "$VERSION" --arg url "https://github.com/$PUBLIC_RELEASE_REPO/releases/download/v$VERSION/$name" --arg sha "$sha" \
+			'. + [{registryType: "mcpb", registryBaseUrl: "https://github.com", identifier: $url, version: $version, fileSha256: $sha, transport: {type: "stdio"}}]' <<<"$packages")"
+	done
+	shopt -u nullglob
+	jq --arg version "$VERSION" --argjson packages "$packages" '.version = $version | .packages = $packages' server.json >"$WORK/server.json" || die "could not rewrite server.json"
+	mv -- "$WORK/server.json" server.json
+	say SUCCESS "server.json carries $VERSION and $(jq '.packages | length' server.json) package entries"
 }
 
 sign_checksums() {
@@ -831,7 +899,7 @@ unyank)
 esac
 
 step "pre-flight"
-require_tools git cargo curl jq awk cargo-nextest cargo-audit cargo-deny cargo-machete cargo-about cargo-auditable cargo-cyclonedx dist gh minisign
+require_tools git cargo curl jq awk shasum unzip tar cargo-nextest cargo-audit cargo-deny cargo-machete cargo-about cargo-auditable cargo-cyclonedx dist gh minisign mcpb
 [[ -z "$(git status --porcelain)" ]] || die "the working tree is not clean; commit or stash first"
 say SUCCESS "working tree is clean"
 current_branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -972,6 +1040,10 @@ build_dist_artifacts
 
 step "signature"
 sign_checksums
+
+step "registry manifest"
+write_server_json
+say INFO "publish to the MCP Registry by hand once the release is up: mcp-publisher login github && mcp-publisher publish"
 
 step "GitHub Release"
 publish_github_release ""

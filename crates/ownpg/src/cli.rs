@@ -192,7 +192,7 @@ pub(crate) struct ConnectionArgs {
         long,
         value_name = "GROUPS",
         value_delimiter = ',',
-        help = "Extra tool groups to load: ddl, roles, maintenance, monitoring, host [env: OWNPG_TOOLS]"
+        help = "Extra tool groups to load: write, transactions, ddl, roles, maintenance, monitoring, host [env: OWNPG_TOOLS]"
     )]
     pub tools: Vec<String>,
 

@@ -366,6 +366,36 @@ mod tests {
     }
 
     #[test]
+    fn a_format_one_file_written_by_the_first_release_still_loads() {
+        let text = r#"format = 1
+
+[profiles.local]
+database = "app"
+schema = "public"
+mode = "read-only"
+host = "127.0.0.1"
+port = 5432
+user = "app"
+tools = ["monitoring"]
+
+[profiles.local.http]
+bind = "127.0.0.1:8765"
+auth = "bearer"
+tokens_file = "/etc/ownpg/tokens"
+"#;
+        let (_dir, path) = temp_file("profiles.toml", text);
+        let loaded = ProfileFile::load(&path).unwrap().unwrap();
+        assert_eq!(loaded.format, Some(PROFILE_FORMAT));
+        let local = loaded.profile("local", &path).unwrap();
+        assert_eq!(local.database.as_deref(), Some("app"));
+        assert_eq!(local.mode, Some(Mode::ReadOnly));
+        assert_eq!(
+            local.http.as_ref().and_then(|http| http.auth),
+            Some(super::super::http::AuthMode::Bearer)
+        );
+    }
+
+    #[test]
     fn a_missing_format_reads_as_the_current_one() {
         let (_dir, path) = temp_file("profiles.toml", "[profiles.a]\ndatabase = \"x\"\n");
         let loaded = ProfileFile::load(&path).unwrap().unwrap();

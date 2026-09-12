@@ -1,0 +1,127 @@
+{
+  "manifest_version": "0.4",
+  "name": "ownpg",
+  "display_name": "OwnPG",
+  "version": "0.1.0",
+  "description": "PostgreSQL DBA tools over MCP, scoped to one database and one schema.",
+  "long_description": "OwnPG connects Claude Desktop to one PostgreSQL database and one schema. Every statement is parsed and classified before it runs, the access mode decides what is allowed, destructive changes ask for confirmation, and an append-only audit log records every call.",
+  "author": {
+    "name": "Md. Sazzad Hossain Sharkar",
+    "email": "sazzad@devops.bd",
+    "url": "https://github.com/SHSharkar"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/devops-infinity/ownpg-releases"
+  },
+  "homepage": "https://github.com/devops-infinity/ownpg-releases",
+  "support": "https://github.com/devops-infinity/ownpg-releases/issues",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["postgresql", "postgres", "database", "dba", "sql"],
+  "server": {
+    "type": "binary",
+    "entry_point": "bin/ownpg",
+    "mcp_config": {
+      "command": "${__dirname}/bin/ownpg",
+      "args": [
+        "serve",
+        "--no-input",
+        "--mode",
+        "${user_config.mode}",
+        "--database",
+        "${user_config.database}",
+        "--schema",
+        "${user_config.schema}",
+        "--host",
+        "${user_config.host}",
+        "--port",
+        "${user_config.port}",
+        "--user",
+        "${user_config.user}"
+      ],
+      "env": {
+        "OWNPG_PASSWORD": "${user_config.password}",
+        "OWNPG_TOOLS": "${user_config.tools}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "pg_list_objects", "description": "List objects in the scoped schema" },
+    { "name": "pg_describe", "description": "Describe one database object" },
+    { "name": "pg_run_query", "description": "Run one read statement" },
+    { "name": "pg_count", "description": "Count rows in a table" },
+    { "name": "pg_explain", "description": "Explain a statement's plan" },
+    { "name": "pg_health", "description": "Summarize server health" },
+    { "name": "pg_doctor", "description": "Report the connection and its settings" }
+  ],
+  "tools_generated": true,
+  "prompts": [
+    { "name": "diagnose_slow_query", "description": "Diagnose a slow query", "arguments": ["sql", "goal"], "text": "Diagnose why one statement is slow and what would make it faster." },
+    { "name": "review_indexes", "description": "Review indexes for a table", "arguments": ["table"], "text": "Review the indexes of one table." },
+    { "name": "plan_column_change", "description": "Plan a safe column change", "arguments": ["table", "column", "change"], "text": "Plan a column change that keeps the table available." }
+  ],
+  "prompts_generated": true,
+  "user_config": {
+    "database": {
+      "type": "string",
+      "title": "Database",
+      "description": "The one database this server manages.",
+      "required": true
+    },
+    "schema": {
+      "type": "string",
+      "title": "Schema",
+      "description": "The one schema this server manages.",
+      "default": "public",
+      "required": true
+    },
+    "mode": {
+      "type": "string",
+      "title": "Access mode",
+      "description": "read-only, write-only, or read-write.",
+      "default": "read-only",
+      "required": true
+    },
+    "host": {
+      "type": "string",
+      "title": "Host",
+      "description": "Host name, address, or Unix socket directory.",
+      "default": "127.0.0.1",
+      "required": true
+    },
+    "port": {
+      "type": "number",
+      "title": "Port",
+      "description": "PostgreSQL port.",
+      "default": 5432,
+      "min": 1,
+      "max": 65535,
+      "required": true
+    },
+    "user": {
+      "type": "string",
+      "title": "Role",
+      "description": "The PostgreSQL role to connect as.",
+      "required": true
+    },
+    "password": {
+      "type": "string",
+      "title": "Password",
+      "description": "The role's password; left empty when the server trusts the connection.",
+      "sensitive": true,
+      "required": false,
+      "default": ""
+    },
+    "tools": {
+      "type": "string",
+      "title": "Extra tool groups",
+      "description": "Comma separated groups to load beyond the default set: write, transactions, ddl, roles, maintenance, monitoring, host.",
+      "required": false,
+      "default": ""
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "win32", "linux"]
+  }
+}

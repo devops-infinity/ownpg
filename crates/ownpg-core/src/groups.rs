@@ -23,6 +23,26 @@ pub struct ToolSpec {
     pub destructive: bool,
     pub idempotent: bool,
     pub program: Option<&'static str>,
+    pub deprecated: Option<Deprecation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deprecation {
+    pub replacement: &'static str,
+    pub removed_in: &'static str,
+}
+
+impl ToolSpec {
+    #[must_use]
+    pub fn description(&self, description: &'static str) -> std::borrow::Cow<'static, str> {
+        match self.deprecated {
+            Some(deprecation) => std::borrow::Cow::Owned(format!(
+                "Deprecated: use {} instead; this tool is removed in {}. {description}",
+                deprecation.replacement, deprecation.removed_in
+            )),
+            None => std::borrow::Cow::Borrowed(description),
+        }
+    }
 }
 
 impl ToolSpec {
@@ -70,6 +90,7 @@ const fn read_tool(name: &'static str, title: &'static str, modes: &'static [Mod
         destructive: false,
         idempotent: true,
         program: None,
+        deprecated: None,
     }
 }
 
@@ -90,6 +111,7 @@ const fn write_tool(
         destructive,
         idempotent,
         program: None,
+        deprecated: None,
     }
 }
 
@@ -214,6 +236,7 @@ const fn monitoring_tool(name: &'static str, title: &'static str) -> ToolSpec {
         destructive: false,
         idempotent: true,
         program: None,
+        deprecated: None,
     }
 }
 
@@ -232,6 +255,7 @@ pub const PG_VACUUM_NEEDS: ToolSpec = ToolSpec {
     destructive: false,
     idempotent: true,
     program: None,
+    deprecated: None,
 };
 pub const PG_BACKEND: ToolSpec =
     maintenance_tool("pg_backend", "Cancel or terminate a backend", true);
@@ -266,6 +290,7 @@ const fn host_tool(
         destructive,
         idempotent: !destructive,
         program: Some(program),
+        deprecated: None,
     }
 }
 
@@ -391,6 +416,29 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn a_deprecated_tool_names_its_replacement_and_removal_version_first() {
+        let retired = ToolSpec {
+            deprecated: Some(Deprecation {
+                replacement: "pg_run_query",
+                removed_in: "2.0.0",
+            }),
+            ..PG_COUNT
+        };
+        let text = retired.description("Count rows in a table.");
+        assert!(
+            text.starts_with(
+                "Deprecated: use pg_run_query instead; this tool is removed in 2.0.0. "
+            )
+        );
+        assert!(text.ends_with("Count rows in a table."));
+        assert_eq!(
+            PG_COUNT.description("Count rows in a table."),
+            "Count rows in a table."
+        );
+        assert!(TOOLS.iter().all(|tool| tool.deprecated.is_none()));
+    }
 
     #[test]
     fn every_tool_appears_once_with_the_prefix_and_a_short_name() {

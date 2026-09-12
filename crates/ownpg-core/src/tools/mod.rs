@@ -313,7 +313,7 @@ where
     let input_schema = schema_for_input::<P>().map_err(|reason| Error::ProtocolFailed {
         detail: format!("the input schema of {} is invalid: {reason}", spec.name),
     })?;
-    let tool = Tool::new(spec.name, description, input_schema)
+    let tool = Tool::new(spec.name, spec.description(description), input_schema)
         .with_title(spec.title)
         .with_raw_output_schema(schema_for_output::<O>())
         .with_annotations(spec.annotations());

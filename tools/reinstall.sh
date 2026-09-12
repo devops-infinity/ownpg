@@ -109,9 +109,8 @@ fi
 
 if [[ $KEEP_CACHE -eq 0 ]]; then
 	for cache in \
-		"${XDG_CACHE_HOME:-$HOME/.cache}/devops.bd/ownpg" \
-		"$HOME/Library/Caches/devops.bd/ownpg" \
-		"${LOCALAPPDATA:-$HOME/AppData/Local}/devops.bd/ownpg"; do
+		"${XDG_CACHE_HOME:-$HOME/.cache}/ownpg" \
+		"${LOCALAPPDATA:-$HOME/AppData/Local}/devops/ownpg/cache"; do
 		if [[ -d "$cache" ]]; then
 			rm -rf "$cache" && say INFO "cleared cache $cache"
 		fi
