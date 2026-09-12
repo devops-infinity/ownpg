@@ -180,6 +180,10 @@ pub fn describe(settings: &Settings) -> Vec<SettingLine> {
         "audit_max_bytes",
         &settings.audit.max_bytes,
     ));
+    lines.push(SettingLine::resolved(
+        "audit_keep_files",
+        &settings.audit.keep_files,
+    ));
     lines.push(SettingLine::path("pg_bindir", settings.pg_bindir.as_ref()));
     lines.push(SettingLine::path(
         "output_dir",

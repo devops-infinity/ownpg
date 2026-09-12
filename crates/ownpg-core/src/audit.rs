@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 
 pub const FORMAT_VERSION: u32 = 1;
 const CHAIN_START: &str = "chain-start";
+const TAIL_SCAN_BYTES: u64 = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,9 +77,13 @@ pub struct Entry {
     pub rule: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handle_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_id: Option<String>,
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub row_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_affected: Option<u64>,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
@@ -104,6 +109,7 @@ struct Marker<'a> {
     process: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     rotated_from: Option<&'a str>,
+    prev: &'a str,
 }
 
 pub const SHORT_STATEMENT_CAP: usize = 200;
@@ -114,12 +120,14 @@ struct OpenLog {
     path: PathBuf,
     written: u64,
     prev: String,
+    rotated_away: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct Sink {
     inner: Mutex<Option<OpenLog>>,
     max_bytes: u64,
+    keep_files: u32,
     base: PathBuf,
     enabled: bool,
 }
@@ -165,6 +173,7 @@ impl Sink {
         Self {
             inner: Mutex::new(None),
             max_bytes: 0,
+            keep_files: 0,
             base: PathBuf::new(),
             enabled: false,
         }
@@ -182,9 +191,51 @@ impl Sink {
         Ok(Self {
             inner: Mutex::new(Some(open)),
             max_bytes: settings.max_bytes.value,
+            keep_files: settings.keep_files.value,
             base,
             enabled: true,
         })
+    }
+
+    pub fn probe(
+        settings: &AuditSettings,
+        data_dir: &Path,
+        profile: Option<&str>,
+    ) -> Result<Option<PathBuf>> {
+        if !settings.enabled.value {
+            return Ok(None);
+        }
+        let base = settings.path.as_ref().map_or_else(
+            || data_dir.join(default_file_name(profile, std::process::id())),
+            |path| path.value.clone(),
+        );
+        let unwritable = |source: std::io::Error| Error::AuditUnwritable {
+            path: base.clone(),
+            source,
+        };
+        if let Some(parent) = base.parent() {
+            crate::config::profile::create_private_directory(parent).map_err(unwritable)?;
+        }
+        let existed = fs::symlink_metadata(&base).is_ok();
+        let mut options = OpenOptions::new();
+        options.read(true).append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&base).map_err(unwritable)?;
+        let locked = file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => unwritable(std::io::Error::other(
+                "another process holds this audit file; give each server its own audit_path",
+            )),
+            std::fs::TryLockError::Error(source) => unwritable(source),
+        });
+        drop(file);
+        if !existed {
+            let _ = fs::remove_file(&base);
+        }
+        locked.map(|()| Some(base))
     }
 
     #[must_use]
@@ -209,8 +260,16 @@ impl Sink {
             return Ok(());
         };
         if self.max_bytes > 0 && open.written >= self.max_bytes {
-            let rotated = rotate(open)?;
-            *open = open_file(&self.base, Some(&rotated))?;
+            if open.rotated_away.is_none() {
+                open.rotated_away = Some(rotate(open)?);
+                prune_rotated(&self.base, self.keep_files);
+            }
+            match open_file(&self.base, open.rotated_away.as_deref()) {
+                Ok(fresh) => *open = fresh,
+                Err(error) => {
+                    tracing::warn!(%error, "the audit log could not be reopened after rotation; still writing to the rotated file");
+                }
+            }
         }
         let line = Line {
             format_version: FORMAT_VERSION,
@@ -229,10 +288,13 @@ impl Sink {
         if let Ok(mut guard) = self.inner.lock()
             && let Some(open) = guard.as_mut()
         {
-            open.file.flush().map_err(|source| Error::AuditUnwritable {
-                path: open.path.clone(),
-                source,
-            })?;
+            open.file
+                .flush()
+                .and_then(|()| open.file.sync_data())
+                .map_err(|source| Error::AuditUnwritable {
+                    path: open.path.clone(),
+                    source,
+                })?;
         }
         Ok(())
     }
@@ -247,19 +309,26 @@ fn open_file(path: &Path, rotated_from: Option<&str>) -> Result<OpenLog> {
         crate::config::profile::create_private_directory(parent).map_err(unwritable)?;
     }
     let mut options = OpenOptions::new();
-    options.append(true).create(true);
+    options.read(true).append(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options.open(path).map_err(unwritable)?;
-    let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let mut file = options.open(path).map_err(unwritable)?;
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => unwritable(std::io::Error::other(
+            "another process holds this audit file; give each server its own audit_path",
+        )),
+        std::fs::TryLockError::Error(source) => unwritable(source),
+    })?;
+    let (written, prev) = read_tail(&mut file).map_err(unwritable)?;
     let mut open = OpenLog {
         file,
         path: path.to_path_buf(),
         written,
-        prev: String::new(),
+        prev,
+        rotated_away: None,
     };
     let marker = Marker {
         format_version: FORMAT_VERSION,
@@ -267,6 +336,7 @@ fn open_file(path: &Path, rotated_from: Option<&str>) -> Result<OpenLog> {
         marker: CHAIN_START,
         process: std::process::id(),
         rotated_from,
+        prev: &open.prev,
     };
     let text = serde_json::to_string(&marker)
         .map_err(|error| unwritable(std::io::Error::other(error.to_string())))?;
@@ -274,17 +344,41 @@ fn open_file(path: &Path, rotated_from: Option<&str>) -> Result<OpenLog> {
     Ok(open)
 }
 
+fn read_tail(file: &mut File) -> std::io::Result<(u64, String)> {
+    let mut written = file.metadata()?.len();
+    if written == 0 {
+        return Ok((0, String::new()));
+    }
+    let start = written.saturating_sub(TAIL_SCAN_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    if tail.last() != Some(&b'\n') {
+        file.write_all(b"\n")?;
+        written += 1;
+        return Ok((written, sha256_hex(&tail)));
+    }
+    tail.pop();
+    let last_line = tail
+        .rsplit(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    Ok((written, sha256_hex(last_line)))
+}
+
 fn write_line(open: &mut OpenLog, text: &str) -> Result<()> {
     let unwritable = |source: std::io::Error| Error::AuditUnwritable {
         path: open.path.clone(),
         source,
     };
+    let mut bytes = Vec::with_capacity(text.len() + 1);
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.push(b'\n');
     open.file
-        .write_all(text.as_bytes())
-        .and_then(|()| open.file.write_all(b"\n"))
+        .write_all(&bytes)
         .and_then(|()| open.file.flush())
         .map_err(unwritable)?;
-    open.written += text.len() as u64 + 1;
+    open.written += bytes.len() as u64;
     open.prev = sha256_hex(text.as_bytes());
     Ok(())
 }
@@ -296,13 +390,46 @@ fn rotate(open: &mut OpenLog) -> Result<String> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("audit.jsonl");
-    let rotated_name = format!("{file_name}.{stamp}");
+    let mut rotated_name = format!("{file_name}.{stamp}");
+    let mut counter = 1u32;
+    while open.path.with_file_name(&rotated_name).exists() {
+        rotated_name = format!("{file_name}.{stamp}.{counter}");
+        counter += 1;
+    }
     let rotated = open.path.with_file_name(&rotated_name);
     fs::rename(&open.path, &rotated).map_err(|source| Error::AuditUnwritable {
         path: open.path.clone(),
         source,
     })?;
     Ok(rotated_name)
+}
+
+fn prune_rotated(base: &Path, keep_files: u32) {
+    if keep_files == 0 {
+        return;
+    }
+    let (Some(parent), Some(file_name)) = (
+        base.parent(),
+        base.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return;
+    };
+    let prefix = format!("{file_name}.");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let mut rotated: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| name.starts_with(&prefix))
+        .collect();
+    rotated.sort();
+    let excess = rotated.len().saturating_sub(keep_files as usize);
+    for name in rotated.into_iter().take(excess) {
+        if let Err(error) = fs::remove_file(parent.join(&name)) {
+            tracing::warn!(%error, file = %name, "a rotated audit file could not be removed");
+        }
+    }
 }
 
 pub fn verify_chain(path: &Path) -> std::result::Result<usize, String> {
@@ -312,14 +439,20 @@ pub fn verify_chain(path: &Path) -> std::result::Result<usize, String> {
     for (number, line) in text.lines().enumerate() {
         let value: serde_json::Value =
             serde_json::from_str(line).map_err(|error| format!("line {}: {error}", number + 1))?;
-        if value.get("marker").is_some() {
-            prev = sha256_hex(line.as_bytes());
-            continue;
-        }
         let recorded = value
             .get("prev")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        if value.get("marker").is_some() {
+            if number > 0 && recorded != prev {
+                return Err(format!(
+                    "line {}: the chain marker does not link to the previous line",
+                    number + 1
+                ));
+            }
+            prev = sha256_hex(line.as_bytes());
+            continue;
+        }
         if recorded != prev {
             return Err(format!(
                 "line {}: prev does not match the previous line",
@@ -359,8 +492,10 @@ mod tests {
             decision: Decision::Allowed,
             rule: None,
             handle_id: None,
+            cursor_id: None,
             duration_ms: 3,
             row_count: Some(1),
+            rows_affected: None,
             truncated: false,
             outcome: None,
             superuser: false,
@@ -372,7 +507,87 @@ mod tests {
             enabled: Resolved::preset(true),
             path: Some(Resolved::new(dir.join("audit.jsonl"), Origin::Flag)),
             max_bytes: Resolved::preset(max_bytes),
+            keep_files: Resolved::preset(0),
         }
+    }
+
+    #[test]
+    fn the_chain_links_across_restarts_and_a_spliced_marker_is_caught() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        {
+            let sink = Sink::open(&settings(dir.path(), 0), dir.path(), None).unwrap();
+            sink.record(&entry("pg_run_query")).unwrap();
+        }
+        let sink = Sink::open(&settings(dir.path(), 0), dir.path(), None).unwrap();
+        sink.record(&entry("pg_describe")).unwrap();
+        drop(sink);
+        assert_eq!(verify_chain(&path).unwrap(), 2);
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let second_marker: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(second_marker["prev"], sha256_hex(lines[1].as_bytes()));
+        let spliced = format!(
+            "{}\n{}\n{{\"v\":1,\"marker\":\"chain-start\",\"prev\":\"\"}}\n{}\n",
+            lines[0], lines[1], lines[3]
+        );
+        fs::write(&path, spliced).unwrap();
+        assert!(verify_chain(&path).unwrap_err().contains("line 3"));
+    }
+
+    #[test]
+    fn a_torn_last_line_is_terminated_before_the_next_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        {
+            let sink = Sink::open(&settings(dir.path(), 0), dir.path(), None).unwrap();
+            sink.record(&entry("pg_run_query")).unwrap();
+        }
+        let mut torn = fs::read_to_string(&path).unwrap();
+        torn.push_str("{\"v\":1,\"tool\":\"cut");
+        fs::write(&path, torn).unwrap();
+        let sink = Sink::open(&settings(dir.path(), 0), dir.path(), None).unwrap();
+        sink.record(&entry("pg_describe")).unwrap();
+        drop(sink);
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[2].ends_with("cut"));
+        assert!(lines[3].contains("chain-start"));
+        assert!(verify_chain(&path).unwrap_err().contains("line 3"));
+    }
+
+    #[test]
+    fn a_second_writer_on_the_same_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Sink::open(&settings(dir.path(), 0), dir.path(), None).unwrap();
+        let second = Sink::open(&settings(dir.path(), 0), dir.path(), None).unwrap_err();
+        assert_eq!(second.id().as_str(), "audit.unwritable");
+        drop(first);
+        Sink::open(&settings(dir.path(), 0), dir.path(), None).unwrap();
+    }
+
+    #[test]
+    fn rotated_files_are_pruned_to_the_keep_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = settings(dir.path(), 300);
+        settings.keep_files = Resolved::preset(1);
+        let sink = Sink::open(&settings, dir.path(), None).unwrap();
+        for _ in 0..12 {
+            sink.record(&entry("pg_run_query")).unwrap();
+        }
+        let rotated = fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("audit.jsonl.")
+            })
+            .count();
+        assert_eq!(rotated, 1);
     }
 
     #[test]

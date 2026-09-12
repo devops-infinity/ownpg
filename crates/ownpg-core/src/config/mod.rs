@@ -18,8 +18,8 @@ pub use http::{
     AuthMode, AuthSettings, HttpEntry, HttpFlags, HttpSettings, MCP_PATH, OauthSettings,
 };
 pub use resolve::{
-    FlagLayer, KeychainLookup, Sources, SshTarget, Warning, parse_ssh_target, parse_tool_groups,
-    resolve,
+    FlagLayer, KeychainLookup, Sources, SshTarget, Warning, ci_says_no_input, parse_ssh_target,
+    parse_tool_groups, resolve,
 };
 
 pub const FILE_CAP_BYTES: u64 = 1_048_576;
@@ -47,7 +47,7 @@ pub fn ssh_keychain_account(profile: &str) -> String {
 }
 pub const DEFAULT_AUDIT_MAX_BYTES: u64 = 52_428_800;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
     ReadOnly,
@@ -91,7 +91,7 @@ impl fmt::Display for Mode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum SslMode {
     Disable,
@@ -139,7 +139,7 @@ impl fmt::Display for SslMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChannelBinding {
     Disable,
@@ -173,7 +173,7 @@ impl fmt::Display for ChannelBinding {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum SshTransport {
     InProcess,
@@ -204,7 +204,19 @@ impl fmt::Display for SshTransport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolGroup {
     Write,
@@ -402,6 +414,7 @@ pub struct AuditSettings {
     pub enabled: Resolved<bool>,
     pub path: Option<Resolved<PathBuf>>,
     pub max_bytes: Resolved<u64>,
+    pub keep_files: Resolved<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +422,7 @@ pub struct AppPaths {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
+    pub log_dir: PathBuf,
     pub config_file: PathBuf,
 }
 
@@ -416,10 +430,12 @@ impl AppPaths {
     #[must_use]
     pub fn from_base(config_dir: PathBuf, data_dir: PathBuf, cache_dir: PathBuf) -> Self {
         let config_file = config_dir.join("profiles.toml");
+        let log_dir = data_dir.join("logs");
         Self {
             config_dir,
             data_dir,
             cache_dir,
+            log_dir,
             config_file,
         }
     }
@@ -427,6 +443,12 @@ impl AppPaths {
     #[must_use]
     pub fn with_config_file(mut self, config_file: PathBuf) -> Self {
         self.config_file = config_file;
+        self
+    }
+
+    #[must_use]
+    pub fn with_log_dir(mut self, log_dir: PathBuf) -> Self {
+        self.log_dir = log_dir;
         self
     }
 }

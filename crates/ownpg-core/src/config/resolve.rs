@@ -130,6 +130,27 @@ fn env_u64(env: &Environment, name: &str) -> Result<Option<u64>> {
         })
 }
 
+#[must_use]
+pub fn ci_says_no_input(env: &Environment) -> Option<bool> {
+    let raw = env.var("CI")?;
+    let lowered = raw.trim().to_ascii_lowercase();
+    (!matches!(lowered.as_str(), "0" | "false" | "no" | "off")).then_some(true)
+}
+
+fn env_u32(env: &Environment, name: &str) -> Result<Option<u32>> {
+    let Some(raw) = env.var(name) else {
+        return Ok(None);
+    };
+    raw.trim()
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| Error::ConfigInvalid {
+            setting: name.to_owned(),
+            value: raw.to_owned(),
+            detail: "expected a whole number".to_owned(),
+        })
+}
+
 fn env_parsed<T>(
     env: &Environment,
     name: &str,
@@ -548,11 +569,17 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
             profile.audit_max_bytes,
         )
         .or_preset(DEFAULT_AUDIT_MAX_BYTES),
+        keep_files: Pick::new(
+            None,
+            env_u32(env, "OWNPG_AUDIT_KEEP_FILES")?,
+            profile.audit_keep_files,
+        )
+        .or_preset(0),
     };
 
     let no_input = Pick::new(
         flags.no_input,
-        env_bool(env, "OWNPG_NO_INPUT")?.or(env_bool(env, "CI")?.filter(|value| *value)),
+        env_bool(env, "OWNPG_NO_INPUT")?.or(ci_says_no_input(env)),
         profile.no_input,
     )
     .or_preset(false);
@@ -570,6 +597,21 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
     )
     .resolve();
 
+    for (name, path) in [
+        ("pg_bindir", pg_bindir.as_ref()),
+        ("audit_path", audit.path.as_ref()),
+        ("output_dir", output_dir.as_ref()),
+    ] {
+        if let Some(path) = path
+            && !path.value.is_absolute()
+        {
+            return Err(Error::ConfigInvalid {
+                setting: name.to_owned(),
+                value: path.value.display().to_string(),
+                detail: "an absolute path is required; a relative path would depend on the directory the client started the server in".to_owned(),
+            });
+        }
+    }
     let http = super::http::resolve_http(&flags.http, env, profile.http.as_ref(), mode.value)?;
     let settings = Settings {
         profile: profile_name,
@@ -797,6 +839,33 @@ mod tests {
             error.to_string().contains("cursor_expiry_seconds"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn relative_path_settings_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, value) in [
+            ("OWNPG_PG_BINDIR", "bin"),
+            ("OWNPG_AUDIT_PATH", "logs/audit.jsonl"),
+            ("OWNPG_OUTPUT_DIR", "dumps"),
+        ] {
+            let env = Environment::default()
+                .with_os_user("sharkar")
+                .with_var(name, value);
+            let error = resolve_with(
+                FlagLayer {
+                    database: Some("app".to_owned()),
+                    ..FlagLayer::default()
+                },
+                &env,
+                paths_under(dir.path()),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("absolute path"),
+                "{name}: {error}"
+            );
+        }
     }
 
     #[test]

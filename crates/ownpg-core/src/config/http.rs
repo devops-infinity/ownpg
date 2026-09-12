@@ -19,7 +19,7 @@ pub const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MCP_PATH: &str = "/mcp";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthMode {
     None,
@@ -53,7 +53,7 @@ impl std::fmt::Display for AuthMode {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HttpEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]

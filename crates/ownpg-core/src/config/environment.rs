@@ -1,11 +1,36 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Environment {
     vars: BTreeMap<String, String>,
     home: Option<PathBuf>,
     os_user: Option<String>,
+}
+
+const SECRET_NAME_ENDINGS: &[&str] =
+    &["PASSWORD", "PASSPHRASE", "TOKEN", "TOKENS", "SECRET", "KEY"];
+
+impl std::fmt::Debug for Environment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut vars = f.debug_map();
+        for (name, value) in &self.vars {
+            let upper = name.to_ascii_uppercase();
+            if SECRET_NAME_ENDINGS
+                .iter()
+                .any(|ending| upper.ends_with(ending))
+            {
+                vars.entry(name, &"<redacted>");
+            } else {
+                vars.entry(name, value);
+            }
+        }
+        vars.finish()?;
+        f.debug_struct(" Environment")
+            .field("home", &self.home)
+            .field("os_user", &self.os_user)
+            .finish()
+    }
 }
 
 impl Environment {
@@ -76,6 +101,19 @@ mod tests {
         assert_eq!(env.var("PGHOST"), None);
         assert_eq!(env.var("PGPORT"), Some("5433"));
         assert_eq!(env.var("PGUSER"), None);
+    }
+
+    #[test]
+    fn debug_output_redacts_secret_looking_variables() {
+        let env = Environment::default()
+            .with_var("PGPASSWORD", "hunter2")
+            .with_var("OWNPG_BEARER_TOKENS", "abc")
+            .with_var("PGHOST", "db.example");
+        let rendered = format!("{env:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains("abc"), "{rendered}");
+        assert!(rendered.contains("db.example"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
     #[test]
