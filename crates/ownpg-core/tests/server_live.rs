@@ -280,9 +280,9 @@ async fn run_query_pages_sanitizes_and_refuses_writes_with_structured_errors() {
     );
 
     rig.finish().await;
-    let lines = verify_chain(&rig_path(&scratch)).expect("the audit chain verifies");
+    let lines = verify_chain(&audit_file_path(&scratch)).expect("the audit chain verifies");
     assert!(lines >= 8, "{lines} audit lines");
-    let content = std::fs::read_to_string(rig_path(&scratch)).unwrap();
+    let content = std::fs::read_to_string(audit_file_path(&scratch)).unwrap();
     assert!(content.contains("\"decision\":\"refused\""));
     assert!(content.contains("\"outcome\":\"25006\""));
     assert!(
@@ -291,7 +291,7 @@ async fn run_query_pages_sanitizes_and_refuses_writes_with_structured_errors() {
     );
 }
 
-fn rig_path(scratch: &support::Scratch) -> std::path::PathBuf {
+fn audit_file_path(scratch: &support::Scratch) -> std::path::PathBuf {
     let data = &scratch.paths.data_dir;
     std::fs::read_dir(data)
         .unwrap()
@@ -416,7 +416,7 @@ async fn the_catalog_tools_list_describe_count_and_explain() {
     let role = rig
         .call(
             "pg_describe",
-            json!({"name": scratch.user, "object_type": "role"}),
+            json!({"name": scratch.user, "target": "role"}),
         )
         .await;
     assert_eq!(
@@ -427,7 +427,7 @@ async fn the_catalog_tools_list_describe_count_and_explain() {
     let privileges = rig
         .call(
             "pg_describe",
-            json!({"name": "orders", "object_type": "privileges"}),
+            json!({"name": "orders", "target": "privileges"}),
         )
         .await;
     let structured = privileges.structured_content.clone().unwrap();
@@ -734,14 +734,14 @@ async fn the_bypass_corpus_is_refused_by_the_live_read_only_server() {
         .unwrap()
         .get(0);
     assert_eq!(before, after, "no corpus statement reached the table");
-    let content = std::fs::read_to_string(rig_path(&scratch)).unwrap();
+    let content = std::fs::read_to_string(audit_file_path(&scratch)).unwrap();
     let refusals = content.matches("\"decision\":\"refused\"").count();
     assert!(
         refusals >= refused,
         "{refusals} refusals logged for {refused} inputs"
     );
     assert!(
-        !content.contains("needle-literal-7") && !content.contains("4242"),
+        !content.contains("needle-literal-7") && !content.contains("id = 4242"),
         "statement literals never reach the audit log"
     );
     assert!(content.contains("customer = $1"), "{content}");

@@ -70,7 +70,7 @@ pub enum Curve {
 pub enum VerifyingKey {
     Rsa { n: Vec<u8>, e: Vec<u8> },
     Ec { curve: Curve, point: Vec<u8> },
-    Ed(Vec<u8>),
+    Ed25519(Vec<u8>),
 }
 
 impl VerifyingKey {
@@ -98,7 +98,7 @@ impl VerifyingKey {
                     ..
                 },
                 Algorithm::Es384,
-            ) | (Self::Ed(_), Algorithm::EdDsa)
+            ) | (Self::Ed25519(_), Algorithm::EdDsa)
         )
     }
 
@@ -130,7 +130,7 @@ impl VerifyingKey {
                     .verify(message, sig)
                     .is_ok()
             }
-            Self::Ed(public) => signature::UnparsedPublicKey::new(&signature::ED25519, public)
+            Self::Ed25519(public) => signature::UnparsedPublicKey::new(&signature::ED25519, public)
                 .verify(message, sig)
                 .is_ok(),
         }
@@ -206,7 +206,7 @@ fn key_from_jwk(jwk: &Jwk) -> Option<VerifyingKey> {
                 return None;
             }
             let x = decode_base64url(jwk.x.as_deref()?)?;
-            (x.len() == 32).then_some(VerifyingKey::Ed(x))
+            (x.len() == 32).then_some(VerifyingKey::Ed25519(x))
         }
         _ => None,
     }
@@ -241,12 +241,12 @@ struct Cache {
 }
 
 impl Cache {
-    fn fresh(&self) -> bool {
+    fn is_fresh(&self) -> bool {
         self.fetched_at
             .is_some_and(|fetched| fetched.elapsed() < self.ttl)
     }
 
-    fn throttled(&self) -> bool {
+    fn is_throttled(&self) -> bool {
         self.last_attempt
             .is_some_and(|attempt| attempt.elapsed() < REFRESH_INTERVAL)
     }
@@ -372,10 +372,10 @@ impl JwksClient {
     async fn refresh(&self, seen: Option<Instant>) -> Result<(), JwksError> {
         let _serial = self.refreshing.lock().await;
         let current = self.snapshot();
-        if current.fetched_at != seen && current.fresh() {
+        if current.fetched_at != seen && current.is_fresh() {
             return Ok(());
         }
-        if current.throttled() {
+        if current.is_throttled() {
             return if current.keys.is_empty() {
                 Err(JwksError::Unreachable(
                     "the last fetch failed less than a minute ago".to_owned(),
@@ -396,11 +396,11 @@ impl JwksClient {
 
     pub async fn key(&self, kid: &str) -> Result<Option<Arc<VerifyingKey>>, JwksError> {
         let cache = self.snapshot();
-        if cache.fresh() {
+        if cache.is_fresh() {
             if let Some(key) = cache.keys.get(kid) {
                 return Ok(Some(Arc::clone(key)));
             }
-            if cache.throttled() {
+            if cache.is_throttled() {
                 return Ok(None);
             }
         }
@@ -416,10 +416,10 @@ impl JwksClient {
 
     pub async fn ready(&self) -> Result<(), JwksError> {
         let cache = self.snapshot();
-        if cache.fresh() {
+        if cache.is_fresh() {
             return Ok(());
         }
-        if cache.throttled() {
+        if cache.is_throttled() {
             return if cache.keys.is_empty() {
                 Err(JwksError::Unreachable(
                     "the last fetch failed less than a minute ago".to_owned(),
@@ -463,7 +463,7 @@ mod tests {
         };
         assert!(ec.accepts(Algorithm::Es256));
         assert!(!ec.accepts(Algorithm::Es384));
-        assert!(VerifyingKey::Ed(vec![0; 32]).accepts(Algorithm::EdDsa));
+        assert!(VerifyingKey::Ed25519(vec![0; 32]).accepts(Algorithm::EdDsa));
         assert_eq!(Algorithm::parse("HS256"), None);
         assert_eq!(Algorithm::parse("none"), None);
     }

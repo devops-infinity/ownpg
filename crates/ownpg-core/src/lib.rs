@@ -4,10 +4,10 @@ pub mod config;
 pub mod connect;
 pub mod engine;
 pub mod error;
-pub mod groups;
 pub mod render;
 pub mod server;
 pub mod shape;
+pub mod tool_specs;
 pub mod tools;
 
 pub use classify::statement_count;

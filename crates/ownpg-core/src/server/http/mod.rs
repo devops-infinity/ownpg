@@ -67,7 +67,7 @@ impl Gatekeeper {
         let scope = rejection
             .scope
             .clone()
-            .unwrap_or_else(|| crate::groups::SCOPE_READ.to_owned());
+            .unwrap_or_else(|| crate::tool_specs::SCOPE_READ.to_owned());
         parts.push(format!("scope=\"{scope}\""));
         let body = serde_json::json!({
             "error": rejection.error,
@@ -111,7 +111,7 @@ impl Gatekeeper {
 
 pub const RATE_LIMITED_CODE: i32 = -32000;
 
-fn too_many(wait: Duration) -> Response {
+fn too_many_requests(wait: Duration) -> Response {
     let seconds = wait.as_secs().max(1);
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
@@ -171,12 +171,14 @@ pub fn client_address(
 }
 
 pub async fn guard(
-    State(gate): State<Arc<Gatekeeper>>,
+    State(gatekeeper): State<Arc<Gatekeeper>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !gate.older_client_sessions && matches!(*request.method(), Method::GET | Method::DELETE) {
+    if !gatekeeper.older_client_sessions
+        && matches!(*request.method(), Method::GET | Method::DELETE)
+    {
         return method_not_allowed();
     }
     if !matches!(
@@ -185,23 +187,23 @@ pub async fn guard(
     ) {
         return method_not_allowed();
     }
-    let client = client_address(peer, request.headers(), &gate.trusted_proxies);
+    let client = client_address(peer, request.headers(), &gatekeeper.trusted_proxies);
     let authorization = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let (principal, key) = match gate
+    let (principal, fingerprint) = match gatekeeper
         .authenticator
-        .authenticate(authorization.as_deref(), &gate.anonymous)
+        .authenticate(authorization.as_deref(), &gatekeeper.anonymous)
         .await
     {
         Ok(found) => found,
         Err(rejection) => {
-            if let Err(wait) = gate.limiter.check(&format!("auth-fail:{client}")) {
-                return too_many(wait);
+            if let Err(wait) = gatekeeper.limiter.check(&format!("auth-fail:{client}")) {
+                return too_many_requests(wait);
             }
-            return gate.challenge(&rejection);
+            return gatekeeper.challenge(&rejection);
         }
     };
     let method_header = request
@@ -215,10 +217,10 @@ pub async fn guard(
             .headers()
             .get(HEADER_MCP_NAME)
             .and_then(|value| value.to_str().ok())
-        && let Some(route) = gate.server.route(name)
+        && let Some(route) = gatekeeper.server.route(name)
         && !principal.allows(route.spec.scope)
     {
-        return gate.challenge(&Rejection::insufficient(route.spec.scope));
+        return gatekeeper.challenge(&Rejection::insufficient(route.spec.scope));
     }
     if matches!(
         method_header.as_str(),
@@ -231,17 +233,17 @@ pub async fn guard(
             | "prompts/list"
             | "prompts/get"
             | "completion/complete"
-    ) && !principal.allows(crate::groups::SCOPE_READ)
+    ) && !principal.allows(crate::tool_specs::SCOPE_READ)
     {
-        return gate.challenge(&Rejection::insufficient(crate::groups::SCOPE_READ));
+        return gatekeeper.challenge(&Rejection::insufficient(crate::tool_specs::SCOPE_READ));
     }
-    let bucket = if key.is_empty() {
+    let bucket = if fingerprint.is_empty() {
         format!("addr:{client}")
     } else {
-        format!("token:{key}")
+        format!("token:{fingerprint}")
     };
-    if let Err(wait) = gate.limiter.check(&bucket) {
-        return too_many(wait);
+    if let Err(wait) = gatekeeper.limiter.check(&bucket) {
+        return too_many_requests(wait);
     }
     request.extensions_mut().insert(principal);
     let mut response = next.run(request).await;
@@ -257,22 +259,22 @@ async fn live() -> Response {
 }
 
 async fn ready(
-    State(gate): State<Arc<Gatekeeper>>,
+    State(gatekeeper): State<Arc<Gatekeeper>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let client = client_address(peer, &headers, &gate.trusted_proxies);
-    if let Err(wait) = gate.limiter.check(&format!("ready:{client}")) {
-        return too_many(wait);
+    let client = client_address(peer, &headers, &gatekeeper.trusted_proxies);
+    if let Err(wait) = gatekeeper.limiter.check(&format!("ready:{client}")) {
+        return too_many_requests(wait);
     }
-    if !gate.server.engine().is_alive().await {
+    if !gatekeeper.server.engine().is_alive().await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "not ready: PostgreSQL is not reachable",
         )
             .into_response();
     }
-    if let Err(detail) = gate.authenticator.ready().await {
+    if let Err(detail) = gatekeeper.authenticator.ready().await {
         tracing::warn!(%detail, "the key endpoint is not ready");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -283,8 +285,8 @@ async fn ready(
     (StatusCode::OK, "ready").into_response()
 }
 
-async fn metadata(State(gate): State<Arc<Gatekeeper>>) -> Response {
-    let mut response = axum::Json(gate.metadata()).into_response();
+async fn metadata(State(gatekeeper): State<Arc<Gatekeeper>>) -> Response {
+    let mut response = axum::Json(gatekeeper.metadata()).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=300"),
@@ -292,13 +294,13 @@ async fn metadata(State(gate): State<Arc<Gatekeeper>>) -> Response {
     response
 }
 
-pub fn router(gate: Arc<Gatekeeper>, settings: &Settings) -> Router {
-    let server = Arc::clone(&gate.server);
+pub fn router(gatekeeper: Arc<Gatekeeper>, settings: &Settings) -> Router {
+    let server = Arc::clone(&gatekeeper.server);
     let http = &settings.http;
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(http.older_client_sessions.value)
         .with_json_response(true)
-        .with_cancellation_token(gate.cancel.clone())
+        .with_cancellation_token(gatekeeper.cancel.clone())
         .with_allowed_hosts(http.allowed_hosts.value.clone())
         .with_allowed_origins(http.allowed_origins.value.clone())
         .with_max_request_body_bytes(http.body_cap.value);
@@ -309,15 +311,18 @@ pub fn router(gate: Arc<Gatekeeper>, settings: &Settings) -> Router {
     );
     Router::new()
         .route_service(MCP_PATH, mcp)
-        .route_layer(middleware::from_fn_with_state(Arc::clone(&gate), guard))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&gatekeeper),
+            guard,
+        ))
         .route_layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
-            gate.body_timeout,
+            gatekeeper.body_timeout,
         ))
         .route(LIVE_PATH, get(live))
         .route(READY_PATH, get(ready))
         .route(METADATA_PATH, get(metadata))
         .route(&format!("{METADATA_PATH}{MCP_PATH}"), get(metadata))
-        .with_state(gate)
+        .with_state(gatekeeper)
 }
 
 pub fn gatekeeper(
@@ -413,23 +418,23 @@ impl Listening {
 pub async fn serve(
     listening: Listening,
     router: Router,
-    gate: Arc<Gatekeeper>,
+    gatekeeper: Arc<Gatekeeper>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     deadline: Duration,
 ) -> Result<ExitClass> {
     let stop = CancellationToken::new();
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-    let permits = Arc::new(tokio::sync::Semaphore::new(gate.max_connections));
+    let permits = Arc::new(tokio::sync::Semaphore::new(gatekeeper.max_connections));
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     builder
         .http1()
         .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(gate.header_timeout)
+        .header_read_timeout(gatekeeper.header_timeout)
         .keep_alive(true);
     let builder = Arc::new(builder);
     let sweeper = {
-        let limiter_gate = Arc::clone(&gate);
+        let limiter_gate = Arc::clone(&gatekeeper);
         let stop = stop.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -496,8 +501,8 @@ pub async fn serve(
             deadline.as_millis()
         );
     }
-    gate.cancel.cancel();
-    gate.server.shutdown().await;
+    gatekeeper.cancel.cancel();
+    gatekeeper.server.shutdown().await;
     Ok(ExitClass::Success)
 }
 

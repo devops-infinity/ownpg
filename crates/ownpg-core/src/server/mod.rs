@@ -27,7 +27,7 @@ use crate::audit::{Decision, Entry, PrincipalKind, Sink, Transport};
 use crate::config::ToolGroup;
 use crate::engine::Engine;
 use crate::error::Result;
-use crate::groups;
+use crate::tool_specs;
 use crate::tools::{self, Call, Context, Outcome, Reply, Route};
 
 pub const LIST_TTL_MS: u64 = 60_000;
@@ -83,7 +83,7 @@ impl Principal {
 pub struct RoundTrip {
     pub request_state: Option<String>,
     pub input_responses: Option<rmcp::model::InputResponses>,
-    pub elicitation: bool,
+    pub can_elicit: bool,
     pub progress: Option<tools::Progress>,
     pub older_peer: Option<Peer<RoleServer>>,
     pub principal: Principal,
@@ -120,7 +120,7 @@ impl Server {
     ) -> Result<Self> {
         let superuser = engine.role().await?.superuser;
         let settings = Arc::clone(engine.settings());
-        let loaded: Vec<&'static str> = groups::loaded(&settings)
+        let loaded: Vec<&'static str> = tool_specs::loaded(&settings)
             .iter()
             .map(|spec| spec.name)
             .collect();
@@ -216,7 +216,7 @@ impl Server {
         let error = crate::error::Error::ScopeInsufficient {
             scope: scope.to_owned(),
         };
-        self.record_plain(
+        self.record_request(
             request,
             request_id.to_owned(),
             started.elapsed(),
@@ -229,7 +229,7 @@ impl Server {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn record_plain(
+    fn record_request(
         &self,
         request: &str,
         request_id: String,
@@ -283,7 +283,7 @@ impl Server {
         let RoundTrip {
             request_state,
             input_responses,
-            elicitation,
+            can_elicit,
             progress,
             older_peer,
             principal,
@@ -302,7 +302,7 @@ impl Server {
             principal: principal.name.clone(),
             request_state,
             input_responses,
-            elicitation,
+            can_elicit,
             progress,
             cancel: cancel.clone(),
         };
@@ -419,7 +419,7 @@ impl Server {
                     .decision
                     .unwrap_or_else(|| failure.decision()),
                 failure.rule().or(deprecated),
-                Some(failure.outcome()),
+                Some(failure.audit_outcome()),
             ),
         };
         let entry = Entry {
@@ -457,7 +457,7 @@ impl Server {
             return;
         };
         let cursors = self.context.engine.open_cursors().await.len();
-        let handles = self.context.engine.open_transactions().await;
+        let handles = self.context.engine.open_transaction_count().await;
         metrics.set_open_handles((cursors + handles) as u64);
     }
 
@@ -582,7 +582,7 @@ impl ServerHandler for Server {
         let span = tracing::info_span!("tool", tool = ?name, request_id = %request_id);
         let _guard = span.enter();
         let arguments = request.arguments.unwrap_or_default();
-        let elicitation = context
+        let can_elicit = context
             .protocol_version()
             .is_some_and(|version| version.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
             && context
@@ -602,7 +602,7 @@ impl ServerHandler for Server {
         let round_trip = RoundTrip {
             request_state: request.request_state,
             input_responses: request.input_responses,
-            elicitation,
+            can_elicit,
             progress,
             older_peer,
             principal: self.principal_for(&context),
@@ -635,13 +635,13 @@ impl ServerHandler for Server {
         let principal = self.principal_for(&context);
         self.require_scope(
             &principal,
-            groups::SCOPE_READ,
+            tool_specs::SCOPE_READ,
             "resources/list",
             &request_id,
             started,
         )?;
         let result = self.list_resource_items().await;
-        self.record_plain(
+        self.record_request(
             "resources/list",
             request_id,
             started.elapsed(),
@@ -673,13 +673,13 @@ impl ServerHandler for Server {
         let principal = self.principal_for(&context);
         self.require_scope(
             &principal,
-            groups::SCOPE_READ,
+            tool_specs::SCOPE_READ,
             "resources/read",
             &request_id,
             started,
         )?;
         let result = self.read_resource_item(&request.uri, &principal).await;
-        self.record_plain(
+        self.record_request(
             "resources/read",
             request_id,
             started.elapsed(),
@@ -709,7 +709,7 @@ impl ServerHandler for Server {
         let principal = self.principal_for(&context);
         self.require_scope(
             &principal,
-            groups::SCOPE_READ,
+            tool_specs::SCOPE_READ,
             "prompts/get",
             &request_id,
             started,
@@ -728,13 +728,13 @@ impl ServerHandler for Server {
         let principal = self.principal_for(&context);
         self.require_scope(
             &principal,
-            groups::SCOPE_READ,
+            tool_specs::SCOPE_READ,
             "completion/complete",
             &request_id,
             started,
         )?;
         let result = self.completion(&request).await;
-        self.record_plain(
+        self.record_request(
             "completion/complete",
             request_id,
             started.elapsed(),
@@ -764,7 +764,7 @@ impl ServerHandler for Server {
         let principal = self.principal_for(&context);
         self.require_scope(
             &principal,
-            groups::SCOPE_READ,
+            tool_specs::SCOPE_READ,
             "resources/subscribe",
             &request_id,
             started,
@@ -784,7 +784,7 @@ impl ServerHandler for Server {
                 held.push((context.peer.clone(), request.uri.clone()));
             }
         }
-        self.record_plain(
+        self.record_request(
             "resources/subscribe",
             request_id,
             started.elapsed(),
@@ -807,7 +807,7 @@ impl ServerHandler for Server {
         let principal = self.principal_for(&context);
         self.require_scope(
             &principal,
-            groups::SCOPE_READ,
+            tool_specs::SCOPE_READ,
             "resources/unsubscribe",
             &request_id,
             started,
@@ -815,7 +815,7 @@ impl ServerHandler for Server {
         if let Ok(mut held) = self.older_subscriptions.lock() {
             held.retain(|(peer, uri)| !(*uri == request.uri && same_peer(peer, &context.peer)));
         }
-        self.record_plain(
+        self.record_request(
             "resources/unsubscribe",
             request_id,
             started.elapsed(),
@@ -833,7 +833,7 @@ impl ServerHandler for Server {
         let principal = self.principal_for(context.request_context());
         self.require_scope(
             &principal,
-            groups::SCOPE_READ,
+            tool_specs::SCOPE_READ,
             "subscriptions/listen",
             &request_id,
             started,

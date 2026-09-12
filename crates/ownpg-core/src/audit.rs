@@ -87,7 +87,8 @@ pub struct Entry {
 
 #[derive(Serialize)]
 struct Line<'a> {
-    v: u32,
+    #[serde(rename = "v")]
+    format_version: u32,
     timestamp: String,
     #[serde(flatten)]
     entry: &'a Entry,
@@ -96,7 +97,8 @@ struct Line<'a> {
 
 #[derive(Serialize)]
 struct Marker<'a> {
-    v: u32,
+    #[serde(rename = "v")]
+    format_version: u32,
     timestamp: String,
     marker: &'static str,
     process: u32,
@@ -107,7 +109,7 @@ struct Marker<'a> {
 pub const SHORT_STATEMENT_CAP: usize = 200;
 
 #[derive(Debug)]
-struct Open {
+struct OpenLog {
     file: File,
     path: PathBuf,
     written: u64,
@@ -116,7 +118,7 @@ struct Open {
 
 #[derive(Debug)]
 pub struct Sink {
-    inner: Mutex<Option<Open>>,
+    inner: Mutex<Option<OpenLog>>,
     max_bytes: u64,
     base: PathBuf,
     enabled: bool,
@@ -211,7 +213,7 @@ impl Sink {
             *open = open_file(&self.base, Some(&rotated))?;
         }
         let line = Line {
-            v: FORMAT_VERSION,
+            format_version: FORMAT_VERSION,
             timestamp: now_rfc3339(),
             entry,
             prev: &open.prev,
@@ -236,7 +238,7 @@ impl Sink {
     }
 }
 
-fn open_file(path: &Path, rotated_from: Option<&str>) -> Result<Open> {
+fn open_file(path: &Path, rotated_from: Option<&str>) -> Result<OpenLog> {
     let unwritable = |source: std::io::Error| Error::AuditUnwritable {
         path: path.to_path_buf(),
         source,
@@ -253,14 +255,14 @@ fn open_file(path: &Path, rotated_from: Option<&str>) -> Result<Open> {
     }
     let file = options.open(path).map_err(unwritable)?;
     let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
-    let mut open = Open {
+    let mut open = OpenLog {
         file,
         path: path.to_path_buf(),
         written,
         prev: String::new(),
     };
     let marker = Marker {
-        v: FORMAT_VERSION,
+        format_version: FORMAT_VERSION,
         timestamp: now_rfc3339(),
         marker: CHAIN_START,
         process: std::process::id(),
@@ -272,7 +274,7 @@ fn open_file(path: &Path, rotated_from: Option<&str>) -> Result<Open> {
     Ok(open)
 }
 
-fn write_line(open: &mut Open, text: &str) -> Result<()> {
+fn write_line(open: &mut OpenLog, text: &str) -> Result<()> {
     let unwritable = |source: std::io::Error| Error::AuditUnwritable {
         path: open.path.clone(),
         source,
@@ -287,7 +289,7 @@ fn write_line(open: &mut Open, text: &str) -> Result<()> {
     Ok(())
 }
 
-fn rotate(open: &mut Open) -> Result<String> {
+fn rotate(open: &mut OpenLog) -> Result<String> {
     let stamp = time::OffsetDateTime::now_utc().unix_timestamp();
     let file_name = open
         .path

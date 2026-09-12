@@ -26,8 +26,8 @@ use crate::audit::{Decision, Transport};
 use crate::config::{MAX_ROW_CAP, Settings};
 use crate::engine::Engine;
 use crate::error::{Error, ErrorId};
-use crate::groups::ToolSpec;
 use crate::shape::{Caps, ResultSet};
+use crate::tool_specs::ToolSpec;
 
 pub const LIST_CAP: usize = 200;
 
@@ -63,7 +63,7 @@ pub struct Call {
     pub principal: String,
     pub request_state: Option<String>,
     pub input_responses: Option<InputResponses>,
-    pub elicitation: bool,
+    pub can_elicit: bool,
     pub progress: Option<Progress>,
     pub cancel: tokio_util::sync::CancellationToken,
 }
@@ -230,7 +230,7 @@ impl ToolFailure {
     }
 
     #[must_use]
-    pub fn outcome(&self) -> String {
+    pub fn audit_outcome(&self) -> String {
         self.sqlstate()
             .unwrap_or_else(|| self.0.error.id().as_str().to_owned())
     }
@@ -324,7 +324,7 @@ where
         .with_raw_output_schema(schema_for_output::<O>())
         .with_annotations(spec.annotations());
     let handler = Arc::new(handler);
-    let call: Handler = Arc::new(move |call: Call| {
+    let parsing_handler: Handler = Arc::new(move |call: Call| {
         let handler = Arc::clone(&handler);
         Box::pin(async move {
             let parsed: P = serde_json::from_value(serde_json::Value::Object(
@@ -342,7 +342,7 @@ where
     Ok(Route {
         spec,
         tool,
-        handler: call,
+        handler: parsing_handler,
     })
 }
 
@@ -418,7 +418,7 @@ mod tests {
             message: "cannot execute nextval() in a read-only transaction".to_owned(),
         });
         assert_eq!(failure.decision(), Decision::Allowed);
-        assert_eq!(failure.outcome(), "25006");
+        assert_eq!(failure.audit_outcome(), "25006");
         let structured = failure.into_call_result().structured_content.unwrap();
         assert_eq!(structured["sqlstate"], "25006");
         assert_eq!(structured["code"], "sql.failed");
@@ -442,13 +442,13 @@ mod tests {
             );
             assert!(route.tool.output_schema.is_some(), "{}", route.spec.name);
         }
-        for spec in crate::groups::TOOLS {
+        for spec in crate::tool_specs::TOOLS {
             assert!(
                 routes.iter().any(|route| route.spec.name == spec.name),
                 "{} has no route",
                 spec.name
             );
         }
-        assert_eq!(routes.len(), crate::groups::TOOLS.len());
+        assert_eq!(routes.len(), crate::tool_specs::TOOLS.len());
     }
 }

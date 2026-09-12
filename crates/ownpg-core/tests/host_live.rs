@@ -28,7 +28,7 @@ struct Rig {
     database: String,
 }
 
-fn bindir() -> Option<PathBuf> {
+fn test_pg_bindir() -> Option<PathBuf> {
     std::env::var_os("OWNPG_TEST_PG_BINDIR").map(PathBuf::from)
 }
 
@@ -37,7 +37,7 @@ async fn rig(scratch: &support::Scratch, output_dir: Option<PathBuf>) -> Rig {
         schema: Some("app".to_owned()),
         mode: Some(Mode::ReadWrite),
         tools: Some(vec![ToolGroup::Host]),
-        pg_bindir: bindir(),
+        pg_bindir: test_pg_bindir(),
         output_dir: output_dir.clone(),
         ..FlagLayer::default()
     }));
@@ -126,7 +126,7 @@ fn program_major(path: &str) -> Option<u32> {
 }
 
 #[cfg(unix)]
-fn mode_of(path: &std::path::Path) -> u32 {
+fn permission_bits(path: &std::path::Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
@@ -272,7 +272,7 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
     let dump_file = rig.output_dir.join("app.dump");
     assert!(dumped["output_bytes"].as_u64().unwrap() > 0);
     #[cfg(unix)]
-    assert_eq!(mode_of(&dump_file), 0o600);
+    assert_eq!(permission_bits(&dump_file), 0o600);
 
     let plain = rig
         .ok(
@@ -295,7 +295,7 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
     let text = std::fs::read_to_string(rig.output_dir.join("globals.sql")).unwrap();
     assert!(text.contains("CREATE ROLE"), "{text}");
     #[cfg(unix)]
-    assert_eq!(mode_of(&rig.output_dir.join("globals.sql")), 0o600);
+    assert_eq!(permission_bits(&rig.output_dir.join("globals.sql")), 0o600);
 
     client.batch_execute("DROP TABLE app.items").await.unwrap();
     let restored = rig.ok("pg_restore", json!({"file": "app.dump"})).await;

@@ -147,9 +147,9 @@ impl HttpSettings {
     pub fn metadata_url(&self) -> String {
         match url::Url::parse(&self.public_url.value) {
             Ok(parsed) if parsed.host_str().is_some() => {
-                let origin = origin_of(&self.public_url.value).unwrap_or_default();
+                let url_origin = url_origin_of(&self.public_url.value).unwrap_or_default();
                 let path = parsed.path().trim_end_matches('/');
-                format!("{origin}/.well-known/oauth-protected-resource{path}")
+                format!("{url_origin}/.well-known/oauth-protected-resource{path}")
             }
             _ => format!(
                 "{}/.well-known/oauth-protected-resource{MCP_PATH}",
@@ -239,7 +239,7 @@ fn parse_public_url(setting: &str, text: &str) -> Result<String> {
     Ok(canonical.to_string())
 }
 
-fn origin_of(url: &str) -> Option<String> {
+fn url_origin_of(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     let default_port = match parsed.scheme() {
@@ -386,7 +386,7 @@ pub fn resolve_http(
     ]
     .into_iter()
     .collect();
-    if let Some(origin) = origin_of(&public_url.value)
+    if let Some(origin) = url_origin_of(&public_url.value)
         && !default_origins.contains(&origin)
     {
         default_origins.push(origin);
@@ -948,11 +948,11 @@ mod tests {
         assert!(parse_public_url("x", "https://db.example.com/other").is_err());
         assert!(parse_public_url("x", "https://db.example.com/mcp?x=1").is_err());
         assert_eq!(
-            origin_of("https://db.example.com:8443/mcp").as_deref(),
+            url_origin_of("https://db.example.com:8443/mcp").as_deref(),
             Some("https://db.example.com:8443")
         );
         assert_eq!(
-            origin_of("https://db.example.com/mcp").as_deref(),
+            url_origin_of("https://db.example.com/mcp").as_deref(),
             Some("https://db.example.com")
         );
     }

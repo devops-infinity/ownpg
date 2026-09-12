@@ -8,7 +8,7 @@ use ownpg_core::config::{
 use ownpg_core::connect::ssh::Hints;
 use ownpg_core::{Error, Result};
 
-use crate::cli::{ConnectionArgs, GlobalArgs, ModeArg, ServeArgs, SshModeArg, SslModeArg};
+use crate::cli::{ConnectionArgs, GlobalArgs, ModeArg, ServeArgs, SshTransportArg, SslModeArg};
 
 pub(crate) const KEYCHAIN_SERVICE: &str = "ownpg";
 
@@ -67,7 +67,7 @@ pub(crate) fn keychain_lookup(account: &str) -> Result<Option<String>> {
     }
 }
 
-pub(crate) fn hints(env: &Environment) -> Hints {
+pub(crate) fn ssh_hints(env: &Environment) -> Hints {
     Hints {
         home: env.home().map(Path::to_path_buf),
         agent_socket: env.var("SSH_AUTH_SOCK").map(PathBuf::from),
@@ -80,10 +80,10 @@ pub(crate) fn flag_layer(
     global: &GlobalArgs,
     serve: Option<&ServeArgs>,
 ) -> Result<FlagLayer> {
-    if connection.ssh_mode == Some(SshModeArg::System) && connection.ssh_trust_new_host {
+    if connection.ssh_transport == Some(SshTransportArg::System) && connection.ssh_trust_new_host {
         return Err(Error::ArgumentInvalid {
             argument: "--ssh-trust-new-host".to_owned(),
-            detail: "the system ssh command manages its own known hosts; drop the flag or use --ssh-mode in-process".to_owned(),
+            detail: "the system ssh command manages its own known hosts; drop the flag or use --ssh-transport in-process".to_owned(),
         });
     }
     let tools = if connection.tools.is_empty() {
@@ -104,9 +104,9 @@ pub(crate) fn flag_layer(
         tools,
         strict_role: connection.strict_role.then_some(true),
         ssh: connection.ssh.clone(),
-        ssh_transport: connection.ssh_mode.map(|mode| match mode {
-            SshModeArg::InProcess => SshTransport::InProcess,
-            SshModeArg::System => SshTransport::System,
+        ssh_transport: connection.ssh_transport.map(|mode| match mode {
+            SshTransportArg::InProcess => SshTransport::InProcess,
+            SshTransportArg::System => SshTransport::System,
         }),
         ssh_trust_new_host: connection.ssh_trust_new_host.then_some(true),
         no_input: global.no_input.then_some(true),
@@ -174,7 +174,7 @@ mod tests {
         assert_eq!(plain.no_input, None);
         let refused = flag_layer(
             &ConnectionArgs {
-                ssh_mode: Some(SshModeArg::System),
+                ssh_transport: Some(SshTransportArg::System),
                 ssh_trust_new_host: true,
                 ..ConnectionArgs::default()
             },

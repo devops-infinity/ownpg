@@ -7,9 +7,9 @@ use super::{
     scoped_name,
 };
 use crate::error::{Error, Result};
-use crate::groups;
 use crate::render::{expression, ident_list, quote_ident, type_name, validate_ident};
 use crate::shape::ResultSet;
+use crate::tool_specs;
 use crate::tools::read::classify_checked;
 use crate::tools::{Call, Outcome, Route, route};
 
@@ -178,7 +178,7 @@ pub fn index(call: Call, args: IndexArgs) -> BoxFuture<'static, Outcome> {
                     ));
                 }
                 if args.nulls_not_distinct {
-                    if !call.engine().features().nulls_not_distinct() {
+                    if !call.engine().features().supports_nulls_not_distinct() {
                         return Err(Error::ArgumentInvalid {
                             argument: "nulls_not_distinct".to_owned(),
                             detail: "NULLS NOT DISTINCT needs PostgreSQL 15 or later".to_owned(),
@@ -367,7 +367,7 @@ pub fn view(call: Call, args: ViewArgs) -> BoxFuture<'static, Outcome> {
                     )
                 } else {
                     let options = if args.security_invoker {
-                        if !call.engine().features().security_invoker() {
+                        if !call.engine().features().supports_security_invoker() {
                             return Err(Error::ArgumentInvalid {
                                 argument: "security_invoker".to_owned(),
                                 detail: "security_invoker needs PostgreSQL 15 or later".to_owned(),
@@ -632,9 +632,13 @@ pub fn sequence(call: Call, args: SequenceArgs) -> BoxFuture<'static, Outcome> {
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<IndexArgs, ResultSet, _>(&groups::PG_INDEX, INDEX_DESCRIPTION, index)?,
-        route::<ViewArgs, ResultSet, _>(&groups::PG_VIEW, VIEW_DESCRIPTION, view)?,
-        route::<SequenceArgs, ResultSet, _>(&groups::PG_SEQUENCE, SEQUENCE_DESCRIPTION, sequence)?,
+        route::<IndexArgs, ResultSet, _>(&tool_specs::PG_INDEX, INDEX_DESCRIPTION, index)?,
+        route::<ViewArgs, ResultSet, _>(&tool_specs::PG_VIEW, VIEW_DESCRIPTION, view)?,
+        route::<SequenceArgs, ResultSet, _>(
+            &tool_specs::PG_SEQUENCE,
+            SEQUENCE_DESCRIPTION,
+            sequence,
+        )?,
     ])
 }
 

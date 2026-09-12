@@ -9,9 +9,9 @@ use crate::audit::Decision;
 use crate::classify::{Classification, StatementClass};
 use crate::config::Mode;
 use crate::error::Error;
-use crate::groups;
 use crate::render::{QualifiedName, expression, ident_list, quote_ident, quote_literal, verify};
 use crate::shape::{ResultSet, UNTRUSTED_NOTICE};
+use crate::tool_specs;
 
 const INSERT_DESCRIPTION: &str = "Insert one or more rows into a table of the scoped schema. Rows are JSON objects keyed by column name; values are converted to the column types by PostgreSQL. One statement inserts every row with the union of the columns the rows name: a column a row leaves out becomes NULL, and only a column no row names takes its default. on_conflict can ignore duplicates or update the listed columns. returning lists the columns to return (\"*\" for all). dry_run shows the statement without running it; transaction runs it inside an open handle.";
 
@@ -19,13 +19,13 @@ const UPDATE_DESCRIPTION: &str = "Update rows of a table in the scoped schema. s
 
 const DELETE_DESCRIPTION: &str = "Delete rows from a table in the scoped schema. filter is a SQL boolean expression placed after WHERE. A delete without a filter, or with a filter that is always true, removes every row and needs confirm: true (or the confirmation prompt). returning lists columns to return from the deleted rows.";
 
-const MERGE_DESCRIPTION: &str = "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. Matched rows have update_columns set from the source (default: every column except match_on); unmatched rows are inserted when insert is true. returning (PostgreSQL 17 and later) lists columns to return.";
+const MERGE_DESCRIPTION: &str = "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. Matched rows have update_columns set from the source (default: every column except match_on); unmatched rows are inserted when insert_unmatched is true. returning (PostgreSQL 17 and later) lists columns to return.";
 
 const RUN_WRITE_DESCRIPTION: &str = "Run one write statement written in SQL: INSERT, UPDATE, DELETE, MERGE, COPY ... FROM STDIN is refused here (use pg_copy), DO, or CALL. Exactly one statement per call. The statement is parsed and classified first: reads are refused (use pg_run_query), schema changes are refused (use the DDL tools), and destructive shapes (a DELETE or UPDATE without a narrowing WHERE) need confirm: true or the confirmation prompt. dry_run returns the classification without running anything. A statement the parser cannot read is refused in read-only and write-only modes; in read-write mode it runs with confirm: true through the extended query protocol, which lets PostgreSQL itself refuse a batch, and the audit record carries the decision unparsed.";
 
 const COPY_DESCRIPTION: &str = "Move rows in bulk. direction in loads data into a table from the data argument through COPY FROM STDIN; direction out returns the rows of a table or a read query through COPY TO STDOUT, cut at the byte cap. Formats are text and csv; binary is refused. COPY never touches a file or a program on the database host.";
 
-fn control_default_returning() -> Vec<String> {
+fn default_returning() -> Vec<String> {
     Vec::new()
 }
 
@@ -56,7 +56,7 @@ pub struct InsertArgs {
         description = "Columns to overwrite on conflict when on_conflict is update. Default: every inserted column except the conflict columns."
     )]
     pub update_columns: Vec<String>,
-    #[serde(default = "control_default_returning")]
+    #[serde(default = "default_returning")]
     #[schemars(
         description = "Columns to return, or [\"*\"] for every column. Empty returns nothing."
     )]
@@ -81,7 +81,7 @@ pub struct UpdateArgs {
         description = "SQL boolean expression placed after WHERE. Empty means every row and needs confirmation."
     )]
     pub filter: String,
-    #[serde(default = "control_default_returning")]
+    #[serde(default = "default_returning")]
     #[schemars(description = "Columns to return, or [\"*\"] for every column.")]
     pub returning: Vec<String>,
     #[serde(default)]
@@ -110,7 +110,7 @@ pub struct DeleteArgs {
         description = "SQL boolean expression placed after WHERE. Empty means every row and needs confirmation."
     )]
     pub filter: String,
-    #[serde(default = "control_default_returning")]
+    #[serde(default = "default_returning")]
     #[schemars(description = "Columns to return from the deleted rows, or [\"*\"].")]
     pub returning: Vec<String>,
     #[serde(default)]
@@ -140,8 +140,8 @@ pub struct MergeArgs {
     pub update_columns: Vec<String>,
     #[serde(default = "default_true")]
     #[schemars(description = "Insert rows that match nothing (default true).")]
-    pub insert: bool,
-    #[serde(default = "control_default_returning")]
+    pub insert_unmatched: bool,
+    #[serde(default = "default_returning")]
     #[schemars(description = "PostgreSQL 17 and later: columns to return, or [\"*\"].")]
     pub returning: Vec<String>,
     #[serde(default)]
@@ -245,7 +245,7 @@ pub struct DryRun {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CopyOutResult {
     pub data: String,
-    pub bytes: usize,
+    pub data_bytes: usize,
     pub truncated: bool,
     pub notice: &'static str,
 }
@@ -304,7 +304,7 @@ pub fn dry_run_reply(sql: &str, classification: &Classification) -> Outcome {
         sql: sql.to_owned(),
         kind: classification.kind.clone(),
         class: classification.class.as_str().to_owned(),
-        destructive: classification.destructive.clone(),
+        destructive: classification.destructive_reason.clone(),
         fingerprint: classification.fingerprint.clone(),
         notice: UNTRUSTED_NOTICE,
     };
@@ -360,10 +360,10 @@ pub async fn execute(
         )
         .await
         .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
-    finish(result, facts)
+    rows_reply(result, facts)
 }
 
-fn finish(result: ResultSet, facts: AuditFacts) -> Outcome {
+fn rows_reply(result: ResultSet, facts: AuditFacts) -> Outcome {
     let facts = facts.with_result(&result);
     let text = result.render_text();
     Ok(ToolOutput::structured(&result, text)?
@@ -384,14 +384,14 @@ pub fn insert(call: Call, args: InsertArgs) -> BoxFuture<'static, Outcome> {
         }
         let columns = column_union(&args.rows)?;
         let column_sql = ident_list("rows", &columns)?;
-        let source_sql: Vec<String> = columns
+        let source_columns: Vec<String> = columns
             .iter()
             .map(|column| format!("source.{}", quote_ident(column)))
             .collect();
         let mut sql = format!(
             "INSERT INTO {} ({column_sql}) SELECT {} FROM jsonb_populate_recordset(NULL::{}, {}) AS source",
             table.sql(),
-            source_sql.join(", "),
+            source_columns.join(", "),
             table.sql(),
             json_literal(&serde_json::Value::Array(
                 args.rows
@@ -425,7 +425,7 @@ pub fn insert(call: Call, args: InsertArgs) -> BoxFuture<'static, Outcome> {
                     args.update_columns.clone()
                 };
                 ident_list("update_columns", &updates)?;
-                let set: Vec<String> = updates
+                let assignments: Vec<String> = updates
                     .iter()
                     .map(|column| {
                         let quoted = quote_ident(column);
@@ -434,7 +434,7 @@ pub fn insert(call: Call, args: InsertArgs) -> BoxFuture<'static, Outcome> {
                     .collect();
                 sql.push_str(&format!(
                     " ON CONFLICT ({targets}) DO UPDATE SET {}",
-                    set.join(", ")
+                    assignments.join(", ")
                 ));
             }
         }
@@ -466,14 +466,14 @@ pub fn update(call: Call, args: UpdateArgs) -> BoxFuture<'static, Outcome> {
         }
         let columns: Vec<String> = args.set.keys().cloned().collect();
         let column_sql = ident_list("set", &columns)?;
-        let picks: Vec<String> = columns
+        let source_columns: Vec<String> = columns
             .iter()
             .map(|column| format!("source.{}", quote_ident(column)))
             .collect();
         let mut sql = format!(
             "UPDATE {} SET ({column_sql}) = (SELECT {} FROM jsonb_populate_record(NULL::{}, {}) AS source)",
             table.sql(),
-            picks.join(", "),
+            source_columns.join(", "),
             table.sql(),
             json_literal(&serde_json::Value::Object(args.set.clone()))
         );
@@ -481,7 +481,7 @@ pub fn update(call: Call, args: UpdateArgs) -> BoxFuture<'static, Outcome> {
             sql.push_str(&format!(" WHERE {}", expression("filter", &args.filter)?));
         }
         if args.returning_old_new {
-            if !call.engine().features().returning_old_new() {
+            if !call.engine().features().supports_returning_old_new() {
                 return Err(Error::ArgumentInvalid {
                     argument: "returning_old_new".to_owned(),
                     detail: "RETURNING OLD and NEW needs PostgreSQL 18 or later".to_owned(),
@@ -541,14 +541,14 @@ pub fn delete(call: Call, args: DeleteArgs) -> BoxFuture<'static, Outcome> {
 pub fn merge(call: Call, args: MergeArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let features = call.engine().features();
-        if !features.merge() {
+        if !features.supports_merge() {
             return Err(Error::ArgumentInvalid {
                 argument: "operation".to_owned(),
                 detail: "MERGE needs PostgreSQL 15 or later".to_owned(),
             }
             .into());
         }
-        if !args.returning.is_empty() && !features.merge_returning() {
+        if !args.returning.is_empty() && !features.supports_merge_returning() {
             return Err(Error::ArgumentInvalid {
                 argument: "returning".to_owned(),
                 detail: "MERGE ... RETURNING needs PostgreSQL 17 or later".to_owned(),
@@ -609,24 +609,27 @@ pub fn merge(call: Call, args: MergeArgs) -> BoxFuture<'static, Outcome> {
         if updates.is_empty() {
             sql.push_str(" WHEN MATCHED THEN DO NOTHING");
         } else {
-            let set: Vec<String> = updates
+            let assignments: Vec<String> = updates
                 .iter()
                 .map(|column| {
                     let quoted = quote_ident(column);
                     format!("{quoted} = source.{quoted}")
                 })
                 .collect();
-            sql.push_str(&format!(" WHEN MATCHED THEN UPDATE SET {}", set.join(", ")));
+            sql.push_str(&format!(
+                " WHEN MATCHED THEN UPDATE SET {}",
+                assignments.join(", ")
+            ));
         }
-        if args.insert {
-            let picks: Vec<String> = columns
+        if args.insert_unmatched {
+            let source_columns: Vec<String> = columns
                 .iter()
                 .map(|column| format!("source.{}", quote_ident(column)))
                 .collect();
             sql.push_str(&format!(
                 " WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
                 ident_list("rows", &columns)?,
-                picks.join(", ")
+                source_columns.join(", ")
             ));
         }
         sql.push_str(&returning_prefixed(&args.returning, "target.")?);
@@ -753,7 +756,7 @@ async fn run_unparsed(call: &Call, sql: &str, args: &RunWriteArgs) -> Outcome {
         .run_unparsed(sql, call.caps(0), &call.principal, handle)
         .await
         .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
-    finish(result, facts)
+    rows_reply(result, facts)
 }
 
 fn copy_options(args: &CopyArgs) -> Result<String, Error> {
@@ -873,7 +876,7 @@ pub fn copy(call: Call, args: CopyArgs) -> BoxFuture<'static, Outcome> {
                     .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
                 let data = crate::shape::sanitize(&String::from_utf8_lossy(&bytes));
                 let result = CopyOutResult {
-                    bytes: data.len(),
+                    data_bytes: data.len(),
                     truncated,
                     data,
                     notice: UNTRUSTED_NOTICE,
@@ -898,16 +901,16 @@ pub fn copy(call: Call, args: CopyArgs) -> BoxFuture<'static, Outcome> {
 
 pub fn routes() -> Result<Vec<Route>, Error> {
     Ok(vec![
-        route::<InsertArgs, ResultSet, _>(&groups::PG_INSERT, INSERT_DESCRIPTION, insert)?,
-        route::<UpdateArgs, ResultSet, _>(&groups::PG_UPDATE, UPDATE_DESCRIPTION, update)?,
-        route::<DeleteArgs, ResultSet, _>(&groups::PG_DELETE, DELETE_DESCRIPTION, delete)?,
-        route::<MergeArgs, ResultSet, _>(&groups::PG_MERGE, MERGE_DESCRIPTION, merge)?,
+        route::<InsertArgs, ResultSet, _>(&tool_specs::PG_INSERT, INSERT_DESCRIPTION, insert)?,
+        route::<UpdateArgs, ResultSet, _>(&tool_specs::PG_UPDATE, UPDATE_DESCRIPTION, update)?,
+        route::<DeleteArgs, ResultSet, _>(&tool_specs::PG_DELETE, DELETE_DESCRIPTION, delete)?,
+        route::<MergeArgs, ResultSet, _>(&tool_specs::PG_MERGE, MERGE_DESCRIPTION, merge)?,
         route::<RunWriteArgs, ResultSet, _>(
-            &groups::PG_RUN_WRITE,
+            &tool_specs::PG_RUN_WRITE,
             RUN_WRITE_DESCRIPTION,
             run_write,
         )?,
-        route::<CopyArgs, CopyOutResult, _>(&groups::PG_COPY, COPY_DESCRIPTION, copy)?,
+        route::<CopyArgs, CopyOutResult, _>(&tool_specs::PG_COPY, COPY_DESCRIPTION, copy)?,
     ])
 }
 

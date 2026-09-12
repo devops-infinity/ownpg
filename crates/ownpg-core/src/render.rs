@@ -5,9 +5,9 @@ use crate::error::{Error, Result};
 
 pub const IDENT_MAX_BYTES: usize = 63;
 
-pub fn validate_ident(kind: &str, name: &str) -> Result<()> {
+pub fn validate_ident(argument: &str, name: &str) -> Result<()> {
     let invalid = |detail: &str| Error::ArgumentInvalid {
-        argument: kind.to_owned(),
+        argument: argument.to_owned(),
         detail: format!("`{name}` {detail}"),
     };
     if name.is_empty() {
@@ -49,9 +49,9 @@ pub struct QualifiedName {
 }
 
 impl QualifiedName {
-    pub fn parse(kind: &str, input: &str, scoped_schema: &str) -> Result<Self> {
+    pub fn parse(argument: &str, input: &str, scoped_schema: &str) -> Result<Self> {
         let (schema, name) = crate::tools::catalog::split_name(input, scoped_schema);
-        validate_ident(kind, &name)?;
+        validate_ident(argument, &name)?;
         validate_ident("schema", &schema)?;
         if schema != scoped_schema && !classify::CATALOG_SCHEMAS.contains(&schema.as_str()) {
             return Err(Error::StatementRefused {
@@ -75,16 +75,16 @@ impl QualifiedName {
     }
 }
 
-pub fn ident_list(kind: &str, names: &[String]) -> Result<String> {
+pub fn ident_list(argument: &str, names: &[String]) -> Result<String> {
     if names.is_empty() {
         return Err(Error::ArgumentInvalid {
-            argument: kind.to_owned(),
+            argument: argument.to_owned(),
             detail: "at least one name is required".to_owned(),
         });
     }
     let mut out = String::new();
     for (index, name) in names.iter().enumerate() {
-        validate_ident(kind, name)?;
+        validate_ident(argument, name)?;
         if index > 0 {
             out.push_str(", ");
         }

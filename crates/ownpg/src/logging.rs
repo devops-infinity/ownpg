@@ -14,20 +14,20 @@ pub(crate) struct LogGuard {
     _worker: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
-pub(crate) fn filter(global: &GlobalArgs, rust_log: Option<&str>) -> EnvFilter {
+pub(crate) fn log_filter(global: &GlobalArgs, rust_log: Option<&str>) -> EnvFilter {
     let base = match (global.quiet, global.verbose) {
         (true, _) => "error",
         (false, 0) => "warn,ownpg=info,ownpg_core=info,rmcp=warn",
         (false, 1) => "info,ownpg=debug,ownpg_core=debug",
         (false, _) => "trace",
     };
-    let mut filter = rust_log
+    let mut env_filter = rust_log
         .and_then(|value| EnvFilter::try_new(value).ok())
         .unwrap_or_else(|| EnvFilter::new(base));
     if global.quiet {
         for directive in ["ownpg=error", "ownpg_core=error"] {
             if let Ok(parsed) = directive.parse() {
-                filter = filter.add_directive(parsed);
+                env_filter = env_filter.add_directive(parsed);
             }
         }
     } else if global.verbose > 0 && rust_log.is_some() {
@@ -38,23 +38,23 @@ pub(crate) fn filter(global: &GlobalArgs, rust_log: Option<&str>) -> EnvFilter {
         };
         for target in ["ownpg", "ownpg_core"] {
             if let Ok(parsed) = format!("{target}={level}").parse() {
-                filter = filter.add_directive(parsed);
+                env_filter = env_filter.add_directive(parsed);
             }
         }
     }
-    filter
+    env_filter
 }
 
 pub(crate) fn init(global: &GlobalArgs, paths: &AppPaths) -> Result<LogGuard> {
     let rust_log = std::env::var("RUST_LOG").ok();
-    let filter = filter(global, rust_log.as_deref());
-    let stderr = tracing_subscriber::fmt::layer()
+    let env_filter = log_filter(global, rust_log.as_deref());
+    let stderr_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(false)
         .with_writer(io::stderr);
-    let stderr = match global.log_format {
-        LogFormatArg::Text => stderr.boxed(),
-        LogFormatArg::Json => stderr.json().flatten_event(true).boxed(),
+    let stderr_layer = match global.log_format {
+        LogFormatArg::Text => stderr_layer.boxed(),
+        LogFormatArg::Json => stderr_layer.json().flatten_event(true).boxed(),
     };
     let (file_layer, worker) = match &global.log_file {
         Some(path) => {
@@ -82,8 +82,8 @@ pub(crate) fn init(global: &GlobalArgs, paths: &AppPaths) -> Result<LogGuard> {
         None => (None, None),
     };
     tracing_subscriber::registry()
-        .with(filter)
-        .with(stderr)
+        .with(env_filter)
+        .with(stderr_layer)
         .with(file_layer)
         .try_init()
         .map_err(|error| Error::ProtocolFailed {
@@ -117,15 +117,15 @@ mod tests {
 
     #[test]
     fn verbosity_and_rust_log_compose() {
-        let default = filter(&global(0, false), None).to_string();
+        let default = log_filter(&global(0, false), None).to_string();
         for directive in ["warn", "ownpg=info", "ownpg_core=info", "rmcp=warn"] {
             assert!(default.contains(directive), "{default}");
         }
-        assert_eq!(filter(&global(2, false), None).to_string(), "trace");
-        let composed = filter(&global(1, false), Some("rmcp=debug")).to_string();
+        assert_eq!(log_filter(&global(2, false), None).to_string(), "trace");
+        let composed = log_filter(&global(1, false), Some("rmcp=debug")).to_string();
         assert!(composed.contains("rmcp=debug"));
         assert!(composed.contains("ownpg=debug"));
-        let quiet = filter(&global(0, true), Some("info")).to_string();
+        let quiet = log_filter(&global(0, true), Some("info")).to_string();
         assert!(quiet.contains("ownpg=error"));
     }
 

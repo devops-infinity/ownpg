@@ -159,7 +159,7 @@ impl fmt::Display for StatementClass {
 pub struct Classification {
     pub class: StatementClass,
     pub kind: String,
-    pub destructive: Option<String>,
+    pub destructive_reason: Option<String>,
     pub refusals: Vec<String>,
     pub relations: Vec<RelationName>,
     pub functions: Vec<String>,
@@ -177,7 +177,7 @@ pub struct RelationName {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Scope<'a> {
+pub struct SchemaScope<'a> {
     pub schema: &'a str,
     pub require_qualified_names: bool,
 }
@@ -226,7 +226,7 @@ pub fn classify(sql: &str) -> Result<Classification> {
     let mut classification = Classification {
         class: StatementClass::Read,
         kind: kind.clone(),
-        destructive: None,
+        destructive_reason: None,
         refusals: Vec::new(),
         relations: found.relations,
         functions: found.functions.clone(),
@@ -265,7 +265,7 @@ pub fn classify(sql: &str) -> Result<Classification> {
             StatementClass::Read
         };
         if !analyze {
-            classification.destructive = None;
+            classification.destructive_reason = None;
         }
     }
     for function in &found.functions {
@@ -297,13 +297,13 @@ pub fn classify(sql: &str) -> Result<Classification> {
     classification.class = strongest;
     classification.returning = found.returning;
     classification.runs_outside_transaction = found.outside_transaction;
-    if classification.destructive.is_none() && classification.class != StatementClass::Read {
-        classification.destructive = found.destructive.clone();
+    if classification.destructive_reason.is_none() && classification.class != StatementClass::Read {
+        classification.destructive_reason = found.destructive_reason.clone();
     }
     Ok(classification)
 }
 
-pub fn check(classification: &Classification, mode: Mode, scope: &Scope<'_>) -> Result<()> {
+pub fn check(classification: &Classification, mode: Mode, scope: &SchemaScope<'_>) -> Result<()> {
     let refuse = |rule: String| Error::StatementRefused {
         rule,
         mode: mode.to_string(),
@@ -346,7 +346,7 @@ struct Findings {
     functions: Vec<String>,
     relations: Vec<RelationName>,
     copies: Vec<CopyShape>,
-    destructive: Option<String>,
+    destructive_reason: Option<String>,
     returning: bool,
     outside_transaction: bool,
 }
@@ -531,7 +531,7 @@ fn walk(value: &Value, found: &mut Findings) {
             for (key, child) in object {
                 match key.as_str() {
                     "FuncCall" => {
-                        if let Some(name) = string_list(child.get("funcname")) {
+                        if let Some(name) = dotted_name(child.get("funcname")) {
                             found.functions.push(name);
                         }
                     }
@@ -623,7 +623,7 @@ fn walk(value: &Value, found: &mut Findings) {
                         found.outside_transaction = true;
                     }
                     "CreateFunctionStmt" | "AlterFunctionStmt" => {
-                        if let Some(name) = string_list(
+                        if let Some(name) = dotted_name(
                             child
                                 .get("funcname")
                                 .or_else(|| child.pointer("/func/objname")),
@@ -654,12 +654,12 @@ fn walk(value: &Value, found: &mut Findings) {
 }
 
 fn note_destructive(found: &mut Findings, reason: &str) {
-    if found.destructive.is_none() {
-        found.destructive = Some(reason.to_owned());
+    if found.destructive_reason.is_none() {
+        found.destructive_reason = Some(reason.to_owned());
     }
 }
 
-fn string_list(value: Option<&Value>) -> Option<String> {
+fn dotted_name(value: Option<&Value>) -> Option<String> {
     let items = value?.as_array()?;
     let parts: Vec<&str> = items
         .iter()
@@ -670,11 +670,11 @@ fn string_list(value: Option<&Value>) -> Option<String> {
 
 fn qualified_name(value: &Value) -> Option<RelationName> {
     if let Some(list) = value.pointer("/node/List/items") {
-        let joined = string_list(Some(list))?;
+        let joined = dotted_name(Some(list))?;
         return split_qualified(&joined);
     }
     if let Some(objname) = value.pointer("/node/ObjectWithArgs/objname") {
-        let joined = string_list(Some(objname))?;
+        let joined = dotted_name(Some(objname))?;
         return split_qualified(&joined);
     }
     if let Some(name) = value.pointer("/node/String/sval").and_then(Value::as_str) {
@@ -738,7 +738,7 @@ mod tests {
     use super::*;
     use crate::error::ErrorId;
 
-    const SCOPE: Scope<'static> = Scope {
+    const SCOPE: SchemaScope<'static> = SchemaScope {
         schema: "app",
         require_qualified_names: false,
     };
@@ -817,7 +817,7 @@ mod tests {
             classification.normalized,
             "SELECT id, name FROM orders WHERE id = $1"
         );
-        assert!(classification.destructive.is_none());
+        assert!(classification.destructive_reason.is_none());
     }
 
     #[test]
@@ -857,7 +857,7 @@ mod tests {
         );
         assert_eq!(insert.class, StatementClass::Write);
         assert!(insert.returning);
-        assert!(insert.destructive.is_none());
+        assert!(insert.destructive_reason.is_none());
         allowed("UPDATE orders SET a = 2 WHERE id = 1", Mode::WriteOnly);
         allowed("DELETE FROM orders WHERE id = 1", Mode::WriteOnly);
         allowed("COPY orders FROM STDIN", Mode::WriteOnly);
@@ -918,7 +918,7 @@ mod tests {
         ] {
             let classification = classify_ok(sql);
             let reason = classification
-                .destructive
+                .destructive_reason
                 .unwrap_or_else(|| panic!("{sql} was not flagged"));
             assert!(reason.contains(expected), "{sql}: {reason}");
         }
@@ -930,7 +930,10 @@ mod tests {
             "INSERT INTO orders VALUES (1)",
             "CREATE TABLE t (a int)",
         ] {
-            assert!(classify_ok(sql).destructive.is_none(), "{sql} was flagged");
+            assert!(
+                classify_ok(sql).destructive_reason.is_none(),
+                "{sql} was flagged"
+            );
         }
     }
 
@@ -949,7 +952,7 @@ mod tests {
         let plain = classify_ok("EXPLAIN DELETE FROM orders");
         assert_eq!(plain.class, StatementClass::Read);
         assert!(!plain.explain_analyze);
-        assert!(plain.destructive.is_none());
+        assert!(plain.destructive_reason.is_none());
         let analyzed = classify_ok("EXPLAIN (ANALYZE) DELETE FROM orders");
         assert_eq!(analyzed.class, StatementClass::Write);
         assert!(analyzed.explain_analyze);
@@ -960,7 +963,7 @@ mod tests {
 
     #[test]
     fn a_pooled_scope_requires_qualified_names() {
-        let scope = Scope {
+        let scope = SchemaScope {
             schema: "app",
             require_qualified_names: true,
         };

@@ -95,7 +95,7 @@ pub struct Session {
     pub info: SessionInfo,
     tls: Arc<Tls>,
     driver: tokio::task::JoinHandle<()>,
-    keep: Vec<Box<dyn std::any::Any + Send + Sync>>,
+    kept_alive: Vec<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl fmt::Debug for Session {
@@ -411,7 +411,7 @@ impl Connector {
         } else {
             Via::Tcp
         };
-        self.finish(
+        self.build_session(
             client,
             driver,
             tls,
@@ -445,10 +445,10 @@ impl Connector {
             });
         };
         let tunnel = ssh::open(ssh, &target_host, target_port, &self.ssh_hints).await?;
-        let (stream, route, keep) = tunnel.into_parts();
+        let (stream, route, kept_alive) = tunnel.into_parts();
         let target_name = format!("{target_host}:{target_port} via {}", route.join(" -> "));
         let mut session = self.connect_over(stream, &target_name, Via::Ssh).await?;
-        session.keep = keep;
+        session.kept_alive = kept_alive;
         Ok(session)
     }
 
@@ -493,7 +493,7 @@ impl Connector {
                 tracing::warn!(%error, "the database connection ended");
             }
         });
-        self.finish(
+        self.build_session(
             client,
             driver,
             &tls,
@@ -509,7 +509,7 @@ impl Connector {
         })
     }
 
-    async fn finish(
+    async fn build_session(
         &self,
         client: Client,
         driver: tokio::task::JoinHandle<()>,
@@ -577,7 +577,7 @@ impl Connector {
             },
             tls: Arc::clone(tls),
             driver,
-            keep: Vec::new(),
+            kept_alive: Vec::new(),
         })
     }
 }
@@ -662,10 +662,6 @@ pub fn describe_sqlstate(error: &tokio_postgres::Error) -> Error {
             message: error.to_string(),
         },
     }
-}
-
-pub fn is_socket(host: Option<&str>) -> bool {
-    host.is_none_or(presets::is_socket_directory)
 }
 
 #[cfg(test)]

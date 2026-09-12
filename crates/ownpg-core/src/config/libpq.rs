@@ -440,15 +440,15 @@ pub fn password_from_file(
             continue;
         }
         let matches = |field: &str, want: &str| field == "*" || field == want;
-        let (Some(h), Some(p), Some(d), Some(u)) =
+        let (Some(host_field), Some(port_field), Some(database_field), Some(user_field)) =
             (fields.first(), fields.get(1), fields.get(2), fields.get(3))
         else {
             continue;
         };
-        if matches(h, host_key)
-            && matches(p, &port_text)
-            && matches(d, database)
-            && matches(u, user)
+        if matches(host_field, host_key)
+            && matches(port_field, &port_text)
+            && matches(database_field, database)
+            && matches(user_field, user)
         {
             let password = fields
                 .get(4..)

@@ -80,7 +80,7 @@ impl Rig {
         result.structured_content.unwrap_or(Value::Null)
     }
 
-    async fn sql(&self, tool: &str, mut arguments: Value) -> String {
+    async fn dry_run_sql(&self, tool: &str, mut arguments: Value) -> String {
         arguments["dry_run"] = json!(true);
         let body = self.ok(tool, arguments).await;
         body["sql"].as_str().unwrap().to_owned()
@@ -133,7 +133,7 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
     }
 
     let create = rig
-        .sql(
+        .dry_run_sql(
             "pg_table",
             json!({
                 "operation": "create", "name": "customers",
@@ -236,7 +236,7 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
     )
     .await;
     let drop_constraint = rig
-        .sql(
+        .dry_run_sql(
             "pg_constraint",
             json!({"operation": "drop", "table": "orders", "name": "orders_note_unique", "confirm": true}),
         )
@@ -323,7 +323,7 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
     assert_eq!(bad_number["code"], "argument.invalid");
 
     let routine_sql = rig
-        .sql(
+        .dry_run_sql(
             "pg_routine",
             json!({
                 "operation": "create", "name": "order_total", "or_replace": true,
@@ -406,7 +406,7 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
     )
     .await;
     let available = rig
-        .ok("pg_extension", json!({"operation": "available"}))
+        .ok("pg_extension", json!({"operation": "list_available"}))
         .await;
     assert!(available["row_count"].as_u64().unwrap() > 0);
     let insert_row = rig
@@ -436,9 +436,9 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
     assert_eq!(touched["rows"][0][1], "12.50");
 
     let role_sql = rig
-        .sql(
+        .dry_run_sql(
             "pg_role",
-            json!({"operation": "create", "name": "app_reader", "login": "on", "password": "s3cret", "connection_limit": "5"}),
+            json!({"operation": "create", "name": "app_reader", "can_login": "on", "password": "s3cret", "connection_limit": "5"}),
         )
         .await;
     assert_eq!(
@@ -448,21 +448,21 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
     let refused_role = rig
         .failed(
             "pg_role",
-            json!({"operation": "create", "name": "app_reader", "login": "on"}),
+            json!({"operation": "create", "name": "app_reader", "can_login": "on"}),
         )
         .await;
     assert_eq!(refused_role["sqlstate"], "42501");
     let template = rig
-        .sql(
+        .dry_run_sql(
             "pg_privileges",
-            json!({"operation": "template", "name": "app_reader", "template": "read_only"}),
+            json!({"operation": "apply_template", "name": "app_reader", "template": "read_only"}),
         )
         .await;
     insta::assert_snapshot!("read_only_template", template);
     let grant_sql = rig
-        .sql(
+        .dry_run_sql(
             "pg_grant",
-            json!({"operation": "grant", "on": "all_tables", "privileges": ["select"], "roles": ["public"]}),
+            json!({"operation": "grant", "target": "all_tables", "privileges": ["select"], "roles": ["public"]}),
         )
         .await;
     assert_eq!(
@@ -471,7 +471,7 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
     );
     rig.ok(
         "pg_grant",
-        json!({"operation": "grant", "on": "table", "names": ["orders"], "privileges": ["select"], "roles": ["public"]}),
+        json!({"operation": "grant", "target": "table", "names": ["orders"], "privileges": ["select"], "roles": ["public"]}),
     )
     .await;
     rig.ok(
@@ -487,7 +487,7 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
     let privileges = rig
         .ok(
             "pg_privileges",
-            json!({"operation": "object", "name": "orders"}),
+            json!({"operation": "list_object", "name": "orders"}),
         )
         .await;
     assert!(
@@ -500,10 +500,10 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
     let mine = rig
         .ok(
             "pg_privileges",
-            json!({"operation": "role", "name": scratch.user}),
+            json!({"operation": "list_role", "name": scratch.user}),
         )
         .await;
-    assert_eq!(mine["schema_usage"], true);
+    assert_eq!(mine["has_schema_usage"], true);
     assert!(!mine["tables"].as_array().unwrap().is_empty());
 
     let drop_needs_confirm = rig

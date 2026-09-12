@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Refuse the wording the project bans
+      - name: refuse the wording the project bans
         run: |
           hits=$(git ls-files -- crates tools ':(top,glob)*.md' ':(exclude)**/LICENSE-*' |
             xargs grep -nIE 'legacy|backward.compat|inspired by|based on|ported from|fork of' 2>/dev/null |
@@ -41,7 +41,7 @@ jobs:
             exit 1
           fi
 
-      - name: Refuse the em dash the project bans
+      - name: refuse the em dash the project bans
         run: |
           em_dash="$(printf '\342\200\224')"
           hits=$(git ls-files -- crates tools ':(top,glob)*.md' | xargs grep -lI -- "$em_dash" 2>/dev/null || true)
@@ -51,7 +51,7 @@ jobs:
             exit 1
           fi
 
-      - name: Refuse the markdown table the project bans
+      - name: refuse the markdown table the project bans
         run: |
           hits=$(git ls-files -- ':(top,glob)*.md' | xargs grep -nE '^\s*\|.*\|\s*$' 2>/dev/null || true)
           if [ -n "$hits" ]; then
@@ -77,7 +77,7 @@ jobs:
       - name: shfmt tools/*.sh
         run: shfmt -d tools/*.sh
 
-  secrets:
+  secret-scan:
     name: secret scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -86,7 +86,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install gitleaks
+      - name: install gitleaks
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf -o gitleaks.tar.gz \
             https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
@@ -114,7 +114,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Confirm the pin still matches rust-version
+      - name: confirm the pin still matches rust-version
         if: matrix.toolchain != 'stable'
         run: |
           declared=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -123,7 +123,7 @@ jobs:
             exit 1
           fi
 
-      - name: Install the toolchain
+      - name: install the toolchain
         run: |
           rustup toolchain install "${{ matrix.toolchain }}" --profile minimal --no-self-update
           rustup component add rustfmt clippy --toolchain "${{ matrix.toolchain }}"
@@ -208,10 +208,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Install the toolchain
+      - name: install the toolchain
         run: rustup toolchain install stable --profile minimal --no-self-update
 
-      - name: Install the matching PostgreSQL client programs
+      - name: install the matching PostgreSQL client programs
         run: |
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y --no-install-recommends "postgresql-client-${{ matrix.postgres }}"
@@ -295,7 +295,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Install the toolchain
+      - name: install the toolchain
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup component add llvm-tools-preview --toolchain stable
@@ -349,7 +349,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Install the toolchain
+      - name: install the toolchain
         run: rustup toolchain install stable --profile minimal --no-self-update
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -366,10 +366,10 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Build the server
+      - name: build the server
         run: cargo build --locked -p ownpg --color=never
 
-      - name: Run the official conformance suite over Streamable HTTP
+      - name: run the official conformance suite over Streamable HTTP
         env:
           OWNPG_HOST: 127.0.0.1
           OWNPG_PORT: "5432"
@@ -421,7 +421,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Install the toolchain
+      - name: install the toolchain
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup component add clippy --toolchain stable
@@ -486,7 +486,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Install the toolchain and the target
+      - name: install the toolchain and the target
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add ${{ matrix.target }}
@@ -530,7 +530,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Install the toolchain
+      - name: install the toolchain
         run: rustup toolchain install "1.89" --profile minimal --no-self-update
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9

@@ -12,7 +12,7 @@ KEEP_BUILD=0
 STALE_DAYS="${OWNPG_STALE_DAYS:-7}"
 KEEP_INCREMENTAL=8
 BUILD_DIR=""
-DOOMED=""
+STALE_HASHES=""
 
 usage() {
 	cat <<'USAGE'
@@ -95,24 +95,24 @@ command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH"
 say INFO "repository $REPO"
 say INFO "profile $PROFILE, installing into $INSTALL_DIR"
 
-removed=0
-for candidate in "$INSTALL_DIR/$BIN" /usr/local/bin/"$BIN" "$HOME/.cargo/bin/$BIN"; do
-	if [[ -e "$candidate" ]]; then
-		rm -f "$candidate" && say INFO "removed $candidate"
-		removed=$((removed + 1))
+REMOVED=0
+for CANDIDATE in "$INSTALL_DIR/$BIN" /usr/local/bin/"$BIN" "$HOME/.cargo/bin/$BIN"; do
+	if [[ -e "$CANDIDATE" ]]; then
+		rm -f "$CANDIDATE" && say INFO "removed $CANDIDATE"
+		REMOVED=$((REMOVED + 1))
 	fi
 done
 if command -v cargo-uninstall >/dev/null 2>&1 || cargo uninstall --help >/dev/null 2>&1; then
 	cargo uninstall "$BIN" >/dev/null 2>&1 && say INFO "removed the cargo-installed copy" || true
 fi
-[[ $removed -eq 0 ]] && say INFO "no previously installed copy found"
+[[ $REMOVED -eq 0 ]] && say INFO "no previously installed copy found"
 
 if [[ $KEEP_CACHE -eq 0 ]]; then
-	for cache in \
+	for CACHE in \
 		"${XDG_CACHE_HOME:-$HOME/.cache}/ownpg" \
 		"${LOCALAPPDATA:-$HOME/AppData/Local}/devops/ownpg/cache"; do
-		if [[ -d "$cache" ]]; then
-			rm -rf "$cache" && say INFO "cleared cache $cache"
+		if [[ -d "$CACHE" ]]; then
+			rm -rf "$CACHE" && say INFO "cleared cache $CACHE"
 		fi
 	done
 fi
@@ -209,9 +209,9 @@ newest_mtime() {
 	printf '%s\n' "$newest"
 }
 
-add_doomed() {
+add_stale_hashes() {
 	[[ -n "$1" ]] || return 0
-	DOOMED="$(printf '%s\n%s\n' "$DOOMED" "$1")"
+	STALE_HASHES="$(printf '%s\n%s\n' "$STALE_HASHES" "$1")"
 }
 
 prune_stale_dirs() {
@@ -236,30 +236,30 @@ prune_stale_dirs() {
 prune_units() {
 	local dir=$1
 	local fingerprints="$dir/.fingerprint"
-	local live dated current stale found newest rustc_id hash entry
+	local live stamped current stale found newest rustc_id hash entry
 	[[ -d "$fingerprints" ]] || return 0
 
 	live="$(find "$fingerprints" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
 		sed -n 's|.*-\([0-9a-f]\{16\}\)$|\1|p' | sort -u)" || true
 	[[ -n "$live" ]] || return 0
 
-	DOOMED=""
+	STALE_HASHES=""
 	newest="$(mtimes "$fingerprints"/*/*.json 2>/dev/null | sort -rn | head -1)" || true
 	rustc_id=""
 	if [[ -n "$newest" ]]; then
 		rustc_id="$(sed -n 's|.*"rustc":\([0-9]*\).*|\1|p' "${newest#* }" 2>/dev/null | head -1)" || true
 	fi
 	if [[ -n "$rustc_id" ]]; then
-		dated="$(grep -l -F '"rustc":' "$fingerprints"/*/*.json 2>/dev/null |
+		stamped="$(grep -l -F '"rustc":' "$fingerprints"/*/*.json 2>/dev/null |
 			sed -n 's|.*-\([0-9a-f]\{16\}\)/[^/]*$|\1|p' | sort -u)" || true
 		current="$(grep -l -F "\"rustc\":$rustc_id," "$fingerprints"/*/*.json 2>/dev/null |
 			sed -n 's|.*-\([0-9a-f]\{16\}\)/[^/]*$|\1|p' | sort -u)" || true
-		if [[ -n "$dated" && -n "$current" ]]; then
-			stale="$(comm -23 <(printf '%s\n' "$dated") <(printf '%s\n' "$current"))" || true
+		if [[ -n "$stamped" && -n "$current" ]]; then
+			stale="$(comm -23 <(printf '%s\n' "$stamped") <(printf '%s\n' "$current"))" || true
 			if [[ -n "$stale" ]]; then
 				say INFO "dropping build data left by an older toolchain"
 			fi
-			add_doomed "$stale"
+			add_stale_hashes "$stale"
 		fi
 	fi
 
@@ -291,24 +291,24 @@ prune_units() {
 					}
 				}
 			' | sed -n 's|.*-\([0-9a-f]\{16\}\)\.d$|\1|p' | sort -u)" || true
-		add_doomed "$found"
+		add_stale_hashes "$found"
 	fi
 
 	if [[ -d "$dir/deps" ]]; then
 		found="$(find "$dir/deps" -mindepth 1 -maxdepth 1 2>/dev/null |
 			sed -n 's|.*/[^/]*-\([0-9a-f]\{16\}\)\(\..*\)\{0,1\}$|\1|p' | sort -u |
 			comm -23 - <(printf '%s\n' "$live"))" || true
-		add_doomed "$found"
+		add_stale_hashes "$found"
 	fi
 
 	if [[ -d "$dir/build" ]]; then
 		found="$(find "$dir/build" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
 			sed -n 's|.*-\([0-9a-f]\{16\}\)$|\1|p' | sort -u |
 			comm -23 - <(printf '%s\n' "$live"))" || true
-		add_doomed "$found"
+		add_stale_hashes "$found"
 	fi
 
-	[[ -n "$DOOMED" ]] || return 0
+	[[ -n "$STALE_HASHES" ]] || return 0
 	while IFS= read -r hash; do
 		[[ -n "$hash" ]] || continue
 		for entry in \
@@ -320,8 +320,8 @@ prune_units() {
 				drop_path "$entry"
 			fi
 		done
-	done < <(printf '%s\n' "$DOOMED" | sort -u)
-	DOOMED=""
+	done < <(printf '%s\n' "$STALE_HASHES" | sort -u)
+	STALE_HASHES=""
 }
 
 prune_incremental() {
@@ -452,15 +452,15 @@ chmod 755 "$INSTALL_DIR/$BIN" 2>/dev/null || true
 say SUCCESS "installed $INSTALL_DIR/$BIN"
 
 if command -v shasum >/dev/null 2>&1; then
-	sum() { shasum -a 256 "$1" | cut -d' ' -f1; }
+	checksum() { shasum -a 256 "$1" | cut -d' ' -f1; }
 elif command -v sha256sum >/dev/null 2>&1; then
-	sum() { sha256sum "$1" | cut -d' ' -f1; }
+	checksum() { sha256sum "$1" | cut -d' ' -f1; }
 else
 	die "need shasum or sha256sum to prove the installed copy matches"
 fi
-BUILT_SUM="$(sum "$BUILT")"
-LIVE_SUM="$(sum "$INSTALL_DIR/$BIN")"
-[[ "$BUILT_SUM" == "$LIVE_SUM" ]] || die "the installed binary does not match the built one"
+BUILT_SUM="$(checksum "$BUILT")"
+INSTALLED_SUM="$(checksum "$INSTALL_DIR/$BIN")"
+[[ "$BUILT_SUM" == "$INSTALLED_SUM" ]] || die "the installed binary does not match the built one"
 say SUCCESS "installed copy matches the build"
 
 RESOLVED="$(command -v "$BIN" 2>/dev/null || true)"

@@ -33,7 +33,7 @@ pub struct Hints {
 pub struct Tunnel {
     pub stream: TunnelStream,
     pub route: Vec<String>,
-    keep: Vec<Box<dyn std::any::Any + Send + Sync>>,
+    kept_alive: Vec<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Tunnel {
@@ -52,7 +52,7 @@ impl Tunnel {
         Vec<String>,
         Vec<Box<dyn std::any::Any + Send + Sync>>,
     ) {
-        (self.stream, self.route, self.keep)
+        (self.stream, self.route, self.kept_alive)
     }
 }
 
@@ -334,7 +334,7 @@ async fn open_in_process(
     Ok(Tunnel {
         stream,
         route,
-        keep: vec![Box::new(handles)],
+        kept_alive: vec![Box::new(handles)],
     })
 }
 
@@ -565,7 +565,7 @@ async fn open_system(
             "{}@{}:{} (system ssh)",
             bastion.user, bastion.host, bastion.port
         )],
-        keep: vec![Box::new(session), Box::new(socket_dir)],
+        kept_alive: vec![Box::new(session), Box::new(socket_dir)],
     })
 }
 

@@ -222,8 +222,8 @@ impl Server {
                     Vec::new()
                 } else {
                     match name.as_str() {
-                        "database" => starts_with(&database, value),
-                        "schema" => starts_with(&schema, value),
+                        "database" => matching_prefix(&database, value),
+                        "schema" => matching_prefix(&schema, value),
                         "table" => self.complete_tables(&schema, value).await?,
                         _ => Vec::new(),
                     }
@@ -243,7 +243,9 @@ impl Server {
             .await
             .map_err(completion_error)?;
         rows.iter()
-            .map(|row| crate::tools::catalog::get::<String>(row, 0).map_err(completion_error))
+            .map(|row| {
+                crate::tools::catalog::read_column::<String>(row, 0).map_err(completion_error)
+            })
             .collect()
     }
 
@@ -261,12 +263,14 @@ impl Server {
             .await
             .map_err(completion_error)?;
         rows.iter()
-            .map(|row| crate::tools::catalog::get::<String>(row, 0).map_err(completion_error))
+            .map(|row| {
+                crate::tools::catalog::read_column::<String>(row, 0).map_err(completion_error)
+            })
             .collect()
     }
 }
 
-fn starts_with(candidate: &str, prefix: &str) -> Vec<String> {
+fn matching_prefix(candidate: &str, prefix: &str) -> Vec<String> {
     if candidate.starts_with(prefix) {
         vec![candidate.to_owned()]
     } else {

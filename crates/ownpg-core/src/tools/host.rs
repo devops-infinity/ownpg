@@ -16,8 +16,8 @@ use crate::classify::{Classification, StatementClass};
 use crate::config::Settings;
 use crate::connect::{Endpoint, Via};
 use crate::error::{Error, Result};
-use crate::groups;
 use crate::shape::UNTRUSTED_NOTICE;
+use crate::tool_specs;
 
 pub const PROGRAMS: [&str; 5] = [
     "pg_dump",
@@ -206,7 +206,7 @@ async fn connection_env(call: &Call) -> Result<ConnectionEnv> {
                 path: settings.paths.data_dir.clone(),
                 source: error,
             })?;
-        restrict(file.path())?;
+        restrict_file(file.path())?;
         std::io::Write::write_all(
             &mut file,
             format!(
@@ -231,7 +231,7 @@ async fn connection_env(call: &Call) -> Result<ConnectionEnv> {
     })
 }
 
-fn restrict(path: &Path) -> Result<()> {
+fn restrict_file(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -317,7 +317,7 @@ fn prepared_file(dir: &Path, name: &str) -> Result<PathBuf> {
             path: path.clone(),
             source: error,
         })?;
-    restrict(&path)?;
+    restrict_file(&path)?;
     Ok(path)
 }
 
@@ -467,19 +467,19 @@ struct Job {
     cwd: Option<PathBuf>,
     dry_run: bool,
     confirm: bool,
-    destructive: Option<String>,
+    destructive_reason: Option<String>,
     timeout_seconds: u64,
 }
 
 fn synthetic_classification(
     kind: &str,
     command: &str,
-    destructive: Option<String>,
+    destructive_reason: Option<String>,
 ) -> Classification {
     Classification {
         class: StatementClass::Maintenance,
         kind: kind.to_owned(),
-        destructive,
+        destructive_reason,
         refusals: Vec::new(),
         relations: Vec::new(),
         functions: Vec::new(),
@@ -511,7 +511,8 @@ async fn run_program(call: &Call, job: Job) -> Outcome {
         .into());
     };
     let command = command_line(&path, &job.arguments);
-    let classification = synthetic_classification(job.tool, &command, job.destructive.clone());
+    let classification =
+        synthetic_classification(job.tool, &command, job.destructive_reason.clone());
     let mut facts = AuditFacts {
         operation: Some(job.tool.to_owned()),
         statement_class: Some("host".to_owned()),
@@ -692,7 +693,7 @@ fn directory_size(path: &Path) -> Option<u64> {
     Some(total)
 }
 
-const fn default_timeout() -> u64 {
+const fn default_program_timeout() -> u64 {
     3_600
 }
 
@@ -750,7 +751,7 @@ pub struct DumpArgs {
     #[serde(default)]
     #[schemars(description = "Parallel jobs for the directory format as text; empty keeps one.")]
     pub jobs: String,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_program_timeout")]
     #[schemars(description = "Seconds before the program is killed (default 3600).")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -828,7 +829,7 @@ pub fn dump(call: Call, args: DumpArgs) -> BoxFuture<'static, Outcome> {
                 cwd: None,
                 dry_run: args.dry_run,
                 confirm: true,
-                destructive: None,
+                destructive_reason: None,
                 timeout_seconds: args.timeout_seconds,
             },
         )
@@ -844,7 +845,7 @@ pub struct DumpallArgs {
     #[serde(default)]
     #[schemars(description = "Leave password hashes out of the role definitions.")]
     pub no_role_passwords: bool,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_program_timeout")]
     #[schemars(description = "Seconds before the program is killed (default 3600).")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -884,7 +885,7 @@ pub fn dumpall_globals(call: Call, args: DumpallArgs) -> BoxFuture<'static, Outc
                 cwd: None,
                 dry_run: args.dry_run,
                 confirm: true,
-                destructive: None,
+                destructive_reason: None,
                 timeout_seconds: args.timeout_seconds,
             },
         )
@@ -920,7 +921,7 @@ pub struct RestoreArgs {
     #[serde(default)]
     #[schemars(description = "Parallel jobs as text; empty keeps one.")]
     pub jobs: String,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_program_timeout")]
     #[schemars(description = "Seconds before the program is killed (default 3600).")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -991,7 +992,7 @@ pub fn restore(call: Call, args: RestoreArgs) -> BoxFuture<'static, Outcome> {
                 cwd: None,
                 dry_run: args.dry_run,
                 confirm: args.confirm,
-                destructive: args.clean.then(|| {
+                destructive_reason: args.clean.then(|| {
                     format!(
                         "pg_restore --clean drops the objects in schema {} before it recreates them",
                         settings.schema.value
@@ -1048,7 +1049,7 @@ pub struct BasebackupArgs {
         description = "Compression as a level (6) or method:level (zstd:3); empty keeps none."
     )]
     pub compress: String,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_program_timeout")]
     #[schemars(description = "Seconds before the program is killed (default 3600).")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -1111,7 +1112,7 @@ pub fn basebackup(call: Call, args: BasebackupArgs) -> BoxFuture<'static, Outcom
                 cwd: None,
                 dry_run: args.dry_run,
                 confirm: true,
-                destructive: None,
+                destructive_reason: None,
                 timeout_seconds: args.timeout_seconds,
             },
         )
@@ -1153,7 +1154,7 @@ pub struct UpgradeCheckArgs {
     #[serde(default)]
     #[schemars(description = "Parallel jobs as text; empty keeps one.")]
     pub jobs: String,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_program_timeout")]
     #[schemars(description = "Seconds before the program is killed (default 3600).")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -1221,7 +1222,7 @@ pub fn upgrade_check(call: Call, args: UpgradeCheckArgs) -> BoxFuture<'static, O
                 cwd: Some(dir),
                 dry_run: args.dry_run,
                 confirm: true,
-                destructive: None,
+                destructive_reason: None,
                 timeout_seconds: args.timeout_seconds,
             },
         )
@@ -1231,20 +1232,20 @@ pub fn upgrade_check(call: Call, args: UpgradeCheckArgs) -> BoxFuture<'static, O
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<DumpArgs, HostRun, _>(&groups::PG_DUMP, DUMP_DESCRIPTION, dump)?,
+        route::<DumpArgs, HostRun, _>(&tool_specs::PG_DUMP, DUMP_DESCRIPTION, dump)?,
         route::<DumpallArgs, HostRun, _>(
-            &groups::PG_DUMPALL_GLOBALS,
+            &tool_specs::PG_DUMPALL_GLOBALS,
             DUMPALL_DESCRIPTION,
             dumpall_globals,
         )?,
-        route::<RestoreArgs, HostRun, _>(&groups::PG_RESTORE, RESTORE_DESCRIPTION, restore)?,
+        route::<RestoreArgs, HostRun, _>(&tool_specs::PG_RESTORE, RESTORE_DESCRIPTION, restore)?,
         route::<BasebackupArgs, HostRun, _>(
-            &groups::PG_BASEBACKUP,
+            &tool_specs::PG_BASEBACKUP,
             BASEBACKUP_DESCRIPTION,
             basebackup,
         )?,
         route::<UpgradeCheckArgs, HostRun, _>(
-            &groups::PG_UPGRADE_CHECK,
+            &tool_specs::PG_UPGRADE_CHECK,
             UPGRADE_CHECK_DESCRIPTION,
             upgrade_check,
         )?,

@@ -24,18 +24,18 @@ PROPAGATE_WAIT=10
 MODE="release"
 VERSION=""
 BUMP=""
-CURRENT=""
+CURRENT_VERSION=""
 ASSUME_YES=0
 STEP="startup"
 STEP_NO=0
-WORK=""
+WORK_DIR=""
 MUTATED=0
 IRREVERSIBLE=0
 UPLOADED=0
 RESUMING=0
 PUSHED=0
-CRATE_CODE=""
-CRATE_BODY=""
+CRATE_HTTP_STATUS=""
+CRATE_BODY_FILE=""
 
 usage() {
 	cat <<'USAGE'
@@ -93,7 +93,7 @@ on_error() {
 	say FAILED "step '$STEP' failed with exit $1"
 }
 
-manual_finish_binaries() {
+print_manual_binary_steps() {
 	printf '  dist build --tag=v%s --artifacts=local --target=<triple> --no-local-paths --output-format=json   # once per target\n' "$VERSION"
 	printf '  dist build --tag=v%s --artifacts=global --no-local-paths\n' "$VERSION"
 	printf '  minisign -Sm target/distrib/sha256.sum -s %s\n' "$MINISIGN_KEY"
@@ -101,31 +101,31 @@ manual_finish_binaries() {
 	printf '  gh release create v%s <the same files> --repo %s --title "OwnPG %s" --notes-file <notes-file>\n' "$VERSION" "$PUBLIC_RELEASE_REPO" "$VERSION"
 }
 
-manual_finish() {
+print_manual_finish() {
 	say INFO "finish by hand with:"
 	printf '  git add -- %s %s %s %s\n' "$ROOT_MANIFEST" "$CLI_MANIFEST" "$LOCK_FILE" "$CHANGELOG"
 	printf '  git commit -m "chore: release %s"\n' "$VERSION"
 	printf '  git tag %s v%s -m "OwnPG v%s"\n' "$(tag_flag)" "$VERSION" "$VERSION"
 	printf '  git push %s %s\n' "$REMOTE" "$BRANCH"
 	printf '  git push %s v%s\n' "$REMOTE" "$VERSION"
-	manual_finish_binaries
+	print_manual_binary_steps
 }
 
 cleanup() {
 	if [[ $MUTATED -eq 1 ]]; then
 		if [[ $IRREVERSIBLE -eq 0 ]]; then
 			restore_tree
-			say WARNING "the version bump was reverted; the tree is back on $CURRENT and nothing was published"
+			say WARNING "the version bump was reverted; the tree is back on $CURRENT_VERSION and nothing was published"
 		else
 			say WARNING "a crate was already uploaded, so the bump was left in place"
-			manual_finish
+			print_manual_finish
 		fi
 	elif [[ $PUSHED -eq 1 ]]; then
 		say WARNING "the commit, tag, and push already succeeded; finish the binaries by hand with:"
-		manual_finish_binaries
+		print_manual_binary_steps
 	fi
-	if [[ -n "$WORK" && -d "$WORK" ]]; then
-		rm -rf -- "$WORK"
+	if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+		rm -rf -- "$WORK_DIR"
 	fi
 }
 
@@ -133,7 +133,7 @@ trap 'on_error $?' ERR
 trap cleanup EXIT
 
 log_path_for() {
-	printf '%s/%s.log' "$WORK" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '-')"
+	printf '%s/%s.log' "$WORK_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '-')"
 }
 
 run() {
@@ -241,19 +241,19 @@ version_greater() {
 
 fetch_crate() {
 	local name="$1"
-	CRATE_BODY="$WORK/crate-$name.json"
-	CRATE_CODE="$(curl -sS -A "$USER_AGENT" --max-time 30 -o "$CRATE_BODY" \
+	CRATE_BODY_FILE="$WORK_DIR/crate-$name.json"
+	CRATE_HTTP_STATUS="$(curl -sS -A "$USER_AGENT" --max-time 30 -o "$CRATE_BODY_FILE" \
 		-w '%{http_code}' "$REGISTRY_API/$name" 2>/dev/null || printf '000')"
 }
 
 crate_has_version() {
-	jq -e --arg want "$1" '[.versions[].num] | index($want) != null' "$CRATE_BODY" >/dev/null 2>&1
+	jq -e --arg want "$1" '[.versions[].num] | index($want) != null' "$CRATE_BODY_FILE" >/dev/null 2>&1
 }
 
 published_already() {
 	local name="$1"
 	fetch_crate "$name"
-	case "$CRATE_CODE" in
+	case "$CRATE_HTTP_STATUS" in
 	404)
 		say INFO "$name is not on crates.io yet; this would be its first release"
 		return 1
@@ -262,23 +262,23 @@ published_already() {
 		crate_has_version "$VERSION"
 		;;
 	*)
-		die "crates.io answered $CRATE_CODE for $name"
+		die "crates.io answered $CRATE_HTTP_STATUS for $name"
 		;;
 	esac
 }
 
 check_registry_state() {
-	local lib_has=0 bin_has=0
-	if published_already "$LIB_CRATE"; then lib_has=1; fi
-	if published_already "$BIN_CRATE"; then bin_has=1; fi
+	local lib_published=0 bin_published=0
+	if published_already "$LIB_CRATE"; then lib_published=1; fi
+	if published_already "$BIN_CRATE"; then bin_published=1; fi
 
-	if [[ $lib_has -eq 1 && $bin_has -eq 1 ]]; then
+	if [[ $lib_published -eq 1 && $bin_published -eq 1 ]]; then
 		die "both crates are already on crates.io at $VERSION; a published version cannot be replaced"
 	fi
-	if [[ $bin_has -eq 1 ]]; then
+	if [[ $bin_published -eq 1 ]]; then
 		die "$BIN_CRATE $VERSION is on crates.io but $LIB_CRATE $VERSION is not; sort that out by hand"
 	fi
-	if [[ $lib_has -eq 1 ]]; then
+	if [[ $lib_published -eq 1 ]]; then
 		RESUMING=1
 		say WARNING "$LIB_CRATE $VERSION is already on crates.io; this run resumes a part-finished release"
 		return 0
@@ -377,7 +377,7 @@ deny_reasons() {
 check_deny() {
 	STEP="cargo deny check"
 	local log code=0
-	log="$WORK/cargo-deny.log"
+	log="$WORK_DIR/cargo-deny.log"
 	cargo deny check >"$log" 2>&1 || code=$?
 	if [[ $code -ne 0 ]]; then
 		say INFO "last 40 lines of output:"
@@ -395,8 +395,8 @@ write_attribution() {
 snapshot_tree() {
 	local file
 	for file in "$ROOT_MANIFEST" "$CLI_MANIFEST" "$LOCK_FILE" "$CHANGELOG"; do
-		mkdir -p -- "$WORK/backup/$(dirname -- "$file")"
-		cp -p -- "$file" "$WORK/backup/$file"
+		mkdir -p -- "$WORK_DIR/backup/$(dirname -- "$file")"
+		cp -p -- "$file" "$WORK_DIR/backup/$file"
 	done
 	MUTATED=1
 }
@@ -404,8 +404,8 @@ snapshot_tree() {
 restore_tree() {
 	local file
 	for file in "$ROOT_MANIFEST" "$CLI_MANIFEST" "$LOCK_FILE" "$CHANGELOG"; do
-		if [[ -f "$WORK/backup/$file" ]]; then
-			cp -p -- "$WORK/backup/$file" "$file"
+		if [[ -f "$WORK_DIR/backup/$file" ]]; then
+			cp -p -- "$WORK_DIR/backup/$file" "$file"
 		fi
 	done
 	MUTATED=0
@@ -414,7 +414,7 @@ restore_tree() {
 rewrite_file() {
 	local target="$1" program="$2"
 	shift 2
-	local temp="$WORK/rewrite.tmp" code=0
+	local temp="$WORK_DIR/rewrite.tmp" code=0
 	awk "$@" -f "$program" "$target" >"$temp" || code=$?
 	if [[ $code -ne 0 ]]; then
 		rm -f -- "$temp"
@@ -425,8 +425,8 @@ rewrite_file() {
 }
 
 bump_workspace_version() {
-	local workspace_prog="$WORK/bump-workspace.awk"
-	cat >"$workspace_prog" <<-'AWK'
+	local workspace_program="$WORK_DIR/bump-workspace.awk"
+	cat >"$workspace_program" <<-'AWK'
 		/^\[/ { section = $0 }
 		{
 			if (!done && section == "[workspace.package]" && $0 ~ /^version[[:space:]]*=/) {
@@ -437,12 +437,12 @@ bump_workspace_version() {
 		}
 		END { if (!done) exit 3 }
 	AWK
-	rewrite_file "$ROOT_MANIFEST" "$workspace_prog" -v new="$VERSION" ||
+	rewrite_file "$ROOT_MANIFEST" "$workspace_program" -v new="$VERSION" ||
 		die "no version line under [workspace.package] in $ROOT_MANIFEST"
 	say SUCCESS "$ROOT_MANIFEST [workspace.package] version is $VERSION"
 
-	local dependency_prog="$WORK/bump-dependency.awk"
-	cat >"$dependency_prog" <<-'AWK'
+	local dependency_program="$WORK_DIR/bump-dependency.awk"
+	cat >"$dependency_program" <<-'AWK'
 		{
 			if (!done && $0 ~ /^ownpg-core[[:space:]]*=/) {
 				if (sub(/version[[:space:]]*=[[:space:]]*"[^"]*"/, "version = \"" new "\"")) done = 1
@@ -451,13 +451,13 @@ bump_workspace_version() {
 		}
 		END { if (!done) exit 3 }
 	AWK
-	rewrite_file "$CLI_MANIFEST" "$dependency_prog" -v new="$VERSION" ||
+	rewrite_file "$CLI_MANIFEST" "$dependency_program" -v new="$VERSION" ||
 		die "no ownpg-core dependency version in $CLI_MANIFEST"
 	say SUCCESS "$CLI_MANIFEST ownpg-core dependency is $VERSION"
 }
 
 move_changelog_section() {
-	local today program="$WORK/changelog.awk"
+	local today program="$WORK_DIR/changelog.awk"
 	today="$(date +%F)"
 	cat >"$program" <<-'AWK'
 		!done && /^## \[Unreleased\]/ {
@@ -480,7 +480,7 @@ move_changelog_section() {
 }
 
 add_changelog_link() {
-	local link="[$VERSION]: $RELEASE_URL_BASE/v$VERSION" program="$WORK/changelog-link.awk"
+	local link="[$VERSION]: $RELEASE_URL_BASE/v$VERSION" program="$WORK_DIR/changelog-link.awk"
 	if grep -qF "[$VERSION]: " "$CHANGELOG"; then
 		say INFO "$CHANGELOG already carries a link reference for $VERSION"
 		return 0
@@ -517,7 +517,7 @@ confirm() {
 }
 
 publish_crate() {
-	local name="$1" log="$WORK/publish-$1.log" code=0
+	local name="$1" log="$WORK_DIR/publish-$1.log" code=0
 	STEP="publish $name"
 	say INFO "publishing $name $VERSION"
 	cargo publish -p "$name" --locked --allow-dirty --color=never >"$log" 2>&1 || code=$?
@@ -542,7 +542,7 @@ publish_crate() {
 }
 
 dist_targets() {
-	local plan="$WORK/dist-plan.json" log="$WORK/dist-plan.log" code=0
+	local plan="$WORK_DIR/dist-plan.json" log="$WORK_DIR/dist-plan.log" code=0
 	dist plan --tag="v$VERSION" --output-format=json >"$plan" 2>"$log" || code=$?
 	if [[ $code -ne 0 ]]; then
 		say INFO "last 40 lines of output:"
@@ -585,8 +585,8 @@ build_dist_artifacts() {
 	[[ ${#targets[@]} -gt 0 ]] || die "dist plan returned no targets to build"
 	say INFO "building local artifacts for: ${targets[*]}"
 	for target in "${targets[@]}"; do
-		log="$WORK/dist-build-$target.log"
-		manifest="$WORK/dist-build-$target.json"
+		log="$WORK_DIR/dist-build-$target.log"
+		manifest="$WORK_DIR/dist-build-$target.json"
 		if CFLAGS="$(c_flags_for "$target")" dist build --tag="v$VERSION" --artifacts=local --target="$target" --no-local-paths \
 			--output-format=json >"$manifest" 2>"$log"; then
 			mkdir -p -- target/distrib
@@ -638,13 +638,13 @@ sign_macos_binaries() {
 		[[ "$target" == *-apple-darwin ]] || continue
 		archive="target/distrib/$BIN_CRATE-$target.tar.gz"
 		[[ -f "$archive" ]] || die "$archive is missing; dist did not produce the macOS archive for $target"
-		stage="$WORK/sign-$target"
+		stage="$WORK_DIR/sign-$target"
 		rm -rf -- "$stage"
 		mkdir -p -- "$stage"
 		tar -xzf "$archive" -C "$stage" || die "could not unpack $archive"
 		run "codesign ($target)" codesign --sign "$identity" --timestamp --options=runtime --force "$stage/$BIN_CRATE-$target/$BIN_CRATE"
 		run "codesign --verify ($target)" codesign --verify --strict --verbose=2 "$stage/$BIN_CRATE-$target/$BIN_CRATE"
-		zip="$WORK/$BIN_CRATE-$target.zip"
+		zip="$WORK_DIR/$BIN_CRATE-$target.zip"
 		rm -f -- "$zip"
 		run "ditto ($target)" ditto -c -k --keepParent "$stage/$BIN_CRATE-$target/$BIN_CRATE" "$zip"
 		run "notarytool submit ($target)" xcrun notarytool submit "$zip" --keychain-profile "$profile" --wait
@@ -666,7 +666,7 @@ sign_windows_binaries() {
 		[[ "$target" == *-pc-windows-msvc ]] || continue
 		archive="target/distrib/$BIN_CRATE-$target.zip"
 		[[ -f "$archive" ]] || die "$archive is missing; dist did not produce the Windows archive for $target"
-		stage="$WORK/sign-$target"
+		stage="$WORK_DIR/sign-$target"
 		rm -rf -- "$stage"
 		mkdir -p -- "$stage"
 		unzip -q "$archive" -d "$stage" || die "could not unpack $archive"
@@ -688,7 +688,7 @@ publish_homebrew_formula() {
 		return 0
 	fi
 	[[ -f "$formula" ]] || die "$formula is missing; dist did not write the Homebrew formula"
-	clone="$WORK/homebrew-tap"
+	clone="$WORK_DIR/homebrew-tap"
 	rm -rf -- "$clone"
 	run "gh repo clone $tap" gh repo clone "$tap" "$clone" -- --quiet --depth 1
 	mkdir -p -- "$clone/Formula"
@@ -736,7 +736,7 @@ build_mcpb_bundles() {
 			say INFO "$target has no MCPB platform; skipping the bundle"
 			continue
 		fi
-		stage="$WORK/mcpb-$target"
+		stage="$WORK_DIR/mcpb-$target"
 		rm -rf -- "$stage"
 		mkdir -p -- "$stage/bin"
 		case "$platform" in
@@ -778,15 +778,15 @@ write_server_json() {
 			'. + [{registryType: "mcpb", registryBaseUrl: "https://github.com", identifier: $url, version: $version, fileSha256: $sha, transport: {type: "stdio"}}]' <<<"$packages")"
 	done
 	shopt -u nullglob
-	jq --arg version "$VERSION" --argjson packages "$packages" '.version = $version | .packages = $packages' server.json >"$WORK/server.json" || die "could not rewrite server.json"
-	mv -- "$WORK/server.json" server.json
+	jq --arg version "$VERSION" --argjson packages "$packages" '.version = $version | .packages = $packages' server.json >"$WORK_DIR/server.json" || die "could not rewrite server.json"
+	mv -- "$WORK_DIR/server.json" server.json
 	say SUCCESS "server.json carries $VERSION and $(jq '.packages | length' server.json) package entries"
 }
 
 sign_checksums() {
 	local sums="target/distrib/sha256.sum"
 	[[ -f "$sums" ]] || die "$sums is missing; the global build did not produce a checksum file"
-	run "minisign -Sm $sums" minisign -Sm "$sums" -s "$MINISIGN_KEY" -t "OwnPG "
+	run "minisign -Sm $sums" minisign -Sm "$sums" -s "$MINISIGN_KEY" -t "OwnPG $VERSION"
 	[[ -f "$sums.minisig" ]] || die "minisign did not write $sums.minisig"
 }
 
@@ -824,7 +824,7 @@ publish_github_release() {
 	local where="${target_repo:-this repository}"
 
 	local -a assets=() entries=()
-	local entry notes="$WORK/release-notes.md"
+	local entry notes="$WORK_DIR/release-notes.md"
 	shopt -s nullglob
 	entries=(target/distrib/*)
 	shopt -u nullglob
@@ -839,7 +839,7 @@ publish_github_release() {
 	fi
 	changelog_section >"$notes"
 
-	local view="$WORK/gh-view-${target_repo//\//-}.json" view_err="$WORK/gh-view-${target_repo//\//-}.err"
+	local view="$WORK_DIR/gh-view-${target_repo//\//-}.json" view_err="$WORK_DIR/gh-view-${target_repo//\//-}.err"
 	if gh release view "v$VERSION" "${repo_flag[@]}" --json assets >"$view" 2>"$view_err"; then
 		local name
 		local -a have_names=() want_names=()
@@ -867,7 +867,7 @@ publish_github_release() {
 	local log
 	log="$(log_path_for "$label")"
 	run "$label" gh release create "v$VERSION" "${assets[@]}" "${repo_flag[@]}" \
-		--title "OwnPG " --notes-file "$notes"
+		--title "OwnPG $VERSION" --notes-file "$notes"
 	local release_url
 	release_url="$(grep -oE 'https://github\.com/[^[:space:]]+/releases/tag/[^[:space:]]+' "$log" | tail -n 1)"
 	[[ -z "$release_url" ]] || say SUCCESS "release page: $release_url"
@@ -878,7 +878,7 @@ wait_for_crate() {
 	say INFO "waiting for $name $VERSION to show up on crates.io"
 	while [[ $tries -lt $PROPAGATE_TRIES ]]; do
 		fetch_crate "$name"
-		if [[ "$CRATE_CODE" == "200" ]] && crate_has_version "$VERSION"; then
+		if [[ "$CRATE_HTTP_STATUS" == "200" ]] && crate_has_version "$VERSION"; then
 			say SUCCESS "$name $VERSION is live"
 			return 0
 		fi
@@ -890,18 +890,18 @@ wait_for_crate() {
 
 check_semver() {
 	fetch_crate "$LIB_CRATE"
-	if [[ "$CRATE_CODE" != "200" ]]; then
+	if [[ "$CRATE_HTTP_STATUS" != "200" ]]; then
 		say INFO "cargo semver-checks skipped: $LIB_CRATE is not on crates.io yet"
 		return 0
 	fi
 	run "cargo semver-checks" cargo semver-checks check-release -p "$LIB_CRATE" --color never
 }
 
-yank_mode() {
-	local undo="$1"
+yank_crates() {
+	local action_word="$1"
 	local action="yank"
 	local -a order=("$BIN_CRATE" "$LIB_CRATE")
-	if [[ "$undo" == "undo" ]]; then
+	if [[ "$action_word" == "unyank" ]]; then
 		action="unyank"
 		order=("$LIB_CRATE" "$BIN_CRATE")
 	fi
@@ -922,13 +922,13 @@ yank_mode() {
 	for name in "${order[@]}"; do
 		code=0
 		command=(cargo yank "$name" --version "$VERSION")
-		if [[ "$undo" == "undo" ]]; then
+		if [[ "$action_word" == "unyank" ]]; then
 			command+=(--undo)
 		fi
-		"${command[@]}" >"$WORK/$action-$name.log" 2>&1 || code=$?
+		"${command[@]}" >"$WORK_DIR/$action-$name.log" 2>&1 || code=$?
 		if [[ $code -ne 0 ]]; then
 			say INFO "last 40 lines of output:"
-			tail -n 40 "$WORK/$action-$name.log"
+			tail -n 40 "$WORK_DIR/$action-$name.log"
 			die "$action of $name $VERSION failed (exit $code)"
 		fi
 		say SUCCESS "$action $name $VERSION"
@@ -998,17 +998,17 @@ if [[ -n "$VERSION" ]]; then
 	valid_version "$VERSION" || die "not a semver triple: $VERSION"
 fi
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/ownpg-release.XXXXXX")"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ownpg-release.XXXXXX")"
 
 say INFO "repository $REPO"
 
 case "$MODE" in
 yank)
-	yank_mode keep
+	yank_crates yank
 	exit 0
 	;;
 unyank)
-	yank_mode undo
+	yank_crates unyank
 	exit 0
 	;;
 *) ;;
@@ -1018,31 +1018,31 @@ step "pre-flight"
 require_tools git cargo curl jq awk shasum unzip tar cargo-nextest cargo-audit cargo-deny cargo-machete cargo-about cargo-auditable cargo-cyclonedx cargo-semver-checks dist gh minisign mcpb
 [[ -z "$(git status --porcelain)" ]] || die "the working tree is not clean; commit or stash first"
 say SUCCESS "working tree is clean"
-current_branch="$(git rev-parse --abbrev-ref HEAD)"
-[[ "$current_branch" == "$BRANCH" ]] || die "on branch $current_branch; a release is cut from $BRANCH"
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+[[ "$CURRENT_BRANCH" == "$BRANCH" ]] || die "on branch $CURRENT_BRANCH; a release is cut from $BRANCH"
 say SUCCESS "on $BRANCH"
 git fetch --quiet "$REMOTE" "$BRANCH" || die "could not fetch $REMOTE/$BRANCH"
-behind="$(git rev-list --count "HEAD..$REMOTE/$BRANCH")"
-[[ "$behind" -eq 0 ]] || die "$BRANCH is $behind commit(s) behind $REMOTE/$BRANCH; pull first"
+BEHIND="$(git rev-list --count "HEAD..$REMOTE/$BRANCH")"
+[[ "$BEHIND" -eq 0 ]] || die "$BRANCH is $BEHIND commit(s) behind $REMOTE/$BRANCH; pull first"
 say SUCCESS "$BRANCH is level with $REMOTE/$BRANCH"
 require_credentials
 require_gh_auth
 require_minisign_key
 check_dist_version
-CURRENT="$(read_current_version)"
-[[ -n "$CURRENT" ]] || die "could not read the version from $ROOT_MANIFEST"
-valid_version "$CURRENT" || die "the version in $ROOT_MANIFEST is not a semver triple: $CURRENT"
+CURRENT_VERSION="$(read_current_version)"
+[[ -n "$CURRENT_VERSION" ]] || die "could not read the version from $ROOT_MANIFEST"
+valid_version "$CURRENT_VERSION" || die "the version in $ROOT_MANIFEST is not a semver triple: $CURRENT_VERSION"
 if [[ -n "$BUMP" ]]; then
-	VERSION="$(next_version "$CURRENT" "$BUMP")" || die "unknown bump: $BUMP"
-	say INFO "$BUMP release: $CURRENT -> $VERSION"
+	VERSION="$(next_version "$CURRENT_VERSION" "$BUMP")" || die "unknown bump: $BUMP"
+	say INFO "$BUMP release: $CURRENT_VERSION -> $VERSION"
 fi
 check_registry_state
-if [[ "$VERSION" == "$CURRENT" ]]; then
-	[[ $RESUMING -eq 1 ]] || die "$VERSION is not greater than the current $CURRENT"
+if [[ "$VERSION" == "$CURRENT_VERSION" ]]; then
+	[[ $RESUMING -eq 1 ]] || die "$VERSION is not greater than the current $CURRENT_VERSION"
 	say WARNING "the manifests already carry $VERSION, so the bump step will change nothing"
 else
-	version_greater "$VERSION" "$CURRENT" || die "$VERSION is not greater than the current $CURRENT"
-	say SUCCESS "$CURRENT -> $VERSION"
+	version_greater "$VERSION" "$CURRENT_VERSION" || die "$VERSION is not greater than the current $CURRENT_VERSION"
+	say SUCCESS "$CURRENT_VERSION -> $VERSION"
 fi
 
 step "house-rule audit"
@@ -1079,18 +1079,18 @@ run "./tools/reinstall.sh" ./tools/reinstall.sh
 
 if [[ "$MODE" == "dry-run" ]]; then
 	step "dist rehearsal"
-	rehearsal_target=""
-	rehearsal_targets=()
-	while IFS= read -r rehearsal_target; do
-		[[ -n "$rehearsal_target" ]] && rehearsal_targets+=("$rehearsal_target")
+	REHEARSAL_TARGET=""
+	REHEARSAL_TARGETS=()
+	while IFS= read -r REHEARSAL_TARGET; do
+		[[ -n "$REHEARSAL_TARGET" ]] && REHEARSAL_TARGETS+=("$REHEARSAL_TARGET")
 	done < <(dist_targets)
-	if [[ ${#rehearsal_targets[@]} -gt 0 ]]; then
-		say SUCCESS "dist plan recognizes ${#rehearsal_targets[@]} targets: ${rehearsal_targets[*]}"
+	if [[ ${#REHEARSAL_TARGETS[@]} -gt 0 ]]; then
+		say SUCCESS "dist plan recognizes ${#REHEARSAL_TARGETS[@]} targets: ${REHEARSAL_TARGETS[*]}"
 	else
 		say WARNING "dist plan returned no targets for v$VERSION"
 	fi
-	if rehearsal_problem="$(changelog_section_problem)"; then
-		say WARNING "$CHANGELOG: $rehearsal_problem; the GitHub Release step would refuse to publish"
+	if REHEARSAL_PROBLEM="$(changelog_section_problem)"; then
+		say WARNING "$CHANGELOG: $REHEARSAL_PROBLEM; the GitHub Release step would refuse to publish"
 	else
 		say SUCCESS "$CHANGELOG has one non-empty [$VERSION] section"
 	fi
@@ -1107,7 +1107,7 @@ if [[ "$MODE" == "dry-run" ]]; then
 
 	restore_tree
 	say INFO "dry run: the bump was written to disk, built, and then reverted"
-	say INFO "$ROOT_MANIFEST, $CLI_MANIFEST, $LOCK_FILE, and $CHANGELOG are back on $CURRENT"
+	say INFO "$ROOT_MANIFEST, $CLI_MANIFEST, $LOCK_FILE, and $CHANGELOG are back on $CURRENT_VERSION"
 	say SUCCESS "dry run finished; nothing was published, tagged, or pushed"
 	exit 0
 fi
@@ -1143,7 +1143,7 @@ fi
 if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
 	say WARNING "tag v$VERSION already exists, leaving it alone"
 else
-	git tag "$(tag_flag)" "v$VERSION" -m "OwnPG v" || die "tagging v$VERSION failed"
+	git tag "$(tag_flag)" "v$VERSION" -m "OwnPG v$VERSION" || die "tagging v$VERSION failed"
 	say SUCCESS "tagged v$VERSION"
 fi
 MUTATED=0

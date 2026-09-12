@@ -54,6 +54,7 @@ pub enum ErrorId {
     ProtocolFailed,
     SqlFailed,
     ExtensionMissing,
+    ExtensionOutdated,
     HostBinaryMissing,
     SubprocessFailed,
     ArgumentInvalid,
@@ -90,6 +91,7 @@ impl ErrorId {
             Self::ProtocolFailed => "protocol.failed",
             Self::SqlFailed => "sql.failed",
             Self::ExtensionMissing => "extension.missing",
+            Self::ExtensionOutdated => "extension.outdated",
             Self::HostBinaryMissing => "host_binary.missing",
             Self::SubprocessFailed => "subprocess.failed",
             Self::ArgumentInvalid => "argument.invalid",
@@ -284,7 +286,7 @@ impl Error {
             Self::ProtocolFailed { .. } => ErrorId::ProtocolFailed,
             Self::SqlFailed { .. } => ErrorId::SqlFailed,
             Self::ExtensionMissing { .. } => ErrorId::ExtensionMissing,
-            Self::ExtensionOutdated { .. } => ErrorId::ExtensionMissing,
+            Self::ExtensionOutdated { .. } => ErrorId::ExtensionOutdated,
             Self::HostBinaryMissing { .. } => ErrorId::HostBinaryMissing,
             Self::SubprocessFailed { .. } => ErrorId::SubprocessFailed,
             Self::ArgumentInvalid { .. } => ErrorId::ArgumentInvalid,
@@ -558,6 +560,11 @@ mod tests {
             Error::ExtensionMissing {
                 name: "pg_stat_statements".to_owned(),
             },
+            Error::ExtensionOutdated {
+                name: "pg_stat_statements".to_owned(),
+                installed: "1.7".to_owned(),
+                needed: "1.8".to_owned(),
+            },
             Error::HostBinaryMissing {
                 name: "pg_dump".to_owned(),
             },
@@ -643,7 +650,8 @@ mod tests {
                 | ErrorId::HandleState
                 | ErrorId::ProtocolFailed
                 | ErrorId::SqlFailed
-                | ErrorId::ExtensionMissing => ExitClass::Runtime,
+                | ErrorId::ExtensionMissing
+                | ErrorId::ExtensionOutdated => ExitClass::Runtime,
                 ErrorId::StatementUnparsable
                 | ErrorId::StatementMultiple
                 | ErrorId::StatementRefused

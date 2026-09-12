@@ -212,10 +212,10 @@ pub(crate) struct ConnectionArgs {
     #[arg(
         long,
         value_enum,
-        value_name = "MODE",
-        help = "SSH client: the built-in one, or the system ssh command [env: OWNPG_SSH_MODE]"
+        value_name = "TRANSPORT",
+        help = "SSH client: the built-in one, or the system ssh command [env: OWNPG_SSH_TRANSPORT]"
     )]
-    pub ssh_mode: Option<SshModeArg>,
+    pub ssh_transport: Option<SshTransportArg>,
 
     #[arg(
         long,
@@ -387,7 +387,7 @@ pub(crate) enum SslModeArg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum SshModeArg {
+pub(crate) enum SshTransportArg {
     #[value(name = "in-process")]
     InProcess,
     System,

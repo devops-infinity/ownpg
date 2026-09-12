@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{Missing, Toggle, cascade_suffix, decimal, if_exists_clause, run_ddl, scoped_name};
 use crate::error::{Error, Result};
-use crate::groups;
 use crate::render::{expression, quote_ident, quote_literal, type_name, validate_ident};
 use crate::shape::ResultSet;
+use crate::tool_specs;
 use crate::tools::{Call, Outcome, Route, route};
 
 const ROUTINE_DESCRIPTION: &str = "Create, replace, alter, rename, or drop a function or procedure in the scoped schema. create takes typed arguments, the return type, the language (sql or plpgsql among others), the body, volatility, strictness, parallel safety, and security. A security definer routine gets search_path pinned to the scoped schema and pg_temp. drop is destructive and needs confirm: true or the confirmation prompt.";
@@ -119,7 +119,7 @@ pub struct RoutineArgs {
     #[schemars(
         description = "Planner row estimate as text for set-returning functions; empty leaves it unset."
     )]
-    pub rows: String,
+    pub row_estimate: String,
     #[serde(default)]
     #[schemars(
         description = "create or alter: settings such as \"work_mem = '64MB'\" applied while the routine runs."
@@ -272,7 +272,7 @@ pub fn routine(call: Call, args: RoutineArgs) -> BoxFuture<'static, Outcome> {
                 if let Some(cost) = decimal("cost", &args.cost)? {
                     sql.push_str(&format!(" COST {cost}"));
                 }
-                if let Some(rows) = decimal("rows", &args.rows)? {
+                if let Some(rows) = decimal("row_estimate", &args.row_estimate)? {
                     sql.push_str(&format!(" ROWS {rows}"));
                 }
                 let mut settings = config_clauses("set_config", &args.set_config)?;
@@ -329,7 +329,7 @@ pub fn routine(call: Call, args: RoutineArgs) -> BoxFuture<'static, Outcome> {
                 if let Some(cost) = decimal("cost", &args.cost)? {
                     clauses.push(format!("COST {cost}"));
                 }
-                if let Some(rows) = decimal("rows", &args.rows)? {
+                if let Some(rows) = decimal("row_estimate", &args.row_estimate)? {
                     clauses.push(format!("ROWS {rows}"));
                 }
                 clauses.extend(config_clauses("set_config", &args.set_config)?);
@@ -474,7 +474,7 @@ pub struct TriggerArgs {
     pub or_replace: bool,
     #[serde(default)]
     #[schemars(description = "create: a constraint trigger that can be deferred.")]
-    pub constraint: bool,
+    pub constraint_trigger: bool,
     #[serde(default)]
     pub deferrable: bool,
     #[serde(default)]
@@ -553,10 +553,14 @@ pub fn trigger(call: Call, args: TriggerArgs) -> BoxFuture<'static, Outcome> {
                 let mut sql = format!(
                     "CREATE{}{} TRIGGER {trigger_name} {timing} {} ON {table}",
                     if args.or_replace { " OR REPLACE" } else { "" },
-                    if args.constraint { " CONSTRAINT" } else { "" },
+                    if args.constraint_trigger {
+                        " CONSTRAINT"
+                    } else {
+                        ""
+                    },
                     events.join(" OR ")
                 );
-                if args.constraint && args.deferrable {
+                if args.constraint_trigger && args.deferrable {
                     sql.push_str(" DEFERRABLE");
                     if args.initially_deferred {
                         sql.push_str(" INITIALLY DEFERRED");
@@ -690,8 +694,8 @@ pub fn trigger(call: Call, args: TriggerArgs) -> BoxFuture<'static, Outcome> {
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<RoutineArgs, ResultSet, _>(&groups::PG_ROUTINE, ROUTINE_DESCRIPTION, routine)?,
-        route::<TriggerArgs, ResultSet, _>(&groups::PG_TRIGGER, TRIGGER_DESCRIPTION, trigger)?,
+        route::<RoutineArgs, ResultSet, _>(&tool_specs::PG_ROUTINE, ROUTINE_DESCRIPTION, routine)?,
+        route::<TriggerArgs, ResultSet, _>(&tool_specs::PG_TRIGGER, TRIGGER_DESCRIPTION, trigger)?,
     ])
 }
 

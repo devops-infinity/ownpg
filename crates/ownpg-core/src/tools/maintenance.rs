@@ -11,9 +11,9 @@ use super::read::facts_for;
 use super::write::dry_run_reply;
 use super::{AuditFacts, Call, Outcome, Route, ToolFailure, ToolOutput, route, text_rows};
 use crate::error::{Error, Result};
-use crate::groups;
 use crate::render::{QualifiedName, ident_list, quote_ident, verify};
 use crate::shape::{ResultSet, UNTRUSTED_NOTICE};
+use crate::tool_specs;
 
 const VACUUM_DESCRIPTION: &str = "Run VACUUM on tables of the scoped schema (every table when none is named), with full, freeze, analyze, disable_page_skipping, skip_locked, index_cleanup, truncate, parallel workers, and a buffer usage limit, or run CHECKPOINT with operation checkpoint. VACUUM runs outside any transaction under its own statement timeout and reports progress from pg_stat_progress_vacuum when the client sent a progress token. VACUUM FULL rewrites the table under an exclusive lock and needs confirm: true or the confirmation prompt.";
 
@@ -27,7 +27,7 @@ const VACUUM_NEEDS_DESCRIPTION: &str = "Report which tables in the scoped schema
 
 const BACKEND_DESCRIPTION: &str = "Cancel the running statement of a backend with pg_cancel_backend, or terminate the backend with pg_terminate_backend. Termination drops that session's connection and needs confirm: true or the confirmation prompt. Both work through pg_signal_backend rules: the target must belong to the same role or the connected role must be a member of pg_signal_backend.";
 
-fn default_timeout() -> u64 {
+fn default_statement_timeout() -> u64 {
     600
 }
 
@@ -78,7 +78,7 @@ pub struct VacuumArgs {
         description = "BUFFER_USAGE_LIMIT such as 256MB (PostgreSQL 16 and later); empty leaves the default."
     )]
     pub buffer_usage_limit: String,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_statement_timeout")]
     #[schemars(description = "Statement timeout in seconds for this run (default 600).")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -99,7 +99,7 @@ async fn scoped_tables(call: &Call) -> Result<Vec<QualifiedName>> {
         .await?;
     let mut out = Vec::new();
     for row in &rows {
-        let name: String = catalog::get(row, 0)?;
+        let name: String = catalog::read_column(row, 0)?;
         out.push(QualifiedName {
             schema: scoped.clone(),
             name,
@@ -127,7 +127,7 @@ struct Job {
     confirm: bool,
     timeout_seconds: u64,
     progress_sql: Option<&'static str>,
-    destructive: Option<String>,
+    destructive_reason: Option<String>,
 }
 
 async fn run_maintenance(call: &Call, job: Job) -> Outcome {
@@ -139,11 +139,11 @@ async fn run_maintenance(call: &Call, job: Job) -> Outcome {
         confirm,
         timeout_seconds,
         progress_sql,
-        destructive,
+        destructive_reason,
     } = job;
     let mut classification = verify(&sql, kinds)?;
-    if destructive.is_some() {
-        classification.destructive = destructive;
+    if destructive_reason.is_some() {
+        classification.destructive_reason = destructive_reason;
     }
     if dry_run {
         return dry_run_reply(&sql, &classification);
@@ -181,7 +181,7 @@ async fn run_maintenance(call: &Call, job: Job) -> Outcome {
                     outcome = &mut work => break outcome,
                     () = poll => {
                         ticks += 1.0;
-                        let rows = call.engine().secondary_rows(progress_sql, &[&pid]).await.unwrap_or_default();
+                        let rows = call.engine().catalog_rows_off_primary(progress_sql, &[&pid]).await.unwrap_or_default();
                         let message = rows.first().map_or_else(
                             || "running".to_owned(),
                             |row| row.try_get::<_, String>(0).unwrap_or_else(|_| "running".to_owned()),
@@ -224,7 +224,7 @@ pub fn vacuum(call: Call, args: VacuumArgs) -> BoxFuture<'static, Outcome> {
                     confirm: args.confirm,
                     timeout_seconds: args.timeout_seconds,
                     progress_sql: None,
-                    destructive: None,
+                    destructive_reason: None,
                 },
             )
             .await;
@@ -265,7 +265,7 @@ pub fn vacuum(call: Call, args: VacuumArgs) -> BoxFuture<'static, Outcome> {
             options.push(format!("PARALLEL {}", workers.clamp(0, 1_024)));
         }
         if !args.buffer_usage_limit.trim().is_empty() {
-            if !call.engine().features().stat_io() {
+            if !call.engine().features().supports_stat_io() {
                 return Err(Error::ArgumentInvalid {
                     argument: "buffer_usage_limit".to_owned(),
                     detail: "BUFFER_USAGE_LIMIT needs PostgreSQL 16 or later".to_owned(),
@@ -298,7 +298,7 @@ pub fn vacuum(call: Call, args: VacuumArgs) -> BoxFuture<'static, Outcome> {
                 confirm: args.confirm,
                 timeout_seconds: args.timeout_seconds,
                 progress_sql: Some(VACUUM_PROGRESS_SQL),
-                destructive: args
+                destructive_reason: args
                     .full
                     .then(|| "VACUUM FULL rewrites the table under an exclusive lock".to_owned()),
             },
@@ -318,7 +318,7 @@ pub struct AnalyzeArgs {
     pub columns: Vec<String>,
     #[serde(default)]
     pub skip_locked: bool,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_statement_timeout")]
     #[schemars(description = "Statement timeout in seconds for this run (default 600).")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -364,7 +364,7 @@ pub fn analyze(call: Call, args: AnalyzeArgs) -> BoxFuture<'static, Outcome> {
                 confirm: true,
                 timeout_seconds: args.timeout_seconds,
                 progress_sql: None,
-                destructive: None,
+                destructive_reason: None,
             },
         )
         .await
@@ -373,7 +373,7 @@ pub fn analyze(call: Call, args: AnalyzeArgs) -> BoxFuture<'static, Outcome> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ReindexTarget {
+pub enum ReindexScope {
     #[default]
     Index,
     Table,
@@ -384,13 +384,13 @@ pub enum ReindexTarget {
 #[serde(deny_unknown_fields)]
 pub struct ReindexArgs {
     #[serde(default)]
-    pub target: ReindexTarget,
+    pub target: ReindexScope,
     #[serde(default)]
     #[schemars(description = "Index or table name; empty for the scoped schema.")]
     pub name: String,
     #[serde(default)]
     pub concurrently: bool,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_statement_timeout")]
     #[schemars(description = "Statement timeout in seconds for this run (default 600).")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -405,15 +405,15 @@ pub fn reindex(call: Call, args: ReindexArgs) -> BoxFuture<'static, Outcome> {
             ""
         };
         let sql = match args.target {
-            ReindexTarget::Index => format!(
+            ReindexScope::Index => format!(
                 "REINDEX INDEX{concurrently} {}",
                 scoped_name(&call, "name", &args.name)?.sql()
             ),
-            ReindexTarget::Table => format!(
+            ReindexScope::Table => format!(
                 "REINDEX TABLE{concurrently} {}",
                 scoped_name(&call, "name", &args.name)?.sql()
             ),
-            ReindexTarget::Schema => format!(
+            ReindexScope::Schema => format!(
                 "REINDEX SCHEMA{concurrently} {}",
                 quote_ident(&call.settings().schema.value)
             ),
@@ -428,7 +428,7 @@ pub fn reindex(call: Call, args: ReindexArgs) -> BoxFuture<'static, Outcome> {
                 confirm: true,
                 timeout_seconds: args.timeout_seconds,
                 progress_sql: None,
-                destructive: None,
+                destructive_reason: None,
             },
         )
         .await
@@ -444,7 +444,7 @@ pub struct RefreshArgs {
     pub concurrently: bool,
     #[serde(default = "default_with_data")]
     pub with_data: bool,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_statement_timeout")]
     #[schemars(description = "Statement timeout in seconds for this run (default 600).")]
     pub timeout_seconds: u64,
     #[serde(default)]
@@ -482,16 +482,12 @@ pub fn refresh(call: Call, args: RefreshArgs) -> BoxFuture<'static, Outcome> {
                 confirm: true,
                 timeout_seconds: args.timeout_seconds,
                 progress_sql: None,
-                destructive: None,
+                destructive_reason: None,
             },
         )
         .await
     })
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct VacuumNeedsArgs {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct VacuumNeed {
@@ -541,7 +537,7 @@ st.last_vacuum::text, st.last_autovacuum::text, st.last_analyze::text, st.last_a
 FROM tables t LEFT JOIN pg_catalog.pg_stat_user_tables st ON st.relid = t.oid \
 ORDER BY COALESCE(st.n_dead_tup, 0) DESC, t.name";
 
-pub fn vacuum_needs(call: Call, _args: VacuumNeedsArgs) -> BoxFuture<'static, Outcome> {
+pub fn vacuum_needs(call: Call, _args: super::health::NoArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let scoped = call.settings().schema.value.clone();
         let rows = call
@@ -551,18 +547,18 @@ pub fn vacuum_needs(call: Call, _args: VacuumNeedsArgs) -> BoxFuture<'static, Ou
         let mut needs = Vec::new();
         for row in &rows {
             needs.push(VacuumNeed {
-                table: catalog::get(row, 0)?,
-                live_rows: catalog::get(row, 1)?,
-                dead_rows: catalog::get(row, 2)?,
-                modified_since_analyze: catalog::get(row, 3)?,
-                vacuum_threshold: catalog::get(row, 4)?,
-                analyze_threshold: catalog::get(row, 5)?,
-                needs_vacuum: catalog::get(row, 6)?,
-                needs_analyze: catalog::get(row, 7)?,
-                last_vacuum: catalog::get(row, 8)?,
-                last_autovacuum: catalog::get(row, 9)?,
-                last_analyze: catalog::get(row, 10)?,
-                last_autoanalyze: catalog::get(row, 11)?,
+                table: catalog::read_column(row, 0)?,
+                live_rows: catalog::read_column(row, 1)?,
+                dead_rows: catalog::read_column(row, 2)?,
+                modified_since_analyze: catalog::read_column(row, 3)?,
+                vacuum_threshold: catalog::read_column(row, 4)?,
+                analyze_threshold: catalog::read_column(row, 5)?,
+                needs_vacuum: catalog::read_column(row, 6)?,
+                needs_analyze: catalog::read_column(row, 7)?,
+                last_vacuum: catalog::read_column(row, 8)?,
+                last_autovacuum: catalog::read_column(row, 9)?,
+                last_analyze: catalog::read_column(row, 10)?,
+                last_autoanalyze: catalog::read_column(row, 11)?,
             });
         }
         let text = text_rows(
@@ -643,8 +639,10 @@ pub fn backend(call: Call, args: BackendArgs) -> BoxFuture<'static, Outcome> {
         let sql = format!("SELECT pg_catalog.{function}({}) AS signalled", args.pid);
         let mut classification = verify(&sql, &["SelectStmt"])?;
         classification.refusals.clear();
-        if args.operation == BackendOperation::Terminate && classification.destructive.is_none() {
-            classification.destructive = Some(format!(
+        if args.operation == BackendOperation::Terminate
+            && classification.destructive_reason.is_none()
+        {
+            classification.destructive_reason = Some(format!(
                 "terminating backend {} drops its session",
                 args.pid
             ));
@@ -678,15 +676,15 @@ pub fn backend(call: Call, args: BackendArgs) -> BoxFuture<'static, Outcome> {
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<VacuumArgs, ResultSet, _>(&groups::PG_VACUUM, VACUUM_DESCRIPTION, vacuum)?,
-        route::<AnalyzeArgs, ResultSet, _>(&groups::PG_ANALYZE, ANALYZE_DESCRIPTION, analyze)?,
-        route::<ReindexArgs, ResultSet, _>(&groups::PG_REINDEX, REINDEX_DESCRIPTION, reindex)?,
-        route::<RefreshArgs, ResultSet, _>(&groups::PG_REFRESH, REFRESH_DESCRIPTION, refresh)?,
-        route::<VacuumNeedsArgs, VacuumNeeds, _>(
-            &groups::PG_VACUUM_NEEDS,
+        route::<VacuumArgs, ResultSet, _>(&tool_specs::PG_VACUUM, VACUUM_DESCRIPTION, vacuum)?,
+        route::<AnalyzeArgs, ResultSet, _>(&tool_specs::PG_ANALYZE, ANALYZE_DESCRIPTION, analyze)?,
+        route::<ReindexArgs, ResultSet, _>(&tool_specs::PG_REINDEX, REINDEX_DESCRIPTION, reindex)?,
+        route::<RefreshArgs, ResultSet, _>(&tool_specs::PG_REFRESH, REFRESH_DESCRIPTION, refresh)?,
+        route::<super::health::NoArgs, VacuumNeeds, _>(
+            &tool_specs::PG_VACUUM_NEEDS,
             VACUUM_NEEDS_DESCRIPTION,
             vacuum_needs,
         )?,
-        route::<BackendArgs, ResultSet, _>(&groups::PG_BACKEND, BACKEND_DESCRIPTION, backend)?,
+        route::<BackendArgs, ResultSet, _>(&tool_specs::PG_BACKEND, BACKEND_DESCRIPTION, backend)?,
     ])
 }

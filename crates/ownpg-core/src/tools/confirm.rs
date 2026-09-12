@@ -93,7 +93,7 @@ impl Gate {
         classification: &Classification,
         confirm: bool,
     ) -> Result<Verdict, ToolFailure> {
-        let Some(rule) = classification.destructive.as_deref() else {
+        let Some(rule) = classification.destructive_reason.as_deref() else {
             return Ok(Verdict::Proceed(Decision::Allowed));
         };
         if confirm {
@@ -127,7 +127,7 @@ impl Gate {
                 .into()),
             };
         }
-        if call.elicitation {
+        if call.can_elicit {
             let sealed = self.seal(&Pending {
                 tool: tool.to_owned(),
                 statement_hash: classification.fingerprint.clone(),
@@ -136,7 +136,7 @@ impl Gate {
             let message = format!(
                 "This {} statement is destructive: {rule}. Statement: {}. Run it?",
                 classification.kind,
-                short(&classification.normalized)
+                short_statement(&classification.normalized)
             );
             let schema = ElicitationSchema::builder()
                 .required_property(
@@ -204,7 +204,7 @@ fn answer(responses: Option<&rmcp::model::InputResponses>) -> Answer {
     }
 }
 
-fn short(statement: &str) -> String {
+fn short_statement(statement: &str) -> String {
     crate::audit::short_statement(statement).unwrap_or_else(|| {
         let mut text: String = statement.chars().take(197).collect();
         text.push_str("...");

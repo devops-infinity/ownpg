@@ -10,10 +10,10 @@ use super::jwks::{Algorithm, JwksClient, JwksError, decode_base64url};
 use crate::audit::{PrincipalKind, sha256_hex};
 use crate::config::{AuthSettings, Mode, OauthSettings, Settings};
 use crate::error::{Error, Result};
-use crate::groups::{
+use crate::server::Principal;
+use crate::tool_specs::{
     SCOPE_DDL, SCOPE_HOST, SCOPE_MAINTENANCE, SCOPE_READ, SCOPE_ROLES, SCOPE_WRITE,
 };
-use crate::server::Principal;
 
 pub const ALL_SCOPES: [&str; 6] = [
     SCOPE_READ,
@@ -84,7 +84,7 @@ pub struct BearerToken {
     digest: [u8; 32],
     name: String,
     scopes: Vec<String>,
-    key: String,
+    fingerprint: String,
 }
 
 fn digest_of(secret: &[u8]) -> [u8; 32] {
@@ -173,7 +173,7 @@ impl BearerTokens {
                 });
             };
             tokens.push(BearerToken {
-                key: sha256_hex(secret.as_bytes()).chars().take(16).collect(),
+                fingerprint: sha256_hex(secret.as_bytes()).chars().take(16).collect(),
                 digest,
                 name,
                 scopes,
@@ -346,7 +346,7 @@ fn now_seconds() -> u64 {
         .unwrap_or_default()
 }
 
-pub fn check_claims(
+pub fn principal_from_claims(
     claims: &Claims,
     issuer: &str,
     audience: &str,
@@ -434,7 +434,7 @@ impl Oauth {
         let claims: Claims = decode_base64url(payload_text)
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .ok_or_else(|| Rejection::unauthorized("the token claims are not valid"))?;
-        let name = check_claims(
+        let name = principal_from_claims(
             &claims,
             &self.settings.issuer.value,
             &self.settings.audience.value,
@@ -536,7 +536,7 @@ impl Authenticator {
                         PrincipalKind::Bearer,
                         found.scopes.clone(),
                     ),
-                    found.key.clone(),
+                    found.fingerprint.clone(),
                 ))
             }
             Self::Oauth(oauth) => {
@@ -547,8 +547,8 @@ impl Authenticator {
                     return Err(Rejection::unauthorized("the token is too long"));
                 }
                 let principal = oauth.validate(&token).await?;
-                let key: String = sha256_hex(token.as_bytes()).chars().take(16).collect();
-                Ok((principal, key))
+                let fingerprint: String = sha256_hex(token.as_bytes()).chars().take(16).collect();
+                Ok((principal, fingerprint))
             }
         }
     }
@@ -651,42 +651,48 @@ mod tests {
             issuer,
             serde_json::json!([audience, "x"]),
         );
-        assert!(check_claims(&good, issuer, audience, 990).is_ok());
-        assert!(check_claims(&good, issuer, audience, 1_000 + LEEWAY_SECONDS).is_ok());
-        assert!(check_claims(&good, issuer, audience, 1_000 + LEEWAY_SECONDS + 1).is_err());
+        assert!(principal_from_claims(&good, issuer, audience, 990).is_ok());
+        assert!(principal_from_claims(&good, issuer, audience, 1_000 + LEEWAY_SECONDS).is_ok());
+        assert!(
+            principal_from_claims(&good, issuer, audience, 1_000 + LEEWAY_SECONDS + 1).is_err()
+        );
         let early = claims(Some(1_000), Some(900), issuer, serde_json::json!(audience));
-        assert!(check_claims(&early, issuer, audience, 900 - LEEWAY_SECONDS - 1).is_err());
-        assert!(check_claims(&early, issuer, audience, 900 - LEEWAY_SECONDS).is_ok());
+        assert!(principal_from_claims(&early, issuer, audience, 900 - LEEWAY_SECONDS - 1).is_err());
+        assert!(principal_from_claims(&early, issuer, audience, 900 - LEEWAY_SECONDS).is_ok());
         let other_issuer = claims(
             Some(1_000),
             None,
             "https://other",
             serde_json::json!(audience),
         );
-        assert!(check_claims(&other_issuer, issuer, audience, 10).is_err());
+        assert!(principal_from_claims(&other_issuer, issuer, audience, 10).is_err());
         let other_audience = claims(
             Some(1_000),
             None,
             issuer,
             serde_json::json!("https://x/mcp"),
         );
-        assert!(check_claims(&other_audience, issuer, audience, 10).is_err());
+        assert!(principal_from_claims(&other_audience, issuer, audience, 10).is_err());
         let no_exp = claims(None, None, issuer, serde_json::json!(audience));
-        assert!(check_claims(&no_exp, issuer, audience, 10).is_err());
+        assert!(principal_from_claims(&no_exp, issuer, audience, 10).is_err());
         assert_eq!(
-            check_claims(&good, issuer, audience, 990).ok().as_deref(),
+            principal_from_claims(&good, issuer, audience, 990)
+                .ok()
+                .as_deref(),
             Some("sub:alice")
         );
         let mut client = claims(Some(1_000), None, issuer, serde_json::json!(audience));
         client.sub = None;
         client.client_id = Some("svc-7".to_owned());
         assert_eq!(
-            check_claims(&client, issuer, audience, 990).ok().as_deref(),
+            principal_from_claims(&client, issuer, audience, 990)
+                .ok()
+                .as_deref(),
             Some("client:svc-7")
         );
         let mut anonymous = claims(Some(1_000), None, issuer, serde_json::json!(audience));
         anonymous.sub = Some("  ".to_owned());
-        let refusal = check_claims(&anonymous, issuer, audience, 990).unwrap_err();
+        let refusal = principal_from_claims(&anonymous, issuer, audience, 990).unwrap_err();
         assert!(refusal.description.contains("neither sub nor client_id"));
     }
 }

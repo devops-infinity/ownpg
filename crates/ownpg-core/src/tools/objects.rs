@@ -8,8 +8,8 @@ use super::catalog::{
 };
 use super::{AuditFacts, Call, Context, LIST_CAP, Outcome, Route, ToolOutput, route, text_rows};
 use crate::error::Error;
-use crate::groups;
 use crate::shape::UNTRUSTED_NOTICE;
+use crate::tool_specs;
 
 const LIST_OBJECTS_DESCRIPTION: &str = "List objects in the scoped schema: tables, views, materialized views, sequences, functions, procedures, types, indexes, extensions, and the schemas of the database. Filter by object type and by a LIKE pattern on the name (% and _ are wildcards). The list is sorted by schema, then name, then OID, so repeated calls return the same order. At most 200 objects return per call; when more remain, truncated is true and cursor carries a token to pass back for the next page.";
 
@@ -34,7 +34,7 @@ pub struct ListObjectsArgs {
     pub name_pattern: String,
     #[serde(default)]
     #[schemars(
-        description = "names returns schema, name, and kind only; summary adds owner, comment, size, and row estimate."
+        description = "names returns schema, name, and kind only; wants_summary adds owner, comment, size, and row estimate."
     )]
     pub detail_level: DetailLevel,
     #[serde(default)]
@@ -81,9 +81,12 @@ pub struct ObjectList {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Keyset {
-    s: String,
-    n: String,
-    o: i64,
+    #[serde(rename = "s")]
+    schema: String,
+    #[serde(rename = "n")]
+    name: String,
+    #[serde(rename = "o")]
+    oid: i64,
 }
 
 fn encode_cursor(key: &Keyset) -> String {
@@ -163,9 +166,9 @@ pub fn list_objects(call: Call, args: ListObjectsArgs) -> BoxFuture<'static, Out
         };
         let start = if args.cursor.is_empty() {
             Keyset {
-                s: String::new(),
-                n: String::new(),
-                o: 0,
+                schema: String::new(),
+                name: String::new(),
+                oid: 0,
             }
         } else {
             decode_cursor(&args.cursor)?
@@ -179,9 +182,9 @@ pub fn list_objects(call: Call, args: ListObjectsArgs) -> BoxFuture<'static, Out
                     &scoped,
                     &kinds,
                     &args.name_pattern,
-                    &start.s,
-                    &start.n,
-                    &start.o,
+                    &start.schema,
+                    &start.name,
+                    &start.oid,
                     &limit,
                 ],
             )
@@ -192,29 +195,49 @@ pub fn list_objects(call: Call, args: ListObjectsArgs) -> BoxFuture<'static, Out
             if objects.len() >= LIST_CAP {
                 break;
             }
-            total = catalog::get(row, 9)?;
-            let kind_text: String = catalog::get(row, 2)?;
+            total = catalog::read_column(row, 9)?;
+            let kind_text: String = catalog::read_column(row, 2)?;
             let kind = ObjectType::parse(&kind_text).unwrap_or(ObjectType::Table);
-            let summary = args.detail_level == DetailLevel::Summary;
+            let wants_summary = args.detail_level == DetailLevel::Summary;
             objects.push(ObjectRow {
-                schema: catalog::get(row, 0)?,
-                name: catalog::get(row, 1)?,
+                schema: catalog::read_column(row, 0)?,
+                name: catalog::read_column(row, 1)?,
                 kind,
-                oid: catalog::get(row, 3)?,
-                owner: if summary { catalog::get(row, 4)? } else { None },
-                comment: if summary { catalog::get(row, 5)? } else { None },
-                size_bytes: if summary { catalog::get(row, 6)? } else { None },
-                estimated_rows: if summary { catalog::get(row, 7)? } else { None },
-                detail: if summary { catalog::get(row, 8)? } else { None },
+                oid: catalog::read_column(row, 3)?,
+                owner: if wants_summary {
+                    catalog::read_column(row, 4)?
+                } else {
+                    None
+                },
+                comment: if wants_summary {
+                    catalog::read_column(row, 5)?
+                } else {
+                    None
+                },
+                size_bytes: if wants_summary {
+                    catalog::read_column(row, 6)?
+                } else {
+                    None
+                },
+                estimated_rows: if wants_summary {
+                    catalog::read_column(row, 7)?
+                } else {
+                    None
+                },
+                detail: if wants_summary {
+                    catalog::read_column(row, 8)?
+                } else {
+                    None
+                },
             });
         }
         let truncated = rows.len() > LIST_CAP;
         let cursor = if truncated {
             objects.last().map(|last| {
                 encode_cursor(&Keyset {
-                    s: last.schema.clone(),
-                    n: last.name.clone(),
-                    o: last.oid,
+                    schema: last.schema.clone(),
+                    name: last.name.clone(),
+                    oid: last.oid,
                 })
             })
         } else {
@@ -273,7 +296,7 @@ pub fn list_objects(call: Call, args: ListObjectsArgs) -> BoxFuture<'static, Out
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum DescribeKind {
+pub enum DescribeTarget {
     #[default]
     Auto,
     Relation,
@@ -295,11 +318,11 @@ pub struct DescribeArgs {
     #[schemars(
         description = "What the name refers to. auto tries a relation, then a routine, then a type, then an extension."
     )]
-    pub object_type: DescribeKind,
+    pub target: DescribeTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct Description {
+pub struct ObjectDescription {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relation: Option<TableDescription>,
@@ -318,7 +341,7 @@ pub struct Description {
     pub notice: &'static str,
 }
 
-impl Description {
+impl ObjectDescription {
     fn empty(kind: &str) -> Self {
         Self {
             kind: kind.to_owned(),
@@ -346,32 +369,32 @@ pub fn describe(call: Call, args: DescribeArgs) -> BoxFuture<'static, Outcome> {
             }
             .into());
         }
-        let description = match args.object_type {
-            DescribeKind::Auto => describe_auto(&context, name).await?,
-            DescribeKind::Relation => describe_relation_or_sequence(&context, name).await?,
-            DescribeKind::Routine => {
-                let mut description = Description::empty("routine");
+        let description = match args.target {
+            DescribeTarget::Auto => describe_auto(&context, name).await?,
+            DescribeTarget::Relation => describe_relation_or_sequence(&context, name).await?,
+            DescribeTarget::Routine => {
+                let mut description = ObjectDescription::empty("routine");
                 description.routines = Some(catalog::describe_routines(engine, name).await?);
                 description
             }
-            DescribeKind::Type => {
-                let mut description = Description::empty("type");
+            DescribeTarget::Type => {
+                let mut description = ObjectDescription::empty("type");
                 description.type_description = Some(catalog::describe_type(engine, name).await?);
                 description
             }
-            DescribeKind::Extension => {
-                let mut description = Description::empty("extension");
+            DescribeTarget::Extension => {
+                let mut description = ObjectDescription::empty("extension");
                 description.extension = Some(catalog::describe_extension(engine, name).await?);
                 description
             }
-            DescribeKind::Role => {
-                let mut description = Description::empty("role");
+            DescribeTarget::Role => {
+                let mut description = ObjectDescription::empty("role");
                 description.role = Some(catalog::describe_role(engine, name).await?);
                 description
             }
-            DescribeKind::Privileges => {
+            DescribeTarget::Privileges => {
                 let relation = catalog::resolve_relation(engine, name).await?;
-                let mut description = Description::empty("privileges");
+                let mut description = ObjectDescription::empty("privileges");
                 description.privileges =
                     Some(catalog::describe_privileges(engine, &relation).await?);
                 description
@@ -391,20 +414,20 @@ pub fn describe(call: Call, args: DescribeArgs) -> BoxFuture<'static, Outcome> {
 async fn describe_relation_or_sequence(
     context: &Context,
     name: &str,
-) -> Result<Description, Error> {
+) -> Result<ObjectDescription, Error> {
     let engine = &context.engine;
     let relation = catalog::resolve_relation(engine, name).await?;
     if relation.kind == ObjectType::Sequence {
-        let mut description = Description::empty("sequence");
+        let mut description = ObjectDescription::empty("sequence");
         description.sequence = Some(catalog::describe_sequence(engine, &relation).await?);
         return Ok(description);
     }
-    let mut description = Description::empty(relation.kind.as_str());
+    let mut description = ObjectDescription::empty(relation.kind.as_str());
     description.relation = Some(catalog::describe_relation(engine, &relation).await?);
     Ok(description)
 }
 
-async fn describe_auto(context: &Context, name: &str) -> Result<Description, Error> {
+async fn describe_auto(context: &Context, name: &str) -> Result<ObjectDescription, Error> {
     let engine = &context.engine;
     match catalog::resolve_relation(engine, name).await {
         Ok(_) => return describe_relation_or_sequence(context, name).await,
@@ -413,7 +436,7 @@ async fn describe_auto(context: &Context, name: &str) -> Result<Description, Err
     }
     match catalog::describe_routines(engine, name).await {
         Ok(routines) => {
-            let mut description = Description::empty("routine");
+            let mut description = ObjectDescription::empty("routine");
             description.routines = Some(routines);
             return Ok(description);
         }
@@ -422,7 +445,7 @@ async fn describe_auto(context: &Context, name: &str) -> Result<Description, Err
     }
     match catalog::describe_type(engine, name).await {
         Ok(type_description) => {
-            let mut description = Description::empty("type");
+            let mut description = ObjectDescription::empty("type");
             description.type_description = Some(type_description);
             return Ok(description);
         }
@@ -431,7 +454,7 @@ async fn describe_auto(context: &Context, name: &str) -> Result<Description, Err
     }
     match catalog::describe_extension(engine, name).await {
         Ok(extension) => {
-            let mut description = Description::empty("extension");
+            let mut description = ObjectDescription::empty("extension");
             description.extension = Some(extension);
             Ok(description)
         }
@@ -446,7 +469,7 @@ async fn describe_auto(context: &Context, name: &str) -> Result<Description, Err
     }
 }
 
-fn render_description(description: &Description) -> String {
+fn render_description(description: &ObjectDescription) -> String {
     let mut out = String::new();
     out.push_str(UNTRUSTED_NOTICE);
     out.push('\n');
@@ -508,7 +531,7 @@ fn render_description(description: &Description) -> String {
         for trigger in &relation.triggers {
             out.push_str(&format!(
                 "  trigger {} [{}]: {}\n",
-                trigger.name, trigger.enabled, trigger.definition
+                trigger.name, trigger.enable_mode, trigger.definition
             ));
         }
         for policy in &relation.policies {
@@ -555,8 +578,8 @@ fn render_description(description: &Description) -> String {
             sequence.name,
             sequence.data_type,
             sequence.start,
-            sequence.minimum,
-            sequence.maximum,
+            sequence.min_value,
+            sequence.max_value,
             sequence.increment,
             sequence.cache,
             if sequence.cycle { " cycle" } else { "" }
@@ -710,12 +733,12 @@ fn render_description(description: &Description) -> String {
 pub fn routes() -> Result<Vec<Route>, Error> {
     Ok(vec![
         route::<ListObjectsArgs, ObjectList, _>(
-            &groups::PG_LIST_OBJECTS,
+            &tool_specs::PG_LIST_OBJECTS,
             LIST_OBJECTS_DESCRIPTION,
             list_objects,
         )?,
-        route::<DescribeArgs, Description, _>(
-            &groups::PG_DESCRIBE,
+        route::<DescribeArgs, ObjectDescription, _>(
+            &tool_specs::PG_DESCRIBE,
             DESCRIBE_DESCRIPTION,
             describe,
         )?,
@@ -729,9 +752,9 @@ mod tests {
     #[test]
     fn a_keyset_cursor_round_trips_and_garbage_is_refused() {
         let key = Keyset {
-            s: "app".to_owned(),
-            n: "orders".to_owned(),
-            o: 16_384,
+            schema: "app".to_owned(),
+            name: "orders".to_owned(),
+            oid: 16_384,
         };
         let cursor = encode_cursor(&key);
         assert!(cursor.bytes().all(|b| b.is_ascii_hexdigit()));

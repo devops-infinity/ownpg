@@ -369,7 +369,13 @@ fn serve_answers_a_client_over_stdio_and_stops_on_eof() {
         .iter()
         .map(|line| serde_json::from_str(line).expect("json-rpc lines only"))
         .collect();
-    let by_id = |id: u64| responses.iter().find(|r| r["id"] == id).cloned().unwrap();
+    let by_id = |id: u64| {
+        responses
+            .iter()
+            .find(|response| response["id"] == id)
+            .cloned()
+            .unwrap()
+    };
     assert_eq!(by_id(1)["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 7);
     assert_eq!(by_id(3)["result"]["structuredContent"]["rows"][0][0], "1");

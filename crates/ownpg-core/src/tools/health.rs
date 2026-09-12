@@ -10,8 +10,8 @@ use super::{AuditFacts, Call, Outcome, Route, ToolOutput, route};
 use crate::config::describe::{SettingLine, describe};
 use crate::engine::Engine;
 use crate::error::{Error, Result};
-use crate::groups;
 use crate::shape::UNTRUSTED_NOTICE;
+use crate::tool_specs;
 
 const HEALTH_DESCRIPTION: &str = "Summarize the health of the connected server and database: connection use against max_connections, the buffer cache hit ratio, the transaction ID age of the database against autovacuum_freeze_max_age, the longest running transaction, sessions idle in a transaction, invalid and unused indexes in the scoped schema, estimated bloat in the scoped schema, replication lag and inactive slots, and the database size. Each check carries a status of ok, warning, or critical with the measured value and a short explanation. Checks are listed in that fixed order.";
 
@@ -83,9 +83,9 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
         )
         .await?;
     if let Some(row) = rows.first() {
-        let used: i64 = catalog::get(row, 0)?;
-        let max: i64 = catalog::get(row, 1)?;
-        let reserved: i64 = catalog::get(row, 2)?;
+        let used: i64 = catalog::read_column(row, 0)?;
+        let max: i64 = catalog::read_column(row, 1)?;
+        let reserved: i64 = catalog::read_column(row, 2)?;
         let usable = (max - reserved).max(1);
         let ratio = used as f64 / usable as f64;
         let status = if ratio >= 0.95 {
@@ -113,8 +113,8 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
         )
         .await?;
     if let Some(row) = rows.first() {
-        let hit: i64 = catalog::get(row, 0)?;
-        let read: i64 = catalog::get(row, 1)?;
+        let hit: i64 = catalog::read_column(row, 0)?;
+        let read: i64 = catalog::read_column(row, 1)?;
         let total = hit + read;
         let ratio = if total == 0 {
             1.0
@@ -147,9 +147,9 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
         )
         .await?;
     if let Some(row) = rows.first() {
-        let age: i64 = catalog::get(row, 0)?;
-        let freeze_max: i64 = catalog::get(row, 1)?;
-        let cluster_max: i64 = catalog::get(row, 2)?;
+        let age: i64 = catalog::read_column(row, 0)?;
+        let freeze_max: i64 = catalog::read_column(row, 1)?;
+        let cluster_max: i64 = catalog::read_column(row, 2)?;
         let status = if cluster_max >= 1_500_000_000 {
             Status::Critical
         } else if age >= freeze_max || cluster_max >= 1_000_000_000 {
@@ -176,8 +176,8 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
         )
         .await?;
     if let Some(row) = rows.first() {
-        let longest: f64 = catalog::get(row, 0)?;
-        let idle: i64 = catalog::get(row, 1)?;
+        let longest: f64 = catalog::read_column(row, 0)?;
+        let idle: i64 = catalog::read_column(row, 1)?;
         let status = if longest >= 3_600.0 {
             Status::Critical
         } else if longest >= 300.0 {
@@ -215,7 +215,7 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
         )
         .await?;
     if let Some(row) = rows.first() {
-        let invalid: i64 = catalog::get(row, 0)?;
+        let invalid: i64 = catalog::read_column(row, 0)?;
         checks.push(Check {
             name: "invalid_indexes".to_owned(),
             status: if invalid > 0 {
@@ -240,8 +240,8 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
         )
         .await?;
     if let Some(row) = rows.first() {
-        let unused: i64 = catalog::get(row, 0)?;
-        let bytes: i64 = catalog::get(row, 1)?;
+        let unused: i64 = catalog::read_column(row, 0)?;
+        let bytes: i64 = catalog::read_column(row, 1)?;
         checks.push(Check {
             name: "unused_indexes".to_owned(),
             status: if unused > 0 && bytes >= 64 * 1024 * 1024 {
@@ -266,9 +266,9 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
         )
         .await?;
     if let Some(row) = rows.first() {
-        let wasted: i64 = catalog::get(row, 0)?;
-        let real: i64 = catalog::get(row, 1)?;
-        let uncertain: bool = catalog::get(row, 2)?;
+        let wasted: i64 = catalog::read_column(row, 0)?;
+        let real: i64 = catalog::read_column(row, 1)?;
+        let uncertain: bool = catalog::read_column(row, 2)?;
         let ratio = if real == 0 {
             0.0
         } else {
@@ -310,13 +310,13 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
         )
         .await?;
     if let Some(row) = rows.first() {
-        let in_recovery: bool = catalog::get(row, 0)?;
-        let replay_lag: i64 = catalog::get(row, 1)?;
-        let replay_age: f64 = catalog::get(row, 2)?;
-        let standbys: i64 = catalog::get(row, 3)?;
-        let standby_lag: i64 = catalog::get(row, 4)?;
-        let inactive_slots: i64 = catalog::get(row, 5)?;
-        let retained: i64 = catalog::get(row, 6)?;
+        let in_recovery: bool = catalog::read_column(row, 0)?;
+        let replay_lag: i64 = catalog::read_column(row, 1)?;
+        let replay_age: f64 = catalog::read_column(row, 2)?;
+        let standbys: i64 = catalog::read_column(row, 3)?;
+        let standby_lag: i64 = catalog::read_column(row, 4)?;
+        let inactive_slots: i64 = catalog::read_column(row, 5)?;
+        let retained: i64 = catalog::read_column(row, 6)?;
         const WARN_BYTES: i64 = 64 * 1024 * 1024;
         const CRITICAL_BYTES: i64 = 1024 * 1024 * 1024;
         let (status, value, detail) = if in_recovery {
@@ -365,7 +365,7 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
         )
         .await?;
     if let Some(row) = rows.first() {
-        let size: i64 = catalog::get(row, 0)?;
+        let size: i64 = catalog::read_column(row, 0)?;
         checks.push(Check {
             name: "database_size".to_owned(),
             status: Status::Ok,
@@ -515,7 +515,7 @@ pub async fn doctor_report(
             .iter()
             .map(ToString::to_string)
             .collect(),
-        tools: groups::loaded(settings)
+        tools: tool_specs::loaded(settings)
             .iter()
             .map(|tool| tool.name.to_owned())
             .collect(),
@@ -629,8 +629,8 @@ pub fn render_doctor(report: &DoctorReport) -> String {
 
 pub fn routes() -> Result<Vec<Route>, Error> {
     Ok(vec![
-        route::<NoArgs, HealthReport, _>(&groups::PG_HEALTH, HEALTH_DESCRIPTION, health)?,
-        route::<NoArgs, DoctorReport, _>(&groups::PG_DOCTOR, DOCTOR_DESCRIPTION, doctor)?,
+        route::<NoArgs, HealthReport, _>(&tool_specs::PG_HEALTH, HEALTH_DESCRIPTION, health)?,
+        route::<NoArgs, DoctorReport, _>(&tool_specs::PG_DOCTOR, DOCTOR_DESCRIPTION, doctor)?,
     ])
 }
 

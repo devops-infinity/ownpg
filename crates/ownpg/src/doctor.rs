@@ -228,9 +228,9 @@ fn examine(global: &GlobalArgs, args: &DoctorArgs, process: &Process) -> Verdict
             return finish(checks, None);
         }
     };
-    let hints = context::hints(&process.env);
+    let ssh_hints = context::ssh_hints(&process.env);
     let report = runtime.block_on(async {
-        let engine = match Engine::start(Arc::clone(&settings), hints).await {
+        let engine = match Engine::start(Arc::clone(&settings), ssh_hints).await {
             Ok(engine) => engine,
             Err(error) => {
                 let attempts = match &error {
@@ -250,12 +250,12 @@ fn examine(global: &GlobalArgs, args: &DoctorArgs, process: &Process) -> Verdict
                 return None;
             }
         };
-        connected_checks(&engine, &settings, &mut checks).await
+        run_connected_checks(&engine, &settings, &mut checks).await
     });
     finish(checks, report)
 }
 
-async fn connected_checks(
+async fn run_connected_checks(
     engine: &Engine,
     settings: &Settings,
     checks: &mut Vec<Check>,

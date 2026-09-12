@@ -7,7 +7,7 @@ use rmcp::model::{
 
 use super::{LIST_TTL_MS, Server};
 use crate::error::Error;
-use crate::tools::objects::{DescribeArgs, DescribeKind, DetailLevel, ListObjectsArgs, describe};
+use crate::tools::objects::{DescribeArgs, DescribeTarget, DetailLevel, ListObjectsArgs, describe};
 use crate::tools::{Call, Reply, ToolFailure};
 
 pub const SCHEMA_TEMPLATE: &str = "postgres://{database}/{schema}";
@@ -28,7 +28,7 @@ pub enum Target {
 }
 
 #[must_use]
-pub fn encode(segment: &str) -> String {
+pub fn percent_encode(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -40,7 +40,7 @@ pub fn encode(segment: &str) -> String {
     out
 }
 
-fn decode(segment: &str) -> Option<String> {
+fn percent_decode(segment: &str) -> Option<String> {
     let mut out = Vec::with_capacity(segment.len());
     let mut bytes = segment.bytes();
     while let Some(byte) = bytes.next() {
@@ -57,16 +57,20 @@ fn decode(segment: &str) -> Option<String> {
 
 #[must_use]
 pub fn schema_uri(database: &str, schema: &str) -> String {
-    format!("postgres://{}/{}", encode(database), encode(schema))
+    format!(
+        "postgres://{}/{}",
+        percent_encode(database),
+        percent_encode(schema)
+    )
 }
 
 #[must_use]
 pub fn table_uri(database: &str, schema: &str, table: &str) -> String {
     format!(
         "postgres://{}/{}/{}",
-        encode(database),
-        encode(schema),
-        encode(table)
+        percent_encode(database),
+        percent_encode(schema),
+        percent_encode(table)
     )
 }
 
@@ -86,7 +90,10 @@ pub fn parse_uri(uri: &str, database: &str, schema: &str) -> Result<Target, Erro
             "the path is {database}/{schema} or {database}/{schema}/{table}",
         ));
     }
-    let decoded: Option<Vec<String>> = segments.iter().map(|segment| decode(segment)).collect();
+    let decoded: Option<Vec<String>> = segments
+        .iter()
+        .map(|segment| percent_decode(segment))
+        .collect();
     let decoded =
         decoded.ok_or_else(|| not_found("a path segment is not valid percent encoding"))?;
     let mut decoded = decoded.into_iter();
@@ -140,7 +147,7 @@ impl Server {
             principal: principal.name.clone(),
             request_state: None,
             input_responses: None,
-            elicitation: false,
+            can_elicit: false,
             progress: None,
             cancel: tokio_util::sync::CancellationToken::new(),
         }
@@ -175,10 +182,12 @@ impl Server {
             .await
             .map_err(resource_error)?;
         for row in &rows {
-            let name: String = crate::tools::catalog::get(row, 0).map_err(resource_error)?;
-            let kind: String = crate::tools::catalog::get(row, 1).map_err(resource_error)?;
+            let name: String =
+                crate::tools::catalog::read_column(row, 0).map_err(resource_error)?;
+            let kind: String =
+                crate::tools::catalog::read_column(row, 1).map_err(resource_error)?;
             let comment: Option<String> =
-                crate::tools::catalog::get(row, 2).map_err(resource_error)?;
+                crate::tools::catalog::read_column(row, 2).map_err(resource_error)?;
             let kind_label = match kind.as_str() {
                 "v" => "view",
                 "m" => "materialized view",
@@ -189,7 +198,7 @@ impl Server {
             let mut resource = Resource::new(self.table_resource_uri(&name), name.clone())
                 .with_title(format!("{kind_label} {schema}.{name}"))
                 .with_mime_type(MIME_TYPE);
-            if let Some(description) = comment.as_deref().and_then(describe_comment) {
+            if let Some(description) = comment.as_deref().and_then(comment_description) {
                 resource = resource.with_description(description);
             }
             items.push(resource);
@@ -225,7 +234,7 @@ impl Server {
                     call,
                     DescribeArgs {
                         name: table.clone(),
-                        object_type: DescribeKind::Relation,
+                        target: DescribeTarget::Relation,
                     },
                 )
                 .await
@@ -269,7 +278,7 @@ fn failure_error(uri: &str, failure: &ToolFailure) -> ErrorData {
 }
 
 #[must_use]
-pub fn describe_comment(comment: &str) -> Option<String> {
+pub fn comment_description(comment: &str) -> Option<String> {
     let mut text = String::with_capacity(comment.len().min(COMMENT_CAP));
     let mut pending_space = false;
     for character in comment.chars() {
@@ -299,13 +308,13 @@ mod tests {
 
     #[test]
     fn comments_are_marked_flattened_and_capped() {
-        assert_eq!(describe_comment("   \n\t "), None);
+        assert_eq!(comment_description("   \n\t "), None);
         assert_eq!(
-            describe_comment("one row\nper\u{7}order  "),
+            comment_description("one row\nper\u{7}order  "),
             Some(format!("{COMMENT_PREFIX}one row per order"))
         );
         let long = "x".repeat(COMMENT_CAP + 5);
-        let described = describe_comment(&long).unwrap();
+        let described = comment_description(&long).unwrap();
         assert!(described.ends_with("..."));
         assert_eq!(
             described.chars().count(),

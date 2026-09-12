@@ -6,9 +6,9 @@ use super::{
     Missing, cascade_suffix, if_exists_clause, if_not_exists_clause, run_ddl, scoped_name,
 };
 use crate::error::{Error, Result};
-use crate::groups;
 use crate::render::{expression, quote_ident, quote_literal, type_name, validate_ident};
 use crate::shape::ResultSet;
+use crate::tool_specs;
 use crate::tools::catalog;
 use crate::tools::{AuditFacts, Call, Outcome, Route, ToolOutput, route, text_rows};
 
@@ -419,7 +419,7 @@ pub enum ExtensionOperation {
     Create,
     Update,
     Drop,
-    Available,
+    ListAvailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -466,7 +466,7 @@ pub struct AvailableExtensions {
 
 pub fn extension(call: Call, args: ExtensionArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
-        if args.operation == ExtensionOperation::Available {
+        if args.operation == ExtensionOperation::ListAvailable {
             let rows = call
                 .engine()
                 .catalog_rows(
@@ -478,10 +478,10 @@ pub fn extension(call: Call, args: ExtensionArgs) -> BoxFuture<'static, Outcome>
             let mut listed = Vec::new();
             for row in &rows {
                 listed.push(AvailableExtension {
-                    name: catalog::get(row, 0)?,
-                    default_version: catalog::get(row, 1)?,
-                    installed_version: catalog::get(row, 2)?,
-                    comment: catalog::get(row, 3)?,
+                    name: catalog::read_column(row, 0)?,
+                    default_version: catalog::read_column(row, 1)?,
+                    installed_version: catalog::read_column(row, 2)?,
+                    comment: catalog::read_column(row, 3)?,
                 });
             }
             let text = text_rows(
@@ -555,7 +555,7 @@ pub fn extension(call: Call, args: ExtensionArgs) -> BoxFuture<'static, Outcome>
                 ),
                 &["DropStmt"],
             ),
-            ExtensionOperation::Available => (String::new(), &[]),
+            ExtensionOperation::ListAvailable => (String::new(), &[]),
         };
         run_ddl(
             &call,
@@ -746,12 +746,12 @@ pub fn comment(call: Call, args: CommentArgs) -> BoxFuture<'static, Outcome> {
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<TypeArgs, ResultSet, _>(&groups::PG_TYPE, TYPE_DESCRIPTION, type_tool)?,
+        route::<TypeArgs, ResultSet, _>(&tool_specs::PG_TYPE, TYPE_DESCRIPTION, type_tool)?,
         route::<ExtensionArgs, ResultSet, _>(
-            &groups::PG_EXTENSION,
+            &tool_specs::PG_EXTENSION,
             EXTENSION_DESCRIPTION,
             extension,
         )?,
-        route::<CommentArgs, ResultSet, _>(&groups::PG_COMMENT, COMMENT_DESCRIPTION, comment)?,
+        route::<CommentArgs, ResultSet, _>(&tool_specs::PG_COMMENT, COMMENT_DESCRIPTION, comment)?,
     ])
 }

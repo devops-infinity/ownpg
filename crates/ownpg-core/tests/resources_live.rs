@@ -95,7 +95,7 @@ async fn rig(scratch: &support::Scratch, lifecycle: ClientLifecycleMode) -> Rig 
 }
 
 impl Rig {
-    async fn tool(&self, tool: &str, arguments: Value) -> Value {
+    async fn ok(&self, tool: &str, arguments: Value) -> Value {
         let object = arguments.as_object().cloned().unwrap_or_default();
         let result = self
             .client
@@ -195,9 +195,9 @@ async fn resources_mirror_the_catalog_tools_and_refuse_foreign_uris() {
     assert_eq!(listed.ttl_ms, Some(60_000));
 
     let described = rig
-        .tool(
+        .ok(
             "pg_describe",
-            json!({"name": "orders", "object_type": "relation"}),
+            json!({"name": "orders", "target": "relation"}),
         )
         .await;
     let read = rig.read(&rig.table_uri("orders")).await;
@@ -336,7 +336,7 @@ async fn a_ddl_call_announces_the_table_and_schema_to_a_2025_client() {
     };
     prepare(&scratch).await;
     let rig = rig(&scratch, ClientLifecycleMode::Initialize).await;
-    rig.tool(
+    rig.ok(
         "pg_column",
         json!({"operation": "add", "table": "orders", "column": "note", "data_type": "text", "dry_run": true}),
     )
@@ -344,7 +344,7 @@ async fn a_ddl_call_announces_the_table_and_schema_to_a_2025_client() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(rig.handler.updated.lock().unwrap().is_empty());
 
-    rig.tool(
+    rig.ok(
         "pg_column",
         json!({"operation": "add", "table": "orders", "column": "note", "data_type": "text"}),
     )
@@ -396,7 +396,7 @@ async fn a_2025_client_subscribes_and_unsubscribes_to_one_table() {
         .send_request(subscribe(rig.table_uri("orders")))
         .await
         .expect("the subscription is accepted");
-    rig.tool(
+    rig.ok(
         "pg_column",
         json!({"operation": "add", "table": "orders", "column": "note", "data_type": "text"}),
     )
@@ -452,7 +452,7 @@ async fn a_ddl_call_reaches_a_subscription_stream_on_the_current_protocol() {
         Some(vec![orders.clone()])
     );
 
-    rig.tool(
+    rig.ok(
         "pg_index",
         json!({"operation": "create", "table": "orders", "name": "orders_customer_idx", "columns": ["customer_id"]}),
     )

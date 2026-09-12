@@ -6,9 +6,9 @@ use super::catalog;
 use super::ddl::{Missing, Toggle, cascade_suffix, if_exists_clause, number, run_ddl, scoped_name};
 use super::{AuditFacts, Call, Outcome, Route, ToolOutput, route, text_rows};
 use crate::error::{Error, Result};
-use crate::groups;
 use crate::render::{expression, ident_list, quote_ident, quote_literal, validate_ident};
 use crate::shape::{ResultSet, UNTRUSTED_NOTICE};
+use crate::tool_specs;
 
 const ROLE_DESCRIPTION: &str = "Create, alter, rename, or drop a role, grant or revoke membership in another role, and set or reset a configuration parameter for a role. Attributes cover login, createdb, createrole, inherit, replication, bypassrls, superuser, connection limit, password, and validity. The password never appears in logs or the audit trail. drop is destructive and needs confirm: true or the confirmation prompt.";
 
@@ -38,19 +38,19 @@ pub struct RoleArgs {
     #[schemars(description = "Role name.")]
     pub name: String,
     #[serde(default)]
-    pub login: Toggle,
+    pub can_login: Toggle,
     #[serde(default)]
     pub superuser: Toggle,
     #[serde(default)]
-    pub createdb: Toggle,
+    pub create_db: Toggle,
     #[serde(default)]
-    pub createrole: Toggle,
+    pub create_role: Toggle,
     #[serde(default)]
     pub inherit: Toggle,
     #[serde(default)]
     pub replication: Toggle,
     #[serde(default)]
-    pub bypassrls: Toggle,
+    pub bypass_rls: Toggle,
     #[serde(default)]
     #[schemars(description = "Whole number as text, -1 for no limit; empty leaves it unset.")]
     pub connection_limit: String,
@@ -74,10 +74,10 @@ pub struct RoleArgs {
     #[schemars(
         description = "grant_membership and revoke_membership: the role to add the member to."
     )]
-    pub role: String,
+    pub group_role: String,
     #[serde(default)]
     #[schemars(description = "grant_membership: WITH ADMIN OPTION.")]
-    pub admin: bool,
+    pub admin_option: bool,
     #[serde(default)]
     #[schemars(description = "grant_membership: the INHERIT option (PostgreSQL 16 and later).")]
     pub inherit_option: Toggle,
@@ -110,13 +110,13 @@ fn role_options(args: &RoleArgs) -> Result<Vec<String>> {
             .as_bool()
             .map(|on| if on { yes } else { no }.to_owned())
     };
-    parts.extend(flag(args.login, "LOGIN", "NOLOGIN"));
+    parts.extend(flag(args.can_login, "LOGIN", "NOLOGIN"));
     parts.extend(flag(args.superuser, "SUPERUSER", "NOSUPERUSER"));
-    parts.extend(flag(args.createdb, "CREATEDB", "NOCREATEDB"));
-    parts.extend(flag(args.createrole, "CREATEROLE", "NOCREATEROLE"));
+    parts.extend(flag(args.create_db, "CREATEDB", "NOCREATEDB"));
+    parts.extend(flag(args.create_role, "CREATEROLE", "NOCREATEROLE"));
     parts.extend(flag(args.inherit, "INHERIT", "NOINHERIT"));
     parts.extend(flag(args.replication, "REPLICATION", "NOREPLICATION"));
-    parts.extend(flag(args.bypassrls, "BYPASSRLS", "NOBYPASSRLS"));
+    parts.extend(flag(args.bypass_rls, "BYPASSRLS", "NOBYPASSRLS"));
     if let Some(limit) = number("connection_limit", &args.connection_limit)? {
         parts.push(format!("CONNECTION LIMIT {}", limit.max(-1)));
     }
@@ -186,13 +186,13 @@ pub fn role(call: Call, args: RoleArgs) -> BoxFuture<'static, Outcome> {
             ),
             RoleOperation::GrantMembership | RoleOperation::RevokeMembership => {
                 let mut missing = Missing::new();
-                missing.need("role", !args.role.trim().is_empty());
+                missing.need("group_role", !args.group_role.trim().is_empty());
                 missing.finish("membership")?;
-                validate_ident("role", args.role.trim())?;
-                let target = quote_ident(args.role.trim());
+                validate_ident("group_role", args.group_role.trim())?;
+                let target = quote_ident(args.group_role.trim());
                 if args.operation == RoleOperation::GrantMembership {
                     let mut options = Vec::new();
-                    if args.admin {
+                    if args.admin_option {
                         options.push("ADMIN OPTION".to_owned());
                     }
                     if let Some(inherit) = args.inherit_option.as_bool() {
@@ -210,7 +210,11 @@ pub fn role(call: Call, args: RoleArgs) -> BoxFuture<'static, Outcome> {
                         &["GrantRoleStmt"],
                     )
                 } else {
-                    let option = if args.admin { "ADMIN OPTION FOR " } else { "" };
+                    let option = if args.admin_option {
+                        "ADMIN OPTION FOR "
+                    } else {
+                        ""
+                    };
                     (
                         format!("REVOKE {option}{target} FROM {name}"),
                         &["GrantRoleStmt"],
@@ -300,7 +304,7 @@ pub enum GrantTarget {
 pub struct GrantArgs {
     pub operation: GrantOperation,
     #[schemars(description = "What kind of object.")]
-    pub on: GrantTarget,
+    pub target: GrantTarget,
     #[serde(default)]
     #[schemars(
         description = "Object names; empty for all_tables, all_sequences, all_routines, schema, and database."
@@ -403,7 +407,7 @@ pub fn grant(call: Call, args: GrantArgs) -> BoxFuture<'static, Outcome> {
         let schema = quote_ident(&scoped);
         let privileges = privilege_list(
             &args.privileges,
-            call.engine().features().maintain_privilege(),
+            call.engine().features().supports_maintain_privilege(),
         )?;
         let roles = role_list(&args.roles)?;
         let named = |kind: &str| -> Result<String> {
@@ -442,7 +446,7 @@ pub fn grant(call: Call, args: GrantArgs) -> BoxFuture<'static, Outcome> {
                 .collect();
             Ok(names?.join(", "))
         };
-        let object = match args.on {
+        let object = match args.target {
             GrantTarget::Table => format!("TABLE {}", named("table")?),
             GrantTarget::AllTables => format!("ALL TABLES IN SCHEMA {schema}"),
             GrantTarget::Sequence => format!("SEQUENCE {}", named("sequence")?),
@@ -487,7 +491,7 @@ pub fn grant(call: Call, args: GrantArgs) -> BoxFuture<'static, Outcome> {
                 &["GrantStmt"],
             ),
             GrantOperation::DefaultGrant | GrantOperation::DefaultRevoke => {
-                let kind = match args.on {
+                let kind = match args.target {
                     GrantTarget::Table | GrantTarget::AllTables => "TABLES",
                     GrantTarget::Sequence | GrantTarget::AllSequences => "SEQUENCES",
                     GrantTarget::Function | GrantTarget::Procedure | GrantTarget::AllRoutines => {
@@ -496,7 +500,7 @@ pub fn grant(call: Call, args: GrantArgs) -> BoxFuture<'static, Outcome> {
                     GrantTarget::Type => "TYPES",
                     GrantTarget::Schema | GrantTarget::Database | GrantTarget::Parameter => {
                         return Err(Error::ArgumentInvalid {
-                            argument: "on".to_owned(),
+                            argument: "target".to_owned(),
                             detail:
                                 "default privileges cover tables, sequences, routines, and types"
                                     .to_owned(),
@@ -713,9 +717,9 @@ pub fn policy(call: Call, args: PolicyArgs) -> BoxFuture<'static, Outcome> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivilegesOperation {
-    Object,
-    Role,
-    Template,
+    ListObject,
+    ListRole,
+    ApplyTemplate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
@@ -753,7 +757,7 @@ pub struct RolePrivilegeRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct RolePrivileges {
     pub role: String,
-    pub schema_usage: bool,
+    pub has_schema_usage: bool,
     pub member_of: Vec<String>,
     pub tables: Vec<RolePrivilegeRow>,
     pub notice: &'static str,
@@ -846,7 +850,7 @@ pub fn privileges(call: Call, args: PrivilegesArgs) -> BoxFuture<'static, Outcom
     Box::pin(async move {
         let scoped = call.settings().schema.value.clone();
         match args.operation {
-            PrivilegesOperation::Object => {
+            PrivilegesOperation::ListObject => {
                 let relation = catalog::resolve_relation(call.engine(), args.name.trim()).await?;
                 let rows = catalog::describe_privileges(call.engine(), &relation).await?;
                 let text = text_rows(
@@ -883,7 +887,7 @@ pub fn privileges(call: Call, args: PrivilegesArgs) -> BoxFuture<'static, Outcom
                     })
                     .into())
             }
-            PrivilegesOperation::Role => {
+            PrivilegesOperation::ListRole => {
                 validate_ident("name", args.name.trim())?;
                 let role = args.name.trim().to_owned();
                 let profile = catalog::describe_role(call.engine(), &role).await?;
@@ -894,8 +898,9 @@ pub fn privileges(call: Call, args: PrivilegesArgs) -> BoxFuture<'static, Outcom
                         &[&role, &scoped],
                     )
                     .await?;
-                let schema_usage: bool =
-                    rows.first().map_or(Ok(false), |row| catalog::get(row, 0))?;
+                let has_schema_usage: bool = rows
+                    .first()
+                    .map_or(Ok(false), |row| catalog::read_column(row, 0))?;
                 let rows = call
                     .engine()
                     .catalog_rows(
@@ -910,8 +915,8 @@ pub fn privileges(call: Call, args: PrivilegesArgs) -> BoxFuture<'static, Outcom
                 let mut tables = Vec::new();
                 for row in &rows {
                     tables.push(RolePrivilegeRow {
-                        table: catalog::get(row, 0)?,
-                        privileges: catalog::get(row, 1)?,
+                        table: catalog::read_column(row, 0)?,
+                        privileges: catalog::read_column(row, 1)?,
                     });
                 }
                 let text = text_rows(
@@ -925,7 +930,7 @@ pub fn privileges(call: Call, args: PrivilegesArgs) -> BoxFuture<'static, Outcom
                 );
                 let result = RolePrivileges {
                     role,
-                    schema_usage,
+                    has_schema_usage,
                     member_of: profile.member_of,
                     tables,
                     notice: UNTRUSTED_NOTICE,
@@ -934,7 +939,7 @@ pub fn privileges(call: Call, args: PrivilegesArgs) -> BoxFuture<'static, Outcom
                     "role {} usage on {}: {}, member of: {}\n{}",
                     result.role,
                     scoped,
-                    result.schema_usage,
+                    result.has_schema_usage,
                     if result.member_of.is_empty() {
                         "nothing".to_owned()
                     } else {
@@ -950,7 +955,7 @@ pub fn privileges(call: Call, args: PrivilegesArgs) -> BoxFuture<'static, Outcom
                     })
                     .into())
             }
-            PrivilegesOperation::Template => {
+            PrivilegesOperation::ApplyTemplate => {
                 if args.template == Template::Unset {
                     return Err(Error::ArgumentInvalid {
                         argument: "template".to_owned(),
@@ -978,11 +983,11 @@ pub fn privileges(call: Call, args: PrivilegesArgs) -> BoxFuture<'static, Outcom
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<RoleArgs, ResultSet, _>(&groups::PG_ROLE, ROLE_DESCRIPTION, role)?,
-        route::<GrantArgs, ResultSet, _>(&groups::PG_GRANT, GRANT_DESCRIPTION, grant)?,
-        route::<PolicyArgs, ResultSet, _>(&groups::PG_POLICY, POLICY_DESCRIPTION, policy)?,
+        route::<RoleArgs, ResultSet, _>(&tool_specs::PG_ROLE, ROLE_DESCRIPTION, role)?,
+        route::<GrantArgs, ResultSet, _>(&tool_specs::PG_GRANT, GRANT_DESCRIPTION, grant)?,
+        route::<PolicyArgs, ResultSet, _>(&tool_specs::PG_POLICY, POLICY_DESCRIPTION, policy)?,
         route::<PrivilegesArgs, ResultSet, _>(
-            &groups::PG_PRIVILEGES,
+            &tool_specs::PG_PRIVILEGES,
             PRIVILEGES_DESCRIPTION,
             privileges,
         )?,

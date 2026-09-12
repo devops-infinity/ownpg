@@ -74,7 +74,7 @@ pub struct ResolvedRelation {
     pub oid: u32,
 }
 
-pub fn scope_check(schema: &str, scoped: &str) -> Result<()> {
+pub fn check_scope(schema: &str, scoped: &str) -> Result<()> {
     if schema == scoped || CATALOG_SCHEMAS.contains(&schema) {
         return Ok(());
     }
@@ -99,11 +99,11 @@ pub async fn resolve_relation(engine: &Engine, name: &str) -> Result<ResolvedRel
         argument: "name".to_owned(),
         detail: format!("`{name}` names no relation in the scoped schema"),
     })?;
-    let schema: String = get(row, 0)?;
-    let relname: String = get(row, 1)?;
-    let relkind: String = get(row, 2)?;
-    let oid: i64 = get(row, 3)?;
-    scope_check(&schema, &engine.settings().schema.value)?;
+    let schema: String = read_column(row, 0)?;
+    let relname: String = read_column(row, 1)?;
+    let relkind: String = read_column(row, 2)?;
+    let oid: i64 = read_column(row, 3)?;
+    check_scope(&schema, &engine.settings().schema.value)?;
     let kind = ObjectType::from_relkind(&relkind).ok_or_else(|| Error::ArgumentInvalid {
         argument: "name".to_owned(),
         detail: format!(
@@ -119,7 +119,10 @@ pub async fn resolve_relation(engine: &Engine, name: &str) -> Result<ResolvedRel
     })
 }
 
-pub fn get<'a, T: tokio_postgres::types::FromSql<'a>>(row: &'a Row, index: usize) -> Result<T> {
+pub fn read_column<'a, T: tokio_postgres::types::FromSql<'a>>(
+    row: &'a Row,
+    index: usize,
+) -> Result<T> {
     row.try_get(index).map_err(|error| Error::ProtocolFailed {
         detail: format!("catalog column {index} could not be read: {error}"),
     })
@@ -162,7 +165,7 @@ pub struct IndexInfo {
 pub struct TriggerInfo {
     pub name: String,
     pub definition: String,
-    pub enabled: String,
+    pub enable_mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
@@ -229,15 +232,15 @@ pub async fn describe_relation(
         argument: "name".to_owned(),
         detail: "the relation vanished while it was being described".to_owned(),
     })?;
-    let persistence: String = get(head, 0)?;
-    let comment: Option<String> = get(head, 1)?;
-    let reltuples: f64 = get(head, 2)?;
-    let total_size: i64 = get(head, 3)?;
-    let table_size: i64 = get(head, 4)?;
-    let row_security: bool = get(head, 5)?;
-    let partition_key: Option<String> = get(head, 6)?;
-    let view_definition: Option<String> = get(head, 7)?;
-    let populated: Option<bool> = get(head, 8)?;
+    let persistence: String = read_column(head, 0)?;
+    let comment: Option<String> = read_column(head, 1)?;
+    let reltuples: f64 = read_column(head, 2)?;
+    let total_size: i64 = read_column(head, 3)?;
+    let table_size: i64 = read_column(head, 4)?;
+    let row_security: bool = read_column(head, 5)?;
+    let partition_key: Option<String> = read_column(head, 6)?;
+    let view_definition: Option<String> = read_column(head, 7)?;
+    let populated: Option<bool> = read_column(head, 8)?;
 
     let mut columns = Vec::new();
     for row in engine
@@ -251,13 +254,13 @@ pub async fn describe_relation(
         )
         .await?
     {
-        let identity: String = get(&row, 4)?;
-        let generated: String = get(&row, 5)?;
+        let identity: String = read_column(&row, 4)?;
+        let generated: String = read_column(&row, 5)?;
         columns.push(ColumnInfo {
-            name: get(&row, 0)?,
-            data_type: get(&row, 1)?,
-            default: get(&row, 2)?,
-            not_null: get(&row, 3)?,
+            name: read_column(&row, 0)?,
+            data_type: read_column(&row, 1)?,
+            default: read_column(&row, 2)?,
+            not_null: read_column(&row, 3)?,
             identity: match identity.as_str() {
                 "a" => Some("always".to_owned()),
                 "d" => Some("by default".to_owned()),
@@ -268,7 +271,7 @@ pub async fn describe_relation(
                 "v" => Some("virtual".to_owned()),
                 _ => None,
             },
-            comment: get(&row, 6)?,
+            comment: read_column(&row, 6)?,
         });
     }
 
@@ -281,9 +284,9 @@ pub async fn describe_relation(
         )
         .await?
     {
-        let kind: String = get(&row, 1)?;
+        let kind: String = read_column(&row, 1)?;
         constraints.push(ConstraintInfo {
-            name: get(&row, 0)?,
+            name: read_column(&row, 0)?,
             kind: match kind.as_str() {
                 "p" => "primary key",
                 "u" => "unique",
@@ -295,8 +298,8 @@ pub async fn describe_relation(
                 _ => "other",
             }
             .to_owned(),
-            definition: get(&row, 2)?,
-            validated: get(&row, 3)?,
+            definition: read_column(&row, 2)?,
+            validated: read_column(&row, 3)?,
         });
     }
 
@@ -312,12 +315,12 @@ pub async fn describe_relation(
         .await?
     {
         indexes.push(IndexInfo {
-            name: get(&row, 0)?,
-            primary: get(&row, 1)?,
-            unique: get(&row, 2)?,
-            valid: get(&row, 3)?,
-            definition: get(&row, 4)?,
-            size_bytes: get(&row, 5)?,
+            name: read_column(&row, 0)?,
+            primary: read_column(&row, 1)?,
+            unique: read_column(&row, 2)?,
+            valid: read_column(&row, 3)?,
+            definition: read_column(&row, 4)?,
+            size_bytes: read_column(&row, 5)?,
         });
     }
 
@@ -330,11 +333,11 @@ pub async fn describe_relation(
         )
         .await?
     {
-        let enabled: String = get(&row, 2)?;
+        let enabled: String = read_column(&row, 2)?;
         triggers.push(TriggerInfo {
-            name: get(&row, 0)?,
-            definition: get(&row, 1)?,
-            enabled: match enabled.as_str() {
+            name: read_column(&row, 0)?,
+            definition: read_column(&row, 1)?,
+            enable_mode: match enabled.as_str() {
                 "O" => "origin".to_owned(),
                 "D" => "disabled".to_owned(),
                 "R" => "replica".to_owned(),
@@ -355,9 +358,9 @@ pub async fn describe_relation(
         )
         .await?
     {
-        let command: String = get(&row, 1)?;
+        let command: String = read_column(&row, 1)?;
         policies.push(PolicyInfo {
-            name: get(&row, 0)?,
+            name: read_column(&row, 0)?,
             command: match command.as_str() {
                 "r" => "select",
                 "a" => "insert",
@@ -366,10 +369,10 @@ pub async fn describe_relation(
                 _ => "all",
             }
             .to_owned(),
-            permissive: get(&row, 2)?,
-            roles: get(&row, 3)?,
-            using: get(&row, 4)?,
-            with_check: get(&row, 5)?,
+            permissive: read_column(&row, 2)?,
+            roles: read_column(&row, 3)?,
+            using: read_column(&row, 4)?,
+            with_check: read_column(&row, 5)?,
         });
     }
 
@@ -385,8 +388,8 @@ pub async fn describe_relation(
             .await?
         {
             partitions.push(PartitionInfo {
-                name: get(&row, 0)?,
-                bound: get(&row, 1)?,
+                name: read_column(&row, 0)?,
+                bound: read_column(&row, 1)?,
             });
         }
     }
@@ -439,7 +442,7 @@ pub struct RoutineDescription {
 pub async fn describe_routines(engine: &Engine, name: &str) -> Result<Vec<RoutineDescription>> {
     let scoped = engine.settings().schema.value.clone();
     let (schema, bare) = split_name(name, &scoped);
-    scope_check(&schema, &scoped)?;
+    check_scope(&schema, &scoped)?;
     let mut out = Vec::new();
     for row in engine
         .catalog_rows(
@@ -454,11 +457,11 @@ pub async fn describe_routines(engine: &Engine, name: &str) -> Result<Vec<Routin
         )
         .await?
     {
-        let kind: String = get(&row, 3)?;
+        let kind: String = read_column(&row, 3)?;
         out.push(RoutineDescription {
-            schema: get(&row, 0)?,
-            name: get(&row, 1)?,
-            signature: get(&row, 2)?,
+            schema: read_column(&row, 0)?,
+            name: read_column(&row, 1)?,
+            signature: read_column(&row, 2)?,
             kind: match kind.as_str() {
                 "f" => "function",
                 "p" => "procedure",
@@ -467,13 +470,13 @@ pub async fn describe_routines(engine: &Engine, name: &str) -> Result<Vec<Routin
                 _ => "routine",
             }
             .to_owned(),
-            language: get(&row, 4)?,
-            security_definer: get(&row, 5)?,
-            returns: get(&row, 6)?,
-            arguments: get(&row, 7)?,
-            comment: get(&row, 8)?,
-            definition: get(&row, 9)?,
-            config: get(&row, 10)?,
+            language: read_column(&row, 4)?,
+            security_definer: read_column(&row, 5)?,
+            returns: read_column(&row, 6)?,
+            arguments: read_column(&row, 7)?,
+            comment: read_column(&row, 8)?,
+            definition: read_column(&row, 9)?,
+            config: read_column(&row, 10)?,
         });
     }
     if out.is_empty() {
@@ -504,7 +507,7 @@ pub struct TypeDescription {
 pub async fn describe_type(engine: &Engine, name: &str) -> Result<TypeDescription> {
     let scoped = engine.settings().schema.value.clone();
     let (schema, bare) = split_name(name, &scoped);
-    scope_check(&schema, &scoped)?;
+    check_scope(&schema, &scoped)?;
     let rows = engine
         .catalog_rows(
             "SELECT t.oid::int8, t.typtype::text, pg_catalog.obj_description(t.oid, 'pg_type'), \
@@ -520,12 +523,12 @@ pub async fn describe_type(engine: &Engine, name: &str) -> Result<TypeDescriptio
         argument: "name".to_owned(),
         detail: format!("`{name}` names no type in schema `{schema}`"),
     })?;
-    let oid: i64 = get(row, 0)?;
-    let typtype: String = get(row, 1)?;
-    let comment: Option<String> = get(row, 2)?;
-    let base_type: Option<String> = get(row, 3)?;
-    let range_subtype: Option<String> = get(row, 4)?;
-    let typrelid: i64 = get(row, 5)?;
+    let oid: i64 = read_column(row, 0)?;
+    let typtype: String = read_column(row, 1)?;
+    let comment: Option<String> = read_column(row, 2)?;
+    let base_type: Option<String> = read_column(row, 3)?;
+    let range_subtype: Option<String> = read_column(row, 4)?;
+    let typrelid: i64 = read_column(row, 5)?;
     let oid_param = u32::try_from(oid).unwrap_or(0);
     let mut enum_labels = Vec::new();
     let mut attributes = Vec::new();
@@ -539,7 +542,7 @@ pub async fn describe_type(engine: &Engine, name: &str) -> Result<TypeDescriptio
                 )
                 .await?
             {
-                enum_labels.push(get(&label, 0)?);
+                enum_labels.push(read_column(&label, 0)?);
             }
         }
         "c" => {
@@ -552,13 +555,13 @@ pub async fn describe_type(engine: &Engine, name: &str) -> Result<TypeDescriptio
                 .await?
             {
                 attributes.push(ColumnInfo {
-                    name: get(&attribute, 0)?,
-                    data_type: get(&attribute, 1)?,
+                    name: read_column(&attribute, 0)?,
+                    data_type: read_column(&attribute, 1)?,
                     default: None,
                     not_null: false,
                     identity: None,
                     generated: None,
-                    comment: get(&attribute, 2)?,
+                    comment: read_column(&attribute, 2)?,
                 });
             }
         }
@@ -570,7 +573,7 @@ pub async fn describe_type(engine: &Engine, name: &str) -> Result<TypeDescriptio
                 )
                 .await?
             {
-                constraints.push(get(&constraint, 0)?);
+                constraints.push(read_column(&constraint, 0)?);
             }
         }
         _ => {}
@@ -603,8 +606,8 @@ pub struct SequenceDescription {
     pub name: String,
     pub data_type: String,
     pub start: i64,
-    pub minimum: i64,
-    pub maximum: i64,
+    pub min_value: i64,
+    pub max_value: i64,
     pub increment: i64,
     pub cycle: bool,
     pub cache: i64,
@@ -634,15 +637,15 @@ pub async fn describe_sequence(
     Ok(SequenceDescription {
         schema: relation.schema.clone(),
         name: relation.name.clone(),
-        data_type: get(row, 0)?,
-        start: get(row, 1)?,
-        minimum: get(row, 2)?,
-        maximum: get(row, 3)?,
-        increment: get(row, 4)?,
-        cycle: get(row, 5)?,
-        cache: get(row, 6)?,
-        last_value: get(row, 7)?,
-        owned_by: get(row, 8)?,
+        data_type: read_column(row, 0)?,
+        start: read_column(row, 1)?,
+        min_value: read_column(row, 2)?,
+        max_value: read_column(row, 3)?,
+        increment: read_column(row, 4)?,
+        cycle: read_column(row, 5)?,
+        cache: read_column(row, 6)?,
+        last_value: read_column(row, 7)?,
+        owned_by: read_column(row, 8)?,
     })
 }
 
@@ -668,11 +671,11 @@ pub async fn describe_extension(engine: &Engine, name: &str) -> Result<Extension
         name: name.to_owned(),
     })?;
     Ok(ExtensionDescription {
-        name: get(row, 0)?,
-        version: get(row, 1)?,
-        schema: get(row, 2)?,
-        relocatable: get(row, 3)?,
-        comment: get(row, 4)?,
+        name: read_column(row, 0)?,
+        version: read_column(row, 1)?,
+        schema: read_column(row, 2)?,
+        relocatable: read_column(row, 3)?,
+        comment: read_column(row, 4)?,
     })
 }
 
@@ -709,18 +712,18 @@ pub async fn describe_role(engine: &Engine, name: &str) -> Result<RoleDescriptio
         detail: format!("`{name}` names no role"),
     })?;
     Ok(RoleDescription {
-        name: get(row, 0)?,
-        superuser: get(row, 1)?,
-        inherit: get(row, 2)?,
-        create_role: get(row, 3)?,
-        create_db: get(row, 4)?,
-        can_login: get(row, 5)?,
-        replication: get(row, 6)?,
-        bypass_rls: get(row, 7)?,
-        connection_limit: get(row, 8)?,
-        valid_until: get(row, 9)?,
-        member_of: get(row, 10)?,
-        config: get(row, 11)?,
+        name: read_column(row, 0)?,
+        superuser: read_column(row, 1)?,
+        inherit: read_column(row, 2)?,
+        create_role: read_column(row, 3)?,
+        create_db: read_column(row, 4)?,
+        can_login: read_column(row, 5)?,
+        replication: read_column(row, 6)?,
+        bypass_rls: read_column(row, 7)?,
+        connection_limit: read_column(row, 8)?,
+        valid_until: read_column(row, 9)?,
+        member_of: read_column(row, 10)?,
+        config: read_column(row, 11)?,
     })
 }
 
@@ -747,10 +750,10 @@ pub async fn describe_privileges(
         .await?
     {
         out.push(PrivilegeRow {
-            grantee: get(&row, 0)?,
-            privilege: get(&row, 1)?,
-            grantable: get(&row, 2)?,
-            grantor: get(&row, 3)?,
+            grantee: read_column(&row, 0)?,
+            privilege: read_column(&row, 1)?,
+            grantable: read_column(&row, 2)?,
+            grantor: read_column(&row, 3)?,
         });
     }
     Ok(out)
@@ -839,10 +842,10 @@ mod tests {
 
     #[test]
     fn the_scope_check_admits_the_catalogs_and_the_scoped_schema_only() {
-        scope_check("app", "app").unwrap();
-        scope_check("pg_catalog", "app").unwrap();
-        scope_check("information_schema", "app").unwrap();
-        let error = scope_check("other", "app").unwrap_err();
+        check_scope("app", "app").unwrap();
+        check_scope("pg_catalog", "app").unwrap();
+        check_scope("information_schema", "app").unwrap();
+        let error = check_scope("other", "app").unwrap_err();
         assert!(error.to_string().contains("outside scoped schema"));
     }
 

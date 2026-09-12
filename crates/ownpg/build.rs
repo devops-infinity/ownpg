@@ -19,7 +19,7 @@ fn main() -> io::Result<()> {
     for path in git_state_files() {
         println!("cargo::rerun-if-changed={}", path.display());
     }
-    println!("cargo::rustc-env=OWNPG_BUILD_COMMIT={}", commit());
+    println!("cargo::rustc-env=OWNPG_BUILD_COMMIT={}", commit_hash());
     println!("cargo::rustc-env=OWNPG_BUILD_DATE={}", build_date());
 
     let Some(out_dir) = env::var_os("OUT_DIR").map(PathBuf::from) else {
@@ -58,7 +58,7 @@ fn git_state_files() -> Vec<PathBuf> {
     files
 }
 
-fn commit() -> String {
+fn commit_hash() -> String {
     Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
         .output()

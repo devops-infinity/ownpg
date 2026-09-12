@@ -47,11 +47,11 @@ fn dispatch(args: Cli) -> Result<ExitClass> {
 
 fn show_manual(path: &[String]) -> Result<ExitClass> {
     let root = Cli::command();
-    let mut here = root.clone();
+    let mut current = root.clone();
     let mut walked: Vec<String> = Vec::new();
     for step in path {
-        let Some(found) = here.get_subcommands().find(|sub| sub.get_name() == step) else {
-            let known = here
+        let Some(found) = current.get_subcommands().find(|sub| sub.get_name() == step) else {
+            let known = current
                 .get_subcommands()
                 .map(|sub| sub.get_name().to_owned())
                 .collect();
@@ -61,7 +61,7 @@ fn show_manual(path: &[String]) -> Result<ExitClass> {
             });
         };
         let next = found.clone();
-        here = next;
+        current = next;
         walked.push(step.clone());
     }
 
@@ -70,7 +70,7 @@ fn show_manual(path: &[String]) -> Result<ExitClass> {
     } else {
         let titled = format!("ownpg-{}", walked.join("-"));
         let leaked: &'static str = Box::leak(titled.into_boxed_str());
-        clap_mangen::Man::new(here.name(leaked).version(ownpg_core::VERSION))
+        clap_mangen::Man::new(current.name(leaked).version(ownpg_core::VERSION))
     };
 
     let mut rendered = Vec::new();

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use super::{AuditFacts, Call, Outcome, Route, ToolOutput, route};
 use crate::engine::HandleInfo;
 use crate::error::Error;
-use crate::groups;
 use crate::render::validate_ident;
+use crate::tool_specs;
 
 const DESCRIPTION: &str = "Open and control an explicit transaction. begin returns a handle; pass that handle as the transaction argument of the write and DDL tools so their statements run inside it, then commit or rollback. savepoint and rollback_to take a savepoint name. status reports a handle's state: open, expired, committed, rolled_back, or lost. One handle can be open at a time; it expires after the configured idle time and is rolled back, and a dropped connection marks it lost. Reads keep working over a second connection while a handle is open.";
 
@@ -104,7 +104,7 @@ pub fn transaction(call: Call, args: TransactionArgs) -> BoxFuture<'static, Outc
 
 pub fn routes() -> Result<Vec<Route>, Error> {
     Ok(vec![route::<TransactionArgs, TransactionResult, _>(
-        &groups::PG_TRANSACTION,
+        &tool_specs::PG_TRANSACTION,
         DESCRIPTION,
         transaction,
     )?])

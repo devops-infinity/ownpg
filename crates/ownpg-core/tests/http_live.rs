@@ -70,7 +70,7 @@ async fn remote(
         .iter()
         .find(|(name, _)| *name == "OWNPG_BEARER_TOKENS")
         .map(|(_, value)| (*value).to_owned());
-    let gate = Arc::new(
+    let gatekeeper = Arc::new(
         http::gatekeeper(
             Arc::clone(&server),
             &settings,
@@ -79,7 +79,7 @@ async fn remote(
         )
         .expect("the gatekeeper builds"),
     );
-    let router = http::router(Arc::clone(&gate), &settings);
+    let router = http::router(Arc::clone(&gatekeeper), &settings);
     let listening = http::Listening::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -88,7 +88,7 @@ async fn remote(
     let task = tokio::spawn(http::serve(
         listening,
         router,
-        gate,
+        gatekeeper,
         async move {
             let _ = stopped.await;
         },
@@ -131,7 +131,7 @@ impl Remote {
             .body(body.to_string())
     }
 
-    async fn tool(
+    async fn call_tool(
         &self,
         tool: &str,
         token: Option<&str>,
@@ -191,7 +191,7 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
     assert_eq!(ready.status(), 200);
     assert_eq!(ready.text().await.unwrap(), "ready");
 
-    let (status, body, headers) = remote.tool("pg_health", None).await;
+    let (status, body, headers) = remote.call_tool("pg_health", None).await;
     assert_eq!(status, 200, "{body}");
     assert_ne!(result_of(&body)["isError"], true, "{body}");
     assert!(
@@ -317,7 +317,7 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
     let mut retry_after = None;
     let mut throttled = Value::Null;
     for _ in 0..70 {
-        let (status, body, headers) = remote.tool("pg_health", None).await;
+        let (status, body, headers) = remote.call_tool("pg_health", None).await;
         last = status;
         if status == 429 {
             retry_after = headers
@@ -360,7 +360,7 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     )
     .await;
 
-    let (status, body, headers) = remote.tool("pg_health", None).await;
+    let (status, body, headers) = remote.call_tool("pg_health", None).await;
     assert_eq!(status, 401, "{body}");
     let challenge = headers
         .get("www-authenticate")
@@ -381,16 +381,16 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     assert_eq!(body["error"], "invalid_request");
 
     let (status, body, _) = remote
-        .tool("pg_health", Some("wrong-token-0123456789"))
+        .call_tool("pg_health", Some("wrong-token-0123456789"))
         .await;
     assert_eq!(status, 401, "{body}");
     assert_eq!(body["error"], "invalid_token");
 
-    let (status, body, _) = remote.tool("pg_health", Some(TOKEN_READ)).await;
+    let (status, body, _) = remote.call_tool("pg_health", Some(TOKEN_READ)).await;
     assert_eq!(status, 200, "{body}");
     assert_ne!(result_of(&body)["isError"], true, "{body}");
 
-    let (status, body, headers) = remote.tool("pg_run_write", Some(TOKEN_READ)).await;
+    let (status, body, headers) = remote.call_tool("pg_run_write", Some(TOKEN_READ)).await;
     assert_eq!(status, 403, "{body}");
     assert_eq!(body["error"], "insufficient_scope");
     assert!(
@@ -527,7 +527,7 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     let mut last = 401;
     for _ in 0..70 {
         let (status, _, _) = remote
-            .tool("pg_health", Some("wrong-token-0123456789"))
+            .call_tool("pg_health", Some("wrong-token-0123456789"))
             .await;
         last = status;
         if status == 429 {
@@ -590,7 +590,7 @@ async fn forwarded_addresses_count_only_behind_a_trusted_proxy() {
         (401, 429),
         "a second forwarded client gets its own bucket"
     );
-    let (status, body, _) = behind_proxy.tool("pg_health", Some(TOKEN_READ)).await;
+    let (status, body, _) = behind_proxy.call_tool("pg_health", Some(TOKEN_READ)).await;
     assert_eq!(status, 200, "{body}");
     behind_proxy.finish().await;
 
@@ -739,11 +739,11 @@ async fn oauth_tokens_are_checked_against_the_issuer_keys() {
             "scope": "ownpg:read"
         }),
     );
-    let (status, body, _) = remote.tool("pg_health", Some(&good)).await;
+    let (status, body, _) = remote.call_tool("pg_health", Some(&good)).await;
     assert_eq!(status, 200, "{body}");
     assert_ne!(result_of(&body)["isError"], true, "{body}");
 
-    let (status, body, headers) = remote.tool("pg_run_write", Some(&good)).await;
+    let (status, body, headers) = remote.call_tool("pg_run_write", Some(&good)).await;
     assert_eq!(status, 403, "{body}");
     assert!(
         headers
@@ -758,7 +758,7 @@ async fn oauth_tokens_are_checked_against_the_issuer_keys() {
         "k1",
         json!({"iss": "https://issuer.test", "aud": "https://other.test/mcp", "sub": "alice", "exp": now() + 600, "scope": "ownpg:read"}),
     );
-    let (status, body, headers) = remote.tool("pg_health", Some(&other_audience)).await;
+    let (status, body, headers) = remote.call_tool("pg_health", Some(&other_audience)).await;
     assert_eq!(status, 401, "{body}");
     assert!(
         headers
@@ -779,7 +779,7 @@ async fn oauth_tokens_are_checked_against_the_issuer_keys() {
         "k1",
         json!({"iss": "https://issuer.test", "aud": audience, "sub": "alice", "exp": now() - 600, "scope": "ownpg:read"}),
     );
-    let (status, body, _) = remote.tool("pg_health", Some(&expired)).await;
+    let (status, body, _) = remote.call_tool("pg_health", Some(&expired)).await;
     assert_eq!(status, 401, "{body}");
     assert!(
         body["error_description"]
@@ -792,7 +792,7 @@ async fn oauth_tokens_are_checked_against_the_issuer_keys() {
         "k2",
         json!({"iss": "https://issuer.test", "aud": audience, "sub": "alice", "exp": now() + 600, "scope": "ownpg:read"}),
     );
-    let (status, body, _) = remote.tool("pg_health", Some(&unknown_key)).await;
+    let (status, body, _) = remote.call_tool("pg_health", Some(&unknown_key)).await;
     assert_eq!(status, 401, "{body}");
 
     let other_key = ring::signature::Ed25519KeyPair::from_pkcs8(
@@ -810,7 +810,7 @@ async fn oauth_tokens_are_checked_against_the_issuer_keys() {
         "k1",
         json!({"iss": "https://issuer.test", "aud": audience, "sub": "mallory", "exp": now() + 600, "scope": "ownpg:read"}),
     );
-    let (status, body, _) = remote.tool("pg_health", Some(&forged)).await;
+    let (status, body, _) = remote.call_tool("pg_health", Some(&forged)).await;
     assert_eq!(status, 401, "{body}");
     assert!(
         body["error_description"]
@@ -819,14 +819,14 @@ async fn oauth_tokens_are_checked_against_the_issuer_keys() {
             .contains("signature")
     );
 
-    let (status, body, _) = remote.tool("pg_health", Some("not.a.jwt")).await;
+    let (status, body, _) = remote.call_tool("pg_health", Some("not.a.jwt")).await;
     assert_eq!(status, 401, "{body}");
 
     let nameless = issuer.token(
         "k1",
         json!({"iss": "https://issuer.test", "aud": audience, "exp": now() + 600, "scope": "ownpg:read"}),
     );
-    let (status, body, _) = remote.tool("pg_health", Some(&nameless)).await;
+    let (status, body, _) = remote.call_tool("pg_health", Some(&nameless)).await;
     assert_eq!(status, 401, "{body}");
     assert!(
         body["error_description"]
@@ -879,7 +879,7 @@ async fn an_unreachable_key_endpoint_fails_closed() {
             .to_string(),
     );
     let token = format!("{header}.{payload}.AAAA");
-    let (status, body, _) = remote.tool("pg_health", Some(&token)).await;
+    let (status, body, _) = remote.call_tool("pg_health", Some(&token)).await;
     assert_eq!(status, 401, "{body}");
     assert!(
         body["error_description"]
@@ -933,9 +933,9 @@ async fn metrics_are_exported_to_the_configured_collector() {
         &[("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str())],
     )
     .await;
-    let (status, body, _) = remote.tool("pg_health", None).await;
+    let (status, body, _) = remote.call_tool("pg_health", None).await;
     assert_eq!(status, 200, "{body}");
-    let (status, _, _) = remote.tool("pg_run_write", None).await;
+    let (status, _, _) = remote.call_tool("pg_run_write", None).await;
     assert_eq!(status, 200);
     remote.finish().await;
     assert!(

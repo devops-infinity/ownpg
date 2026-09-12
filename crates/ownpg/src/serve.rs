@@ -25,7 +25,7 @@ pub(crate) fn run(global: &GlobalArgs, args: &ServeArgs, process: &Process) -> R
         tracing::warn!(code = warning.code, "{}", warning.message);
     }
     let settings = Arc::new(settings);
-    let hints = context::hints(&process.env);
+    let ssh_hints = context::ssh_hints(&process.env);
     let principal = Principal::local(process.env.os_user());
     let runtime = if args.http {
         tokio::runtime::Builder::new_multi_thread()
@@ -43,9 +43,9 @@ pub(crate) fn run(global: &GlobalArgs, args: &ServeArgs, process: &Process) -> R
     let over_http = args.http;
     runtime.block_on(async move {
         let engine = if over_http {
-            Engine::start_pooled(Arc::clone(&settings), hints).await?
+            Engine::start_pooled(Arc::clone(&settings), ssh_hints).await?
         } else {
-            Engine::start(Arc::clone(&settings), hints).await?
+            Engine::start(Arc::clone(&settings), ssh_hints).await?
         };
         let info = engine.info().await;
         if let Some(warning) = info.tls_warning() {
@@ -72,13 +72,13 @@ pub(crate) fn run(global: &GlobalArgs, args: &ServeArgs, process: &Process) -> R
                 )
                 .await?,
             );
-            let gate = Arc::new(http::gatekeeper(
+            let gatekeeper = Arc::new(http::gatekeeper(
                 Arc::clone(&server),
                 &settings,
                 environment_tokens.as_deref(),
                 Principal::local(None),
             )?);
-            let router = http::router(Arc::clone(&gate), &settings);
+            let router = http::router(Arc::clone(&gatekeeper), &settings);
             let listening = http::Listening::bind(settings.http.bind.value).await?;
             tracing::info!(
                 address = %listening.local_addr,
@@ -89,7 +89,7 @@ pub(crate) fn run(global: &GlobalArgs, args: &ServeArgs, process: &Process) -> R
             return http::serve(
                 listening,
                 router,
-                gate,
+                gatekeeper,
                 http::shutdown_signal(),
                 settings.http.shutdown.value,
             )

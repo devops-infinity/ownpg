@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use super::read::facts_for;
 use super::{Call, Outcome, Route, ToolFailure, ToolOutput, route};
 use crate::error::{Error, Result};
-use crate::groups;
 use crate::render::{quote_literal, verify};
 use crate::shape::ResultSet;
+use crate::tool_specs;
 
 const ACTIVITY_DESCRIPTION: &str = "List client backends from pg_stat_activity: pid, role, application, client address, state, wait event, how long the transaction and the current statement have run, and the statement text. Idle sessions are left out unless include_idle is true; min_duration_seconds keeps only statements running at least that long. Sorted by transaction start, oldest first, then pid.";
 
@@ -110,10 +110,6 @@ pub fn locks(call: Call, args: LocksArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move { run_catalog(&call, "locks", LOCKS_SQL, args.row_cap).await })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ReplicationArgs {}
-
 const REPLICATION_SQL: &str = "SELECT 'server' AS kind, 'in_recovery' AS name, pg_catalog.pg_is_in_recovery()::text AS state, NULL::text AS sync_state, \
                    CASE WHEN pg_catalog.pg_is_in_recovery() THEN pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_last_wal_receive_lsn(), pg_catalog.pg_last_wal_replay_lsn())::int8 ELSE 0 END AS lag_bytes, \
                    NULL::text AS detail \
@@ -129,16 +125,12 @@ const REPLICATION_SQL: &str = "SELECT 'server' AS kind, 'in_recovery' AS name, p
                    FROM pg_catalog.pg_replication_slots \
                    ORDER BY 1, 2";
 
-pub fn replication(call: Call, _args: ReplicationArgs) -> BoxFuture<'static, Outcome> {
+pub fn replication(call: Call, _args: super::health::NoArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move { run_catalog(&call, "replication", REPLICATION_SQL, 1_000).await })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WalArgs {}
-
 fn wal_sql(features: crate::engine::Features) -> String {
-    let checkpointer = if features.stat_checkpointer() {
+    let checkpointer = if features.supports_stat_checkpointer() {
         "SELECT 'checkpointer' AS source, 'timed checkpoints' AS metric, num_timed::text AS value FROM pg_catalog.pg_stat_checkpointer \
              UNION ALL SELECT 'checkpointer', 'requested checkpoints', num_requested::text FROM pg_catalog.pg_stat_checkpointer \
              UNION ALL SELECT 'checkpointer', 'write time ms', write_time::text FROM pg_catalog.pg_stat_checkpointer \
@@ -151,7 +143,7 @@ fn wal_sql(features: crate::engine::Features) -> String {
              UNION ALL SELECT 'bgwriter', 'sync time ms', checkpoint_sync_time::text FROM pg_catalog.pg_stat_bgwriter \
              UNION ALL SELECT 'bgwriter', 'buffers written by checkpoints', buffers_checkpoint::text FROM pg_catalog.pg_stat_bgwriter"
     };
-    let io = if features.stat_io() {
+    let io = if features.supports_stat_io() {
         " UNION ALL SELECT 'io', backend_type || ' ' || object || ' ' || context || ' reads', sum(reads)::text FROM pg_catalog.pg_stat_io WHERE reads > 0 GROUP BY backend_type, object, context \
               UNION ALL SELECT 'io', backend_type || ' ' || object || ' ' || context || ' writes', sum(writes)::text FROM pg_catalog.pg_stat_io WHERE writes > 0 GROUP BY backend_type, object, context"
     } else {
@@ -169,16 +161,12 @@ fn wal_sql(features: crate::engine::Features) -> String {
     )
 }
 
-pub fn wal(call: Call, _args: WalArgs) -> BoxFuture<'static, Outcome> {
+pub fn wal(call: Call, _args: super::health::NoArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let sql = wal_sql(call.engine().features());
         run_catalog(&call, "wal", &sql, 1_000).await
     })
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct IndexesHealthArgs {}
 
 pub(crate) fn indexes_health_sql(schema: &str) -> String {
     let scoped = quote_literal(schema);
@@ -210,7 +198,7 @@ pub(crate) fn indexes_health_sql(schema: &str) -> String {
     )
 }
 
-pub fn indexes_health(call: Call, _args: IndexesHealthArgs) -> BoxFuture<'static, Outcome> {
+pub fn indexes_health(call: Call, _args: super::health::NoArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let sql = indexes_health_sql(&call.settings().schema.value);
         run_catalog(&call, "indexes_health", &sql, 1_000).await
@@ -250,8 +238,8 @@ async fn installed_extension(call: &Call, name: &str) -> Result<(String, String)
         });
     };
     Ok((
-        super::catalog::get::<String>(row, 0)?,
-        super::catalog::get::<String>(row, 1)?,
+        super::catalog::read_column::<String>(row, 0)?,
+        super::catalog::read_column::<String>(row, 1)?,
     ))
 }
 
@@ -492,23 +480,31 @@ pub fn top_queries(call: Call, args: TopQueriesArgs) -> BoxFuture<'static, Outco
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<ActivityArgs, ResultSet, _>(&groups::PG_ACTIVITY, ACTIVITY_DESCRIPTION, activity)?,
-        route::<LocksArgs, ResultSet, _>(&groups::PG_LOCKS, LOCKS_DESCRIPTION, locks)?,
-        route::<ReplicationArgs, ResultSet, _>(
-            &groups::PG_REPLICATION,
+        route::<ActivityArgs, ResultSet, _>(
+            &tool_specs::PG_ACTIVITY,
+            ACTIVITY_DESCRIPTION,
+            activity,
+        )?,
+        route::<LocksArgs, ResultSet, _>(&tool_specs::PG_LOCKS, LOCKS_DESCRIPTION, locks)?,
+        route::<super::health::NoArgs, ResultSet, _>(
+            &tool_specs::PG_REPLICATION,
             REPLICATION_DESCRIPTION,
             replication,
         )?,
-        route::<WalArgs, ResultSet, _>(&groups::PG_WAL, WAL_DESCRIPTION, wal)?,
-        route::<IndexesHealthArgs, ResultSet, _>(
-            &groups::PG_INDEXES_HEALTH,
+        route::<super::health::NoArgs, ResultSet, _>(&tool_specs::PG_WAL, WAL_DESCRIPTION, wal)?,
+        route::<super::health::NoArgs, ResultSet, _>(
+            &tool_specs::PG_INDEXES_HEALTH,
             INDEXES_HEALTH_DESCRIPTION,
             indexes_health,
         )?,
-        route::<BloatArgs, ResultSet, _>(&groups::PG_BLOAT, BLOAT_DESCRIPTION, bloat)?,
-        route::<SettingsArgs, ResultSet, _>(&groups::PG_SETTINGS, SETTINGS_DESCRIPTION, settings)?,
+        route::<BloatArgs, ResultSet, _>(&tool_specs::PG_BLOAT, BLOAT_DESCRIPTION, bloat)?,
+        route::<SettingsArgs, ResultSet, _>(
+            &tool_specs::PG_SETTINGS,
+            SETTINGS_DESCRIPTION,
+            settings,
+        )?,
         route::<TopQueriesArgs, ResultSet, _>(
-            &groups::PG_TOP_QUERIES,
+            &tool_specs::PG_TOP_QUERIES,
             TOP_QUERIES_DESCRIPTION,
             top_queries,
         )?,
@@ -531,7 +527,7 @@ mod tests {
             installed: "1.7".to_owned(),
             needed: "1.8".to_owned(),
         };
-        assert_eq!(error.id(), crate::error::ErrorId::ExtensionMissing);
+        assert_eq!(error.id(), crate::error::ErrorId::ExtensionOutdated);
         assert!(
             error
                 .remedy()

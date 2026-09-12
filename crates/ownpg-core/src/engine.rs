@@ -67,82 +67,85 @@ impl Features {
     }
 
     #[must_use]
-    pub const fn stat_io(self) -> bool {
+    pub const fn supports_stat_io(self) -> bool {
         self.server_version_num >= 160_000
     }
 
     #[must_use]
-    pub const fn merge(self) -> bool {
+    pub const fn supports_merge(self) -> bool {
         self.server_version_num >= 150_000
     }
 
     #[must_use]
-    pub const fn merge_returning(self) -> bool {
+    pub const fn supports_merge_returning(self) -> bool {
         self.server_version_num >= 170_000
     }
 
     #[must_use]
-    pub const fn transaction_timeout(self) -> bool {
+    pub const fn supports_transaction_timeout(self) -> bool {
         self.server_version_num >= 170_000
     }
 
     #[must_use]
-    pub const fn stat_checkpointer(self) -> bool {
+    pub const fn supports_stat_checkpointer(self) -> bool {
         self.server_version_num >= 170_000
     }
 
     #[must_use]
-    pub const fn returning_old_new(self) -> bool {
+    pub const fn supports_returning_old_new(self) -> bool {
         self.server_version_num >= 180_000
     }
 
     #[must_use]
-    pub const fn not_enforced_constraints(self) -> bool {
+    pub const fn supports_not_enforced_constraints(self) -> bool {
         self.server_version_num >= 180_000
     }
 
     #[must_use]
-    pub const fn virtual_generated_columns(self) -> bool {
+    pub const fn supports_virtual_generated_columns(self) -> bool {
         self.server_version_num >= 180_000
     }
 
     #[must_use]
-    pub const fn nulls_not_distinct(self) -> bool {
+    pub const fn supports_nulls_not_distinct(self) -> bool {
         self.server_version_num >= 150_000
     }
 
     #[must_use]
-    pub const fn without_overlaps(self) -> bool {
+    pub const fn supports_without_overlaps(self) -> bool {
         self.server_version_num >= 180_000
     }
 
     #[must_use]
-    pub const fn security_invoker(self) -> bool {
+    pub const fn supports_security_invoker(self) -> bool {
         self.server_version_num >= 150_000
     }
 
     #[must_use]
-    pub const fn maintain_privilege(self) -> bool {
+    pub const fn supports_maintain_privilege(self) -> bool {
         self.server_version_num >= 170_000
     }
 
     #[must_use]
     pub fn as_map(self) -> BTreeMap<&'static str, bool> {
         BTreeMap::from([
-            ("pg_stat_io", self.stat_io()),
-            ("merge", self.merge()),
-            ("merge_returning", self.merge_returning()),
-            ("transaction_timeout", self.transaction_timeout()),
-            ("pg_stat_checkpointer", self.stat_checkpointer()),
-            ("returning_old_new", self.returning_old_new()),
-            ("not_enforced_constraints", self.not_enforced_constraints()),
+            ("pg_stat_io", self.supports_stat_io()),
+            ("merge", self.supports_merge()),
+            ("merge_returning", self.supports_merge_returning()),
+            ("transaction_timeout", self.supports_transaction_timeout()),
+            ("pg_stat_checkpointer", self.supports_stat_checkpointer()),
+            ("returning_old_new", self.supports_returning_old_new()),
+            (
+                "not_enforced_constraints",
+                self.supports_not_enforced_constraints(),
+            ),
             (
                 "virtual_generated_columns",
-                self.virtual_generated_columns(),
+                self.supports_virtual_generated_columns(),
             ),
-            ("nulls_not_distinct", self.nulls_not_distinct()),
-            ("without_overlaps", self.without_overlaps()),
-            ("maintain_privilege", self.maintain_privilege()),
+            ("nulls_not_distinct", self.supports_nulls_not_distinct()),
+            ("without_overlaps", self.supports_without_overlaps()),
+            ("maintain_privilege", self.supports_maintain_privilege()),
         ])
     }
 }
@@ -233,7 +236,7 @@ impl deadpool::managed::Manager for SessionManager {
 }
 
 pub type Pool = deadpool::managed::Pool<SessionManager>;
-type Pooled = deadpool::managed::Object<SessionManager>;
+type PooledSession = deadpool::managed::Object<SessionManager>;
 
 fn pool_error(error: deadpool::managed::PoolError<Error>) -> Error {
     match error {
@@ -246,7 +249,7 @@ fn pool_error(error: deadpool::managed::PoolError<Error>) -> Error {
 
 enum Conn {
     Owned(Session),
-    Pooled(Pooled),
+    Pooled(PooledSession),
 }
 
 impl std::fmt::Debug for Conn {
@@ -285,10 +288,10 @@ struct Lane {
 
 impl Lane {
     fn new(session: Session) -> Self {
-        Self::around(Conn::Owned(session))
+        Self::from_conn(Conn::Owned(session))
     }
 
-    const fn around(conn: Conn) -> Self {
+    const fn from_conn(conn: Conn) -> Self {
         Self {
             conn,
             in_read_transaction: false,
@@ -306,7 +309,7 @@ impl Lane {
 #[derive(Debug)]
 struct Primary {
     lane: Lane,
-    write: Option<WriteHandle>,
+    write_handle: Option<WriteHandle>,
     closed: BTreeMap<String, HandleState>,
 }
 
@@ -329,7 +332,7 @@ tokio::task_local! {
 #[derive(Default)]
 struct Running {
     next_seq: u64,
-    tokens: HashMap<u64, Vec<(u64, tokio_postgres::CancelToken)>>,
+    cancel_tokens: HashMap<u64, Vec<(u64, tokio_postgres::CancelToken)>>,
 }
 
 struct Tracked<'a> {
@@ -345,10 +348,10 @@ impl Drop for Tracked<'_> {
         let Ok(mut running) = self.engine.running.lock() else {
             return;
         };
-        if let Some(tokens) = running.tokens.get_mut(&call) {
-            tokens.retain(|(held, _)| *held != seq);
-            if tokens.is_empty() {
-                running.tokens.remove(&call);
+        if let Some(cancel_tokens) = running.cancel_tokens.get_mut(&call) {
+            cancel_tokens.retain(|(held, _)| *held != seq);
+            if cancel_tokens.is_empty() {
+                running.cancel_tokens.remove(&call);
             }
         }
     }
@@ -365,7 +368,7 @@ pub struct Engine {
     running: std::sync::Mutex<Running>,
     role: tokio::sync::OnceCell<RoleProfile>,
     features: Features,
-    prefix: Option<String>,
+    transaction_prefix: Option<String>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -395,7 +398,8 @@ impl Engine {
         let connector = Arc::new(Connector::new(Arc::clone(&settings)).with_ssh_hints(hints));
         let session = connector.connect().await?;
         let features = Features::from_version(session.info.server_version_num);
-        let prefix = pooled_transaction_prefix(&settings, session.info.server_version_num);
+        let transaction_prefix =
+            pooled_transaction_prefix(&settings, session.info.server_version_num);
         let pool = if pooled {
             let size = usize::try_from(settings.http.pool_size.value).unwrap_or(4);
             let pool = Pool::builder(SessionManager {
@@ -421,7 +425,7 @@ impl Engine {
             connector,
             primary: Mutex::new(Primary {
                 lane: Lane::new(session),
-                write: None,
+                write_handle: None,
                 closed: BTreeMap::new(),
             }),
             secondary: Mutex::new(None),
@@ -431,7 +435,7 @@ impl Engine {
             running: std::sync::Mutex::new(Running::default()),
             role: tokio::sync::OnceCell::new(),
             features,
-            prefix,
+            transaction_prefix,
         };
         if engine.settings.strict_role.value {
             engine.role().await?.enforce(true)?;
@@ -451,7 +455,7 @@ impl Engine {
             });
         };
         let object = pool.get().await.map_err(pool_error)?;
-        Ok(Lane::around(Conn::Pooled(object)))
+        Ok(Lane::from_conn(Conn::Pooled(object)))
     }
 
     #[must_use]
@@ -482,40 +486,45 @@ impl Engine {
     }
 
     pub async fn cancel_call(&self, call: u64) -> Result<()> {
-        let tokens = self
+        let cancel_tokens = self
             .running
             .lock()
             .map_err(|_| Error::ProtocolFailed {
                 detail: "the running-call lock is poisoned".to_owned(),
             })?
-            .tokens
+            .cancel_tokens
             .get(&call)
-            .map(|tokens| tokens.iter().map(|(_, token)| token.clone()).collect())
+            .map(|cancel_tokens| {
+                cancel_tokens
+                    .iter()
+                    .map(|(_, token)| token.clone())
+                    .collect()
+            })
             .unwrap_or_default();
-        self.send_cancel(tokens).await
+        self.send_cancel(cancel_tokens).await
     }
 
     pub async fn cancel_running_statements(&self) -> Result<()> {
-        let tokens = self
+        let cancel_tokens = self
             .running
             .lock()
             .map_err(|_| Error::ProtocolFailed {
                 detail: "the running-call lock is poisoned".to_owned(),
             })?
-            .tokens
+            .cancel_tokens
             .values()
-            .flat_map(|tokens| tokens.iter().map(|(_, token)| token.clone()))
+            .flat_map(|cancel_tokens| cancel_tokens.iter().map(|(_, token)| token.clone()))
             .collect();
-        self.send_cancel(tokens).await
+        self.send_cancel(cancel_tokens).await
     }
 
-    async fn send_cancel(&self, tokens: Vec<tokio_postgres::CancelToken>) -> Result<()> {
-        if tokens.is_empty() {
+    async fn send_cancel(&self, cancel_tokens: Vec<tokio_postgres::CancelToken>) -> Result<()> {
+        if cancel_tokens.is_empty() {
             return Ok(());
         }
         let tls = crate::connect::tls::build(&self.settings.connection, "cancel")?;
         let mut failure = None;
-        for token in tokens {
+        for token in cancel_tokens {
             if let Err(error) = token.cancel_query(tls.connector.clone()).await {
                 failure = Some(Error::ProtocolFailed {
                     detail: format!("the cancel request failed: {error}"),
@@ -531,7 +540,7 @@ impl Engine {
             running.next_seq += 1;
             let seq = running.next_seq;
             running
-                .tokens
+                .cancel_tokens
                 .entry(call)
                 .or_default()
                 .push((seq, session.cancel.clone()));
@@ -563,7 +572,7 @@ impl Engine {
             swept += sweep_expired(&mut primary.lane).await?;
             finish_if_idle(&mut primary.lane).await?;
             self.expire_write_handle(&mut primary).await?;
-            primary.write.is_some()
+            primary.write_handle.is_some()
         };
         if let Some(lane) = self.secondary.lock().await.as_mut() {
             swept += sweep_expired(lane).await?;
@@ -620,8 +629,8 @@ impl Engine {
         })
     }
 
-    fn prefix(&self) -> Option<&str> {
-        self.prefix.as_deref()
+    fn transaction_prefix(&self) -> Option<&str> {
+        self.transaction_prefix.as_deref()
     }
 
     async fn ensure_secondary(&self, slot: &mut Option<Lane>) -> Result<()> {
@@ -653,7 +662,7 @@ impl Engine {
         let mut primary = self.primary.lock().await;
         self.ensure_alive(&mut primary).await?;
         self.expire_write_handle(&mut primary).await?;
-        if primary.write.is_none() {
+        if primary.write_handle.is_none() {
             return Ok(LaneHold::Primary(primary));
         }
         drop(primary);
@@ -675,24 +684,24 @@ impl Engine {
         let mut hold = self.read_hold().await?;
         let lane = hold.lane()?;
         let _tracked = self.track(lane.conn.session());
-        let result = read_on_lane(lane, self.prefix(), sql, None, caps, expiry).await;
+        let result = read_on_lane(lane, self.transaction_prefix(), sql, None, caps, expiry).await;
         self.release_hold(hold).await;
         result
     }
 
-    pub async fn run_query(
+    pub async fn run_read_paged(
         &self,
         sql: &str,
-        is_select: bool,
+        page_with_cursor: bool,
         caps: Caps,
         principal: &str,
     ) -> Result<ResultSet> {
         let expiry = self.settings.limits.cursor_expiry.value;
-        let owner = is_select.then_some(principal);
+        let owner = page_with_cursor.then_some(principal);
         let mut hold = self.read_hold().await?;
         let lane = hold.lane()?;
         let _tracked = self.track(lane.conn.session());
-        let result = read_on_lane(lane, self.prefix(), sql, owner, caps, expiry).await;
+        let result = read_on_lane(lane, self.transaction_prefix(), sql, owner, caps, expiry).await;
         self.release_hold(hold).await;
         result
     }
@@ -748,14 +757,10 @@ impl Engine {
             let mut hold = self.read_hold().await?;
             let lane = hold.lane()?;
             let _tracked = self.track(lane.conn.session());
-            let result = catalog_on_lane(lane, self.prefix(), sql, params).await;
+            let result = catalog_on_lane(lane, self.transaction_prefix(), sql, params).await;
             self.release_hold(hold).await;
             result
         })
-    }
-
-    pub async fn catalog_text(&self, sql: &str, caps: Caps) -> Result<ResultSet> {
-        self.run_read(sql, caps).await
     }
 
     async fn ensure_alive(&self, primary: &mut Primary) -> Result<()> {
@@ -763,7 +768,7 @@ impl Engine {
             return Ok(());
         }
         tracing::warn!("the database connection was lost; reconnecting once");
-        if let Some(handle) = primary.write.take() {
+        if let Some(handle) = primary.write_handle.take() {
             primary.closed.insert(handle.id, HandleState::Lost);
         }
         let fresh = self.connector.connect().await?;
@@ -773,13 +778,13 @@ impl Engine {
 
     async fn expire_write_handle(&self, primary: &mut Primary) -> Result<()> {
         let expired = primary
-            .write
+            .write_handle
             .as_ref()
             .is_some_and(|handle| handle.expires_at <= Instant::now());
         if !expired {
             return Ok(());
         }
-        if let Some(handle) = primary.write.take() {
+        if let Some(handle) = primary.write_handle.take() {
             tracing::info!(handle = %handle.id, "the transaction handle expired; rolling back");
             let outcome = primary.lane.conn.client().batch_execute("ROLLBACK").await;
             if let Err(error) = outcome
@@ -797,7 +802,7 @@ impl Engine {
         id: &str,
         principal: &str,
     ) -> Result<&'a mut WriteHandle> {
-        match primary.write.as_mut() {
+        match primary.write_handle.as_mut() {
             Some(handle) if handle.id == id => {
                 if handle.principal != principal {
                     return Err(Error::HandleState {
@@ -841,7 +846,7 @@ impl Engine {
         let mut primary = self.primary.lock().await;
         self.ensure_alive(&mut primary).await?;
         self.expire_write_handle(&mut primary).await?;
-        if let Some(handle) = &primary.write {
+        if let Some(handle) = &primary.write_handle {
             return Err(Error::HandleState {
                 handle: handle.id.clone(),
                 state: "open; commit or roll it back before opening another".to_owned(),
@@ -853,12 +858,12 @@ impl Engine {
             .lane
             .conn
             .client()
-            .batch_execute(&begin_statement(self.prefix()))
+            .batch_execute(&begin_statement(self.transaction_prefix()))
             .await
             .map_err(|error| describe_sqlstate(&error))?;
         let handle = self.new_write_handle(principal);
         let info = Self::describe_handle(&handle);
-        primary.write = Some(handle);
+        primary.write_handle = Some(handle);
         Ok(info)
     }
 
@@ -878,17 +883,21 @@ impl Engine {
         }
         let mut primary = self.primary.lock().await;
         self.expire_write_handle(&mut primary).await?;
-        if let Some(handle) = primary.write.as_ref().filter(|handle| handle.id == id) {
+        if let Some(handle) = primary
+            .write_handle
+            .as_ref()
+            .filter(|handle| handle.id == id)
+        {
             return Ok(Self::describe_handle(handle));
         }
         closed_handle_info(&primary.closed, id)
     }
 
-    pub async fn open_transactions(&self) -> usize {
+    pub async fn open_transaction_count(&self) -> usize {
         if self.pool.is_some() {
             return self.pooled_handles.lock().await.open.len();
         }
-        usize::from(self.primary.lock().await.write.is_some())
+        usize::from(self.primary.lock().await.write_handle.is_some())
     }
 
     pub async fn commit(&self, id: &str, principal: &str) -> Result<HandleInfo> {
@@ -917,7 +926,7 @@ impl Engine {
             Self::check_handle(&mut primary, id, principal)?;
             let _tracked = self.track(primary.lane.conn.session());
             if primary.lane.conn.client().is_closed() {
-                if let Some(handle) = primary.write.take() {
+                if let Some(handle) = primary.write_handle.take() {
                     primary.closed.insert(handle.id, HandleState::Lost);
                 }
                 return Err(Error::HandleState {
@@ -926,7 +935,7 @@ impl Engine {
                 });
             }
             let outcome = primary.lane.conn.client().batch_execute(statement).await;
-            let Some(handle) = primary.write.take() else {
+            let Some(handle) = primary.write_handle.take() else {
                 return Err(Error::HandleState {
                     handle: id.to_owned(),
                     state: "unknown".to_owned(),
@@ -1061,7 +1070,7 @@ impl Engine {
             Self::check_handle(&mut primary, id, principal)?;
             let _tracked = self.track(primary.lane.conn.session());
             if primary.lane.conn.client().is_closed() {
-                if let Some(handle) = primary.write.take() {
+                if let Some(handle) = primary.write_handle.take() {
                     primary.closed.insert(handle.id, HandleState::Lost);
                 }
                 return Err(Error::HandleState {
@@ -1075,7 +1084,7 @@ impl Engine {
             .await;
             let expiry = self.settings.limits.handle_expiry.value;
             if primary.lane.conn.client().is_closed() {
-                if let Some(handle) = primary.write.take() {
+                if let Some(handle) = primary.write_handle.take() {
                     primary.closed.insert(handle.id, HandleState::Lost);
                 }
             } else if let Ok(handle) = Self::check_handle(&mut primary, id, principal) {
@@ -1087,12 +1096,19 @@ impl Engine {
         if self.pool.is_some() {
             let lane = self.checkout().await?;
             let _tracked = self.track(lane.conn.session());
-            return autocommit(lane.conn.client(), self.prefix(), timeout, sql, caps).await;
+            return autocommit(
+                lane.conn.client(),
+                self.transaction_prefix(),
+                timeout,
+                sql,
+                caps,
+            )
+            .await;
         }
         let mut primary = self.primary.lock().await;
         self.ensure_alive(&mut primary).await?;
         self.expire_write_handle(&mut primary).await?;
-        if let Some(open) = &primary.write {
+        if let Some(open) = &primary.write_handle {
             return Err(Error::HandleState {
                 handle: open.id.clone(),
                 state: "open; pass it as `transaction`, or commit or roll it back first".to_owned(),
@@ -1104,7 +1120,7 @@ impl Engine {
             let _tracked = self.track(primary.lane.conn.session());
             return autocommit(
                 primary.lane.conn.client(),
-                self.prefix(),
+                self.transaction_prefix(),
                 timeout,
                 sql,
                 caps,
@@ -1127,7 +1143,14 @@ impl Engine {
             });
         }
         let _tracked = self.track(lane.conn.session());
-        autocommit(lane.conn.client(), self.prefix(), timeout, sql, caps).await
+        autocommit(
+            lane.conn.client(),
+            self.transaction_prefix(),
+            timeout,
+            sql,
+            caps,
+        )
+        .await
     }
 
     pub async fn run_unparsed(
@@ -1170,7 +1193,7 @@ impl Engine {
             })
     }
 
-    pub async fn secondary_rows(
+    pub async fn catalog_rows_off_primary(
         &self,
         sql: &str,
         params: &[&dyn CatalogParam],
@@ -1178,7 +1201,7 @@ impl Engine {
         if self.pool.is_some() {
             let mut lane = self.checkout().await?;
             let _tracked = self.track(lane.conn.session());
-            return catalog_on_lane(&mut lane, self.prefix(), sql, params).await;
+            return catalog_on_lane(&mut lane, self.transaction_prefix(), sql, params).await;
         }
         let mut slot = self.secondary.lock().await;
         self.ensure_secondary(&mut slot).await?;
@@ -1186,7 +1209,7 @@ impl Engine {
             detail: "the second connection is missing".to_owned(),
         })?;
         let _tracked = self.track(lane.conn.session());
-        catalog_on_lane(lane, self.prefix(), sql, params).await
+        catalog_on_lane(lane, self.transaction_prefix(), sql, params).await
     }
 
     pub async fn copy_in(
@@ -1202,7 +1225,7 @@ impl Engine {
         let mut primary = self.primary.lock().await;
         self.ensure_alive(&mut primary).await?;
         self.expire_write_handle(&mut primary).await?;
-        match (handle, &primary.write) {
+        match (handle, &primary.write_handle) {
             (Some(id), _) => {
                 Self::check_handle(&mut primary, id, principal)?;
             }
@@ -1227,7 +1250,7 @@ impl Engine {
         let _tracked = self.track(primary.lane.conn.session());
         let rows = copy_in_on(
             primary.lane.conn.client(),
-            self.prefix(),
+            self.transaction_prefix(),
             handle.is_some(),
             sql,
             data,
@@ -1246,7 +1269,7 @@ impl Engine {
         let mut hold = self.read_hold().await?;
         let lane = hold.lane()?;
         let _tracked = self.track(lane.conn.session());
-        let result = copy_out_on(lane, self.prefix(), sql, byte_cap).await;
+        let result = copy_out_on(lane, self.transaction_prefix(), sql, byte_cap).await;
         self.release_hold(hold).await;
         result
     }
@@ -1255,12 +1278,13 @@ impl Engine {
         if self.pool.is_some() {
             let lane = self.checkout().await?;
             let _tracked = self.track(lane.conn.session());
-            return discard_after(lane.conn.client(), self.prefix(), sql, caps).await;
+            return run_then_rollback(lane.conn.client(), self.transaction_prefix(), sql, caps)
+                .await;
         }
         let mut primary = self.primary.lock().await;
         self.ensure_alive(&mut primary).await?;
         self.expire_write_handle(&mut primary).await?;
-        if let Some(open) = &primary.write {
+        if let Some(open) = &primary.write_handle {
             return Err(Error::HandleState {
                 handle: open.id.clone(),
                 state: "open; commit or roll it back before an EXPLAIN ANALYZE of a write"
@@ -1271,7 +1295,13 @@ impl Engine {
         finish_if_idle(&mut primary.lane).await?;
         if !primary.lane.in_read_transaction {
             let _tracked = self.track(primary.lane.conn.session());
-            return discard_after(primary.lane.conn.client(), self.prefix(), sql, caps).await;
+            return run_then_rollback(
+                primary.lane.conn.client(),
+                self.transaction_prefix(),
+                sql,
+                caps,
+            )
+            .await;
         }
         drop(primary);
         let mut slot = self.secondary.lock().await;
@@ -1288,13 +1318,13 @@ impl Engine {
             });
         }
         let _tracked = self.track(lane.conn.session());
-        discard_after(lane.conn.client(), self.prefix(), sql, caps).await
+        run_then_rollback(lane.conn.client(), self.transaction_prefix(), sql, caps).await
     }
 
     pub async fn release_everything(&self) -> Result<()> {
         {
             let mut primary = self.primary.lock().await;
-            if let Some(handle) = primary.write.take() {
+            if let Some(handle) = primary.write_handle.take() {
                 if !primary.lane.conn.client().is_closed() {
                     let _ = primary.lane.conn.client().batch_execute("ROLLBACK").await;
                 }
@@ -1376,7 +1406,7 @@ impl Engine {
         let _tracked = self.track(lane.conn.session());
         lane.conn
             .client()
-            .batch_execute(&begin_statement(self.prefix()))
+            .batch_execute(&begin_statement(self.transaction_prefix()))
             .await
             .map_err(|error| describe_sqlstate(&error))?;
         let handle = self.new_write_handle(principal);
@@ -1396,7 +1426,7 @@ impl Engine {
         closed_handle_info(&handles.closed, id)
     }
 
-    fn pooled_take<'a>(
+    fn pooled_check_handle<'a>(
         handles: &'a mut PooledHandles,
         id: &str,
         principal: &str,
@@ -1433,7 +1463,7 @@ impl Engine {
     ) -> Result<HandleInfo> {
         let mut handles = self.pooled_handles.lock().await;
         self.pooled_sweep(&mut handles).await;
-        Self::pooled_take(&mut handles, id, principal)?;
+        Self::pooled_check_handle(&mut handles, id, principal)?;
         let Some(held) = handles.open.remove(id) else {
             return Err(Error::HandleState {
                 handle: id.to_owned(),
@@ -1472,7 +1502,7 @@ impl Engine {
     async fn pooled_check_savepoint(&self, id: &str, principal: &str, name: &str) -> Result<()> {
         let mut handles = self.pooled_handles.lock().await;
         self.pooled_sweep(&mut handles).await;
-        let held = Self::pooled_take(&mut handles, id, principal)?;
+        let held = Self::pooled_check_handle(&mut handles, id, principal)?;
         check_savepoint(&held.handle, id, name)
     }
 
@@ -1488,7 +1518,7 @@ impl Engine {
     {
         let mut handles = self.pooled_handles.lock().await;
         self.pooled_sweep(&mut handles).await;
-        let held = Self::pooled_take(&mut handles, id, principal)?;
+        let held = Self::pooled_check_handle(&mut handles, id, principal)?;
         if held.lane.conn.client().is_closed() {
             Self::pooled_lose(&mut handles, id);
             return Err(Error::HandleState {
@@ -1518,7 +1548,7 @@ impl Engine {
     ) -> Result<ResultSet> {
         let mut handles = self.pooled_handles.lock().await;
         self.pooled_sweep(&mut handles).await;
-        let held = Self::pooled_take(&mut handles, id, principal)?;
+        let held = Self::pooled_check_handle(&mut handles, id, principal)?;
         if held.lane.conn.client().is_closed() {
             Self::pooled_lose(&mut handles, id);
             return Err(Error::HandleState {
@@ -1551,11 +1581,18 @@ impl Engine {
         let Some(id) = handle else {
             let lane = self.checkout().await?;
             let _tracked = self.track(lane.conn.session());
-            return copy_in_on(lane.conn.client(), self.prefix(), false, sql, data).await;
+            return copy_in_on(
+                lane.conn.client(),
+                self.transaction_prefix(),
+                false,
+                sql,
+                data,
+            )
+            .await;
         };
         let mut handles = self.pooled_handles.lock().await;
         self.pooled_sweep(&mut handles).await;
-        let held = Self::pooled_take(&mut handles, id, principal)?;
+        let held = Self::pooled_check_handle(&mut handles, id, principal)?;
         if held.lane.conn.client().is_closed() {
             Self::pooled_lose(&mut handles, id);
             return Err(Error::HandleState {
@@ -1564,7 +1601,14 @@ impl Engine {
             });
         }
         let _tracked = self.track(held.lane.conn.session());
-        let rows = copy_in_on(held.lane.conn.client(), self.prefix(), true, sql, data).await?;
+        let rows = copy_in_on(
+            held.lane.conn.client(),
+            self.transaction_prefix(),
+            true,
+            sql,
+            data,
+        )
+        .await?;
         held.handle.statements += 1;
         held.handle.expires_at = Instant::now() + self.settings.limits.handle_expiry.value;
         Ok(rows)
@@ -1589,9 +1633,9 @@ impl LaneHold<'_> {
     }
 }
 
-fn begin_statement(prefix: Option<&str>) -> String {
-    match prefix {
-        Some(prefix) => format!("BEGIN; {prefix}"),
+fn begin_statement(transaction_prefix: Option<&str>) -> String {
+    match transaction_prefix {
+        Some(transaction_prefix) => format!("BEGIN; {transaction_prefix}"),
         None => "BEGIN".to_owned(),
     }
 }
@@ -1645,15 +1689,15 @@ fn check_cursor_owner(lane: &Lane, id: &str, principal: &str) -> Result<()> {
 
 async fn catalog_on_lane(
     lane: &mut Lane,
-    prefix: Option<&str>,
+    transaction_prefix: Option<&str>,
     sql: &str,
     params: &[&dyn CatalogParam],
 ) -> Result<Vec<tokio_postgres::Row>> {
-    if prefix.is_none() {
+    if transaction_prefix.is_none() {
         return query_rows(lane.conn.client(), sql, params).await;
     }
     sweep_expired(lane).await?;
-    begin_read(lane, prefix).await?;
+    begin_read(lane, transaction_prefix).await?;
     let outcome = query_rows(lane.conn.client(), sql, params).await;
     if lane.conn.client().is_closed() {
         lane.forget_state();
@@ -1667,19 +1711,19 @@ async fn catalog_on_lane(
 
 async fn autocommit(
     client: &tokio_postgres::Client,
-    prefix: Option<&str>,
+    transaction_prefix: Option<&str>,
     timeout: Option<Duration>,
     sql: &str,
     caps: Caps,
 ) -> Result<ResultSet> {
-    let Some(prefix) = prefix else {
+    let Some(transaction_prefix) = transaction_prefix else {
         return timed(client, timeout, false, || {
             autocommit_statement(client, sql, caps)
         })
         .await;
     };
     client
-        .batch_execute(&format!("BEGIN; {prefix}"))
+        .batch_execute(&format!("BEGIN; {transaction_prefix}"))
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     let result = timed(client, timeout, true, || {
@@ -1706,15 +1750,15 @@ async fn settle_wrapper(client: &tokio_postgres::Client, commit: bool) -> Result
 
 async fn copy_in_on(
     client: &tokio_postgres::Client,
-    prefix: Option<&str>,
+    transaction_prefix: Option<&str>,
     inside_handle: bool,
     sql: &str,
     data: &[u8],
 ) -> Result<u64> {
-    let wrap = prefix.filter(|_| !inside_handle);
-    if let Some(prefix) = wrap {
+    let wrap = transaction_prefix.filter(|_| !inside_handle);
+    if let Some(transaction_prefix) = wrap {
         client
-            .batch_execute(&format!("BEGIN; {prefix}"))
+            .batch_execute(&format!("BEGIN; {transaction_prefix}"))
             .await
             .map_err(|error| describe_sqlstate(&error))?;
     }
@@ -1740,12 +1784,12 @@ async fn copy_in_on(
 
 async fn copy_out_on(
     lane: &mut Lane,
-    prefix: Option<&str>,
+    transaction_prefix: Option<&str>,
     sql: &str,
     byte_cap: usize,
 ) -> Result<(Vec<u8>, bool)> {
     sweep_expired(lane).await?;
-    begin_read(lane, prefix).await?;
+    begin_read(lane, transaction_prefix).await?;
     let session = lane.conn.session();
     let outcome = async {
         let stream = session
@@ -1820,14 +1864,14 @@ async fn query_rows(
 
 async fn read_on_lane(
     lane: &mut Lane,
-    prefix: Option<&str>,
+    transaction_prefix: Option<&str>,
     sql: &str,
     owner: Option<&str>,
     caps: Caps,
     expiry: Duration,
 ) -> Result<ResultSet> {
     sweep_expired(lane).await?;
-    begin_read(lane, prefix).await?;
+    begin_read(lane, transaction_prefix).await?;
     let outcome = match owner {
         Some(principal) if lane.cursors.len() < CURSOR_CAP => {
             read_through_cursor(lane, sql, principal, caps, expiry).await
@@ -1974,12 +2018,14 @@ fn new_handle_id() -> String {
     format!("{:016x}", rand::random::<u64>())
 }
 
-async fn begin_read(lane: &mut Lane, prefix: Option<&str>) -> Result<()> {
+async fn begin_read(lane: &mut Lane, transaction_prefix: Option<&str>) -> Result<()> {
     if lane.in_read_transaction {
         return Ok(());
     }
-    let statement = match prefix {
-        Some(prefix) => format!("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY; {prefix}"),
+    let statement = match transaction_prefix {
+        Some(transaction_prefix) => {
+            format!("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY; {transaction_prefix}")
+        }
         None => "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY".to_owned(),
     };
     lane.conn
@@ -2125,7 +2171,7 @@ async fn guarded_statement(
 async fn timed<F, Fut>(
     client: &tokio_postgres::Client,
     timeout: Option<Duration>,
-    local: bool,
+    inside_transaction: bool,
     run: F,
 ) -> Result<ResultSet>
 where
@@ -2135,16 +2181,20 @@ where
     let Some(timeout) = timeout else {
         return run().await;
     };
-    let scope = if local { "SET LOCAL" } else { "SET" };
+    let set_keyword = if inside_transaction {
+        "SET LOCAL"
+    } else {
+        "SET"
+    };
     client
         .batch_execute(&format!(
-            "{scope} statement_timeout = '{}ms'",
+            "{set_keyword} statement_timeout = '{}ms'",
             timeout.as_millis()
         ))
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     let result = run().await;
-    if !local && !client.is_closed() {
+    if !inside_transaction && !client.is_closed() {
         let reset = client.batch_execute("RESET statement_timeout").await;
         if let Err(error) = reset {
             tracing::warn!(%error, "statement_timeout could not be reset");
@@ -2165,14 +2215,14 @@ async fn autocommit_statement(
     Ok(collect_messages(messages, caps))
 }
 
-async fn discard_after(
+async fn run_then_rollback(
     client: &tokio_postgres::Client,
-    prefix: Option<&str>,
+    transaction_prefix: Option<&str>,
     sql: &str,
     caps: Caps,
 ) -> Result<ResultSet> {
     client
-        .batch_execute(&begin_statement(prefix))
+        .batch_execute(&begin_statement(transaction_prefix))
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     let result = guarded_statement(client, sql, caps).await;
@@ -2257,24 +2307,24 @@ mod tests {
     #[test]
     fn the_feature_map_follows_the_documented_version_gates() {
         let fourteen = Features::from_version(140_000);
-        assert!(!fourteen.stat_io());
-        assert!(!fourteen.merge());
-        assert!(!fourteen.merge_returning());
-        assert!(!fourteen.returning_old_new());
+        assert!(!fourteen.supports_stat_io());
+        assert!(!fourteen.supports_merge());
+        assert!(!fourteen.supports_merge_returning());
+        assert!(!fourteen.supports_returning_old_new());
         let fifteen = Features::from_version(150_000);
-        assert!(fifteen.merge());
-        assert!(fifteen.nulls_not_distinct());
+        assert!(fifteen.supports_merge());
+        assert!(fifteen.supports_nulls_not_distinct());
         let seventeen = Features::from_version(170_000);
-        assert!(seventeen.stat_io());
-        assert!(seventeen.merge_returning());
-        assert!(seventeen.transaction_timeout());
-        assert!(seventeen.maintain_privilege());
-        assert!(!fifteen.maintain_privilege());
-        assert!(!seventeen.returning_old_new());
+        assert!(seventeen.supports_stat_io());
+        assert!(seventeen.supports_merge_returning());
+        assert!(seventeen.supports_transaction_timeout());
+        assert!(seventeen.supports_maintain_privilege());
+        assert!(!fifteen.supports_maintain_privilege());
+        assert!(!seventeen.supports_returning_old_new());
         let eighteen = Features::from_version(180_006);
-        assert!(eighteen.returning_old_new());
-        assert!(eighteen.not_enforced_constraints());
-        assert!(eighteen.without_overlaps());
+        assert!(eighteen.supports_returning_old_new());
+        assert!(eighteen.supports_not_enforced_constraints());
+        assert!(eighteen.supports_without_overlaps());
         assert_eq!(eighteen.as_map().len(), 11);
     }
 

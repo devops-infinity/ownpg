@@ -671,7 +671,7 @@ fn resolve_ssh(
             flags.ssh_transport,
             env_parsed(
                 env,
-                "OWNPG_SSH_MODE",
+                "OWNPG_SSH_TRANSPORT",
                 SshTransport::parse,
                 "in-process or system",
             )?,
@@ -709,8 +709,7 @@ mod tests {
     use crate::error::ErrorId;
     use std::collections::BTreeMap;
 
-    fn sources(dir: &std::path::Path, env: &Environment) -> AppPaths {
-        let _ = env;
+    fn paths_under(dir: &std::path::Path) -> AppPaths {
         AppPaths::from_base(dir.join("config"), dir.join("data"), dir.join("cache"))
     }
 
@@ -737,7 +736,7 @@ mod tests {
     fn a_bare_run_with_a_database_flag_uses_the_presets() {
         let dir = tempfile::tempdir().unwrap();
         let env = Environment::default().with_os_user("sharkar");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let flags = FlagLayer {
             database: Some("app".to_owned()),
             ..FlagLayer::default()
@@ -774,13 +773,13 @@ mod tests {
             },
             ..FlagLayer::default()
         };
-        let (settings, _) = resolve_with(flags.clone(), &env, sources(dir.path(), &env)).unwrap();
+        let (settings, _) = resolve_with(flags.clone(), &env, paths_under(dir.path())).unwrap();
         assert!(settings.strict_role.value);
         assert_eq!(settings.strict_role.origin, Origin::Preset);
         let relaxed = Environment::default()
             .with_os_user("sharkar")
             .with_var("OWNPG_STRICT_ROLE", "false");
-        let (settings, _) = resolve_with(flags, &relaxed, sources(dir.path(), &relaxed)).unwrap();
+        let (settings, _) = resolve_with(flags, &relaxed, paths_under(dir.path())).unwrap();
         assert!(!settings.strict_role.value);
         let tight = Environment::default()
             .with_os_user("sharkar")
@@ -791,7 +790,7 @@ mod tests {
                 ..FlagLayer::default()
             },
             &tight,
-            sources(dir.path(), &tight),
+            paths_under(dir.path()),
         )
         .unwrap_err();
         assert!(
@@ -804,7 +803,7 @@ mod tests {
     fn no_database_anywhere_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let env = Environment::default();
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let error = resolve_with(FlagLayer::default(), &env, paths).unwrap_err();
         assert_eq!(error.id(), ErrorId::DatabaseMissing);
         assert!(error.remedy().contains("--database"));
@@ -818,7 +817,7 @@ mod tests {
             .with_var("OWNPG_PROFILE", "local")
             .with_var("PGHOST", "env-host")
             .with_var("PGDATABASE", "env-db");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let mut file = ProfileFile::default();
         file.profiles.insert(
             "local".to_owned(),
@@ -853,7 +852,7 @@ mod tests {
         let env = Environment::default()
             .with_var("OWNPG_MODE", "read-write")
             .with_var("OWNPG_DATABASE", "app");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let (settings, _) = resolve_with(FlagLayer::default(), &env, paths).unwrap();
         assert_eq!(settings.mode.value, Mode::ReadWrite);
         assert_eq!(settings.mode.origin, Origin::Environment);
@@ -863,7 +862,7 @@ mod tests {
     fn a_named_profile_that_does_not_exist_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let env = Environment::default();
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let flags = FlagLayer {
             profile: Some("staging".to_owned()),
             database: Some("x".to_owned()),
@@ -888,7 +887,7 @@ mod tests {
             .with_var("PGHOST", "env-host")
             .with_var("PGUSER", "env-user")
             .with_var("OWNPG_DSN", "postgresql://dsn-user@dsn-host/dsn-db");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let (settings, _) = resolve_with(FlagLayer::default(), &env, paths).unwrap();
         assert_eq!(settings.connection.host.as_ref().unwrap().value, "dsn-host");
         assert_eq!(settings.connection.user.value, "dsn-user");
@@ -913,7 +912,7 @@ mod tests {
             .with_var("PGHOST", "db.internal")
             .with_var("PGUSER", "reader")
             .with_var("PGDATABASE", "app");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let (settings, warnings) = resolve_with(FlagLayer::default(), &env, paths.clone()).unwrap();
         assert_eq!(
             settings
@@ -941,7 +940,7 @@ mod tests {
         let env = Environment::default()
             .with_var("OWNPG_PROFILE", "plain")
             .with_var("APP_DB_PASSWORD", "from-env");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let mut file = ProfileFile::default();
         file.profiles.insert(
             "plain".to_owned(),
@@ -1056,7 +1055,7 @@ mod tests {
         let env = Environment::default()
             .with_var("OWNPG_DATABASE", "app")
             .with_var("OWNPG_STRICT_ROLE", "maybe");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let error = resolve_with(FlagLayer::default(), &env, paths).unwrap_err();
         assert_eq!(error.id(), ErrorId::ConfigInvalid);
         assert!(error.to_string().contains("OWNPG_STRICT_ROLE"));
@@ -1066,7 +1065,7 @@ mod tests {
     fn a_tool_group_the_mode_forbids_is_refused_at_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let env = Environment::default().with_var("OWNPG_DATABASE", "app");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let flags = FlagLayer {
             tools: Some(vec![ToolGroup::Ddl]),
             ..FlagLayer::default()
@@ -1083,7 +1082,7 @@ mod tests {
             .with_var("OWNPG_DATABASE", "app")
             .with_var("OWNPG_MODE", "read-write")
             .with_var("OWNPG_TOOLS", "monitoring, ddl");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let (settings, _) = resolve_with(FlagLayer::default(), &env, paths).unwrap();
         assert_eq!(
             settings.loaded_groups(),
@@ -1102,7 +1101,7 @@ mod tests {
         let env = Environment::default()
             .with_var("OWNPG_DATABASE", "app")
             .with_var("OWNPG_ROW_CAP", "5000");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let error = resolve_with(FlagLayer::default(), &env, paths).unwrap_err();
         assert_eq!(error.id(), ErrorId::ConfigInvalid);
         assert!(error.to_string().contains("row_cap"));
@@ -1114,7 +1113,7 @@ mod tests {
         let env = Environment::default()
             .with_var("OWNPG_DATABASE", "app")
             .with_var("CI", "true");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let (settings, _) = resolve_with(FlagLayer::default(), &env, paths.clone()).unwrap();
         assert!(settings.no_input.value);
         assert_eq!(settings.no_input.origin, Origin::Environment);
@@ -1149,7 +1148,7 @@ mod tests {
             .with_var("OWNPG_PROFILE", "staging")
             .with_home("/home/u".into())
             .with_os_user("u");
-        let paths = sources(dir.path(), &env);
+        let paths = paths_under(dir.path());
         let mut file = ProfileFile::default();
         file.profiles.insert(
             "staging".to_owned(),

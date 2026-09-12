@@ -44,7 +44,7 @@ async fn a_large_select_is_paged_through_a_cursor_in_order() {
         byte_cap: 1_000_000,
     };
     let first = engine
-        .run_query("SELECT id, name FROM big ORDER BY id", true, caps, "tester")
+        .run_read_paged("SELECT id, name FROM big ORDER BY id", true, caps, "tester")
         .await
         .unwrap();
     assert_eq!(first.row_count, 100);
@@ -84,7 +84,7 @@ async fn a_small_select_leaves_no_cursor_and_the_transaction_ends() {
         byte_cap: 1_000_000,
     };
     let result = engine
-        .run_query("SELECT count(*) FROM big", true, caps, "tester")
+        .run_read_paged("SELECT count(*) FROM big", true, caps, "tester")
         .await
         .unwrap();
     assert_eq!(result.row_count, 1);
@@ -112,7 +112,7 @@ async fn a_write_that_slips_past_the_classifier_is_stopped_by_the_read_only_tran
     assert_eq!(error.id(), ErrorId::SqlFailed);
     assert!(error.to_string().contains("25006"), "{error}");
     let after = engine
-        .run_query("SELECT count(*) FROM big", true, caps, "tester")
+        .run_read_paged("SELECT count(*) FROM big", true, caps, "tester")
         .await
         .unwrap();
     assert_eq!(after.rows[0][0].as_deref(), Some("3"));
@@ -129,7 +129,7 @@ async fn a_lost_connection_is_reconnected_once_and_cursors_are_gone() {
         byte_cap: 1_000_000,
     };
     let first = engine
-        .run_query("SELECT id FROM big ORDER BY id", true, caps, "tester")
+        .run_read_paged("SELECT id FROM big ORDER BY id", true, caps, "tester")
         .await
         .unwrap();
     let cursor = first.cursor.clone().unwrap();
@@ -144,7 +144,7 @@ async fn a_lost_connection_is_reconnected_once_and_cursors_are_gone() {
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let again = engine
-        .run_query("SELECT 1", true, caps, "tester")
+        .run_read_paged("SELECT 1", true, caps, "tester")
         .await
         .expect("the engine reconnects once");
     assert_eq!(again.rows[0][0].as_deref(), Some("1"));
@@ -182,7 +182,7 @@ async fn expired_cursors_are_swept_and_the_transaction_ends() {
         byte_cap: 1_000_000,
     };
     let first = engine
-        .run_query("SELECT id FROM big ORDER BY id", true, caps, "tester")
+        .run_read_paged("SELECT id FROM big ORDER BY id", true, caps, "tester")
         .await
         .unwrap();
     assert!(first.cursor.is_some());
@@ -190,7 +190,7 @@ async fn expired_cursors_are_swept_and_the_transaction_ends() {
     assert_eq!(engine.sweep().await.unwrap(), 1);
     assert!(engine.open_cursors().await.is_empty());
     let state = engine
-        .run_query("SELECT 1", true, caps, "tester")
+        .run_read_paged("SELECT 1", true, caps, "tester")
         .await
         .unwrap();
     assert_eq!(state.row_count, 1);
@@ -207,7 +207,7 @@ async fn a_cursor_answers_only_the_principal_that_opened_it() {
         byte_cap: 1_000_000,
     };
     let first = engine
-        .run_query("SELECT id FROM big ORDER BY id", true, caps, "alice")
+        .run_read_paged("SELECT id FROM big ORDER BY id", true, caps, "alice")
         .await
         .unwrap();
     let cursor = first.cursor.clone().unwrap();
@@ -325,7 +325,7 @@ async fn pooled_handles_give_each_principal_its_own_connection() {
     let alice = engine.begin_transaction("alice").await.unwrap();
     let bob = engine.begin_transaction("bob").await.unwrap();
     assert_ne!(alice.id, bob.id);
-    assert_eq!(engine.open_transactions().await, 2);
+    assert_eq!(engine.open_transaction_count().await, 2);
     let again = engine.begin_transaction("alice").await.unwrap_err();
     assert!(again.to_string().contains(&alice.id), "{again}");
     engine
@@ -366,7 +366,7 @@ async fn pooled_handles_give_each_principal_its_own_connection() {
     assert_eq!(committed.statements, 1);
     let rolled = engine.rollback(&bob.id, "bob").await.unwrap();
     assert_eq!(rolled.state.as_str(), "rolled_back");
-    assert_eq!(engine.open_transactions().await, 0);
+    assert_eq!(engine.open_transaction_count().await, 0);
     let status = engine.transaction_status(&alice.id).await.unwrap();
     assert_eq!(status.state.as_str(), "committed");
     let seen = engine

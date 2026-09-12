@@ -7,9 +7,9 @@ use super::{
     if_not_exists_clause, run_ddl, scoped_name,
 };
 use crate::error::{Error, Result};
-use crate::groups;
 use crate::render::{expression, ident_list, quote_ident, type_name, validate_ident};
 use crate::shape::ResultSet;
+use crate::tool_specs;
 use crate::tools::{Call, Outcome, Route, route};
 
 const TABLE_DESCRIPTION: &str = "Create, alter, rename, truncate, or drop a table in the scoped schema, and attach or detach partitions. create takes columns with types, defaults, identity, generated expressions, and inline constraints, plus a composite primary key, partitioning, LIKE, and inheritance. drop, truncate, and detach_partition are destructive and need confirm: true or the confirmation prompt. dry_run returns the rendered SQL.";
@@ -71,7 +71,11 @@ pub fn column_definition(call: &Call, column: &ColumnSpec, kind: &str) -> Result
     if !column.generated.trim().is_empty() {
         let mode = match column.generated_kind {
             GeneratedKind::Virtual => {
-                if !call.engine().features().virtual_generated_columns() {
+                if !call
+                    .engine()
+                    .features()
+                    .supports_virtual_generated_columns()
+                {
                     return Err(Error::ArgumentInvalid {
                         argument: "generated_kind".to_owned(),
                         detail: "virtual generated columns need PostgreSQL 18 or later".to_owned(),
@@ -669,7 +673,7 @@ pub struct ConstraintArgs {
     pub match_full: bool,
     #[serde(default)]
     #[schemars(description = "add exclude: the access method, such as gist.")]
-    pub using: String,
+    pub method: String,
     #[serde(default)]
     #[schemars(
         description = "add exclude: elements such as \"room WITH =\" and \"during WITH &&\"."
@@ -738,7 +742,7 @@ fn constraint_body(call: &Call, args: &ConstraintArgs) -> Result<String> {
             missing.finish("add")?;
             let mut columns = ident_list("columns", &args.columns)?;
             if !args.without_overlaps.trim().is_empty() {
-                if !features.without_overlaps() {
+                if !features.supports_without_overlaps() {
                     return Err(Error::ArgumentInvalid {
                         argument: "without_overlaps".to_owned(),
                         detail: "WITHOUT OVERLAPS needs PostgreSQL 18 or later".to_owned(),
@@ -751,7 +755,7 @@ fn constraint_body(call: &Call, args: &ConstraintArgs) -> Result<String> {
                 ));
             }
             let nulls = if kind == ConstraintKind::Unique && args.nulls_not_distinct {
-                if !features.nulls_not_distinct() {
+                if !features.supports_nulls_not_distinct() {
                     return Err(Error::ArgumentInvalid {
                         argument: "nulls_not_distinct".to_owned(),
                         detail: "NULLS NOT DISTINCT needs PostgreSQL 15 or later".to_owned(),
@@ -797,7 +801,7 @@ fn constraint_body(call: &Call, args: &ConstraintArgs) -> Result<String> {
                 )
             };
             if !args.period.trim().is_empty() {
-                if !features.without_overlaps() {
+                if !features.supports_without_overlaps() {
                     return Err(Error::ArgumentInvalid {
                         argument: "period".to_owned(),
                         detail: "PERIOD foreign keys need PostgreSQL 18 or later".to_owned(),
@@ -830,11 +834,11 @@ fn constraint_body(call: &Call, args: &ConstraintArgs) -> Result<String> {
             let mut missing = Missing::new();
             missing.need("elements", !args.elements.is_empty());
             missing.finish("add")?;
-            let method = if args.using.trim().is_empty() {
+            let method = if args.method.trim().is_empty() {
                 String::new()
             } else {
-                validate_ident("using", args.using.trim())?;
-                format!("USING {} ", args.using.trim())
+                validate_ident("method", args.method.trim())?;
+                format!("USING {} ", args.method.trim())
             };
             let mut body = format!("EXCLUDE {method}({})", args.elements.join(", "));
             if !args.where_clause.trim().is_empty() {
@@ -848,7 +852,7 @@ fn constraint_body(call: &Call, args: &ConstraintArgs) -> Result<String> {
     };
     let mut body = body;
     if let Some(enforced) = args.enforced.as_bool() {
-        if !features.not_enforced_constraints() {
+        if !features.supports_not_enforced_constraints() {
             return Err(Error::ArgumentInvalid {
                 argument: "enforced".to_owned(),
                 detail: "ENFORCED and NOT ENFORCED need PostgreSQL 18 or later".to_owned(),
@@ -917,7 +921,7 @@ pub fn constraint(call: Call, args: ConstraintArgs) -> BoxFuture<'static, Outcom
             ConstraintOperation::Alter => {
                 let mut clauses = Vec::new();
                 if let Some(enforced) = args.enforced.as_bool() {
-                    if !call.engine().features().not_enforced_constraints() {
+                    if !call.engine().features().supports_not_enforced_constraints() {
                         return Err(Error::ArgumentInvalid {
                             argument: "enforced".to_owned(),
                             detail: "ENFORCED and NOT ENFORCED need PostgreSQL 18 or later"
@@ -967,10 +971,10 @@ pub fn constraint(call: Call, args: ConstraintArgs) -> BoxFuture<'static, Outcom
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<TableArgs, ResultSet, _>(&groups::PG_TABLE, TABLE_DESCRIPTION, table)?,
-        route::<ColumnArgs, ResultSet, _>(&groups::PG_COLUMN, COLUMN_DESCRIPTION, column)?,
+        route::<TableArgs, ResultSet, _>(&tool_specs::PG_TABLE, TABLE_DESCRIPTION, table)?,
+        route::<ColumnArgs, ResultSet, _>(&tool_specs::PG_COLUMN, COLUMN_DESCRIPTION, column)?,
         route::<ConstraintArgs, ResultSet, _>(
-            &groups::PG_CONSTRAINT,
+            &tool_specs::PG_CONSTRAINT,
             CONSTRAINT_DESCRIPTION,
             constraint,
         )?,
