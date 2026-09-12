@@ -17,6 +17,7 @@ use clap::{
         5 external failure   130 interrupted   101 a bug\n\n\
         Documentation: https://github.com/devops-infinity/ownpg-releases\n  \
         Report a bug: https://github.com/devops-infinity/ownpg-releases/issues/new",
+    after_long_help = ROOT_EXAMPLES,
     disable_help_subcommand = true,
     infer_subcommands = false,
     propagate_version = true,
@@ -72,7 +73,7 @@ pub(crate) struct GlobalArgs {
         global = true,
         value_name = "PATH",
         value_hint = ValueHint::FilePath,
-        help = "Also write logs to this file, rotated daily. A bare name lands under the data directory"
+        help = "Also write logs to this file, rotated daily with the newest seven days kept. A bare name lands under the log directory (see `config path`)"
     )]
     pub log_file: Option<PathBuf>,
 
@@ -87,15 +88,54 @@ pub(crate) struct GlobalArgs {
     pub config: Option<PathBuf>,
 }
 
+pub(crate) const ROOT_EXAMPLES: &str = "EXAMPLES:\n  \
+    ownpg serve -d app                  serve app.public read-only over stdio\n  \
+    ownpg serve -d app -s billing -m rw --tools write,transactions\n  \
+    ownpg doctor -p staging --format json\n  \
+    ownpg serve --http --auth bearer --bind 127.0.0.1:8765 -d app\n  \
+    ownpg config init && ownpg config set-password local\n  \
+    ownpg completions zsh > ~/.zfunc/_ownpg\n\n\
+    EXIT CODES:\n  \
+    0 success   1 runtime failure   2 usage or configuration   4 refused by policy\n  \
+    5 external failure   130 interrupted   101 a bug\n\n\
+    Documentation: https://github.com/devops-infinity/ownpg-releases\n  \
+    Report a bug: https://github.com/devops-infinity/ownpg-releases/issues/new";
+
+pub(crate) const SERVE_EXAMPLES: &str = "EXAMPLES:\n  \
+    ownpg serve -d app                  stdio, read-only, the public schema\n  \
+    ownpg serve -d app -m ro --ssh deploy@bastion.example\n  \
+    ownpg serve --http --auth none --bind 127.0.0.1:8765 -d app\n  \
+    ownpg serve --http --auth bearer --bind 0.0.0.0:8765 -d app --strict-role";
+
+pub(crate) const DOCTOR_EXAMPLES: &str = "EXAMPLES:\n  \
+    ownpg doctor -d app\n  \
+    ownpg doctor -p staging --format json";
+
+pub(crate) const CONFIG_EXAMPLES: &str = "EXAMPLES:\n  \
+    ownpg config path\n  \
+    ownpg config init --dry-run         print a profile file that names every key\n  \
+    ownpg config show -p staging --format json\n  \
+    ownpg config set-password staging   read the password from the terminal or stdin";
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    #[command(about = "Serve the database to an MCP client over stdio (the default command)")]
+    #[command(
+        about = "Serve the database to an MCP client over stdio (the default command)",
+        after_long_help = SERVE_EXAMPLES
+    )]
     Serve(ServeArgs),
 
-    #[command(about = "Check the connection and the settings, and report every attempt")]
+    #[command(
+        about = "Check the connection and the settings, and report every attempt",
+        after_long_help = DOCTOR_EXAMPLES
+    )]
     Doctor(DoctorArgs),
 
-    #[command(subcommand, about = "Manage connection profiles and local state")]
+    #[command(
+        subcommand,
+        about = "Manage connection profiles and local state",
+        after_long_help = CONFIG_EXAMPLES
+    )]
     Config(ConfigCommand),
 
     #[command(about = "Write the manual page to stdout")]
@@ -160,6 +200,7 @@ pub(crate) struct ConnectionArgs {
     #[arg(
         long,
         value_name = "PORT",
+        value_parser = clap::value_parser!(u16).range(1..),
         help = "TCP port, or the socket file suffix [env: OWNPG_PORT]"
     )]
     pub port: Option<u16>,
@@ -229,7 +270,10 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub connection: ConnectionArgs,
 
-    #[arg(long, help = "Turn the audit log off for this run")]
+    #[arg(
+        long,
+        help = "Turn the audit log off for this run [env: OWNPG_AUDIT=false]"
+    )]
     pub no_audit: bool,
 
     #[arg(
@@ -263,7 +307,7 @@ pub(crate) struct ServeArgs {
         long,
         requires = "http",
         value_name = "ADDR",
-        help = "Address to bind in HTTP mode (default 127.0.0.1:8765)"
+        help = "Address to bind in HTTP mode: host:port, a bare address, or :port (default 127.0.0.1:8765) [env: OWNPG_BIND]"
     )]
     pub bind: Option<String>,
 
@@ -272,7 +316,7 @@ pub(crate) struct ServeArgs {
         requires = "http",
         value_enum,
         value_name = "MODE",
-        help = "How HTTP clients prove who they are"
+        help = "How HTTP clients prove who they are [env: OWNPG_AUTH]"
     )]
     pub auth: Option<AuthArg>,
 }
@@ -309,8 +353,17 @@ pub(crate) enum ConfigCommand {
         format: OutputFormatArg,
     },
 
-    #[command(about = "Print the profile file path and the data and cache directories")]
-    Path,
+    #[command(about = "Print the profile file path and the data, cache, and log directories")]
+    Path {
+        #[arg(
+            long,
+            value_enum,
+            value_name = "FORMAT",
+            default_value_t = OutputFormatArg::Text,
+            help = "Report shape"
+        )]
+        format: OutputFormatArg,
+    },
 
     #[command(about = "Write an example profile file")]
     Init {
@@ -444,6 +497,41 @@ mod tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn every_example_line_parses_through_the_command_tree() {
+        let mut checked = 0;
+        for block in [
+            ROOT_EXAMPLES,
+            SERVE_EXAMPLES,
+            DOCTOR_EXAMPLES,
+            CONFIG_EXAMPLES,
+        ] {
+            for line in block.lines() {
+                let trimmed = line.trim();
+                let Some(rest) = trimmed.strip_prefix("ownpg ") else {
+                    continue;
+                };
+                let command = rest
+                    .split("  ")
+                    .next()
+                    .unwrap_or_default()
+                    .split(" && ")
+                    .next()
+                    .unwrap_or_default()
+                    .split(" > ")
+                    .next()
+                    .unwrap_or_default();
+                let words: Vec<&str> = command.split_whitespace().collect();
+                assert!(
+                    parse(&words).is_ok(),
+                    "example does not parse: ownpg {command}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 12, "{checked}");
     }
 
     #[test]

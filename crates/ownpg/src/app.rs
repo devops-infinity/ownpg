@@ -66,15 +66,15 @@ fn show_manual(path: &[String]) -> Result<ExitClass> {
     }
 
     let page = if walked.is_empty() {
-        clap_mangen::Man::new(root)
+        root
     } else {
         let titled = format!("ownpg-{}", walked.join("-"));
         let leaked: &'static str = Box::leak(titled.into_boxed_str());
-        clap_mangen::Man::new(current.name(leaked).version(ownpg_core::VERSION))
+        current.name(leaked).version(ownpg_core::VERSION)
     };
 
     let mut rendered = Vec::new();
-    page.render(&mut rendered).map_err(stdout_error)?;
+    crate::man::render(&page, &mut rendered).map_err(stdout_error)?;
     emit(|out| out.write_all(&rendered)).map_err(stdout_error)?;
     Ok(ExitClass::Success)
 }

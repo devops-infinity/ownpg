@@ -2,7 +2,7 @@ use std::io::{IsTerminal, Read};
 
 use ownpg_core::config::describe::describe;
 use ownpg_core::config::profile::{ProfileFile, write_private};
-use ownpg_core::config::{Sources, keychain_account, resolve, ssh_keychain_account};
+use ownpg_core::config::{Secret, Sources, keychain_account, resolve, ssh_keychain_account};
 use ownpg_core::{Error, ExitClass, Result};
 
 use crate::cli::{ConfigCommand, GlobalArgs, OutputFormatArg};
@@ -55,14 +55,34 @@ pub(crate) fn run(
             }
             Ok(ExitClass::Success)
         }
-        ConfigCommand::Path => {
+        ConfigCommand::Path { format } => {
             let paths = &process.paths;
-            emit(|out| {
-                writeln!(out, "profiles: {}", paths.config_file.display())?;
-                writeln!(out, "data: {}", paths.data_dir.display())?;
-                writeln!(out, "cache: {}", paths.cache_dir.display())
-            })
-            .map_err(stdout_error)?;
+            match format {
+                OutputFormatArg::Json => {
+                    let document = serde_json::json!({
+                        "format_version": crate::doctor::FORMAT_VERSION,
+                        "profiles": paths.config_file,
+                        "data": paths.data_dir,
+                        "cache": paths.cache_dir,
+                        "logs": paths.log_dir,
+                    });
+                    let rendered = serde_json::to_string_pretty(&document).map_err(|error| {
+                        Error::ProtocolFailed {
+                            detail: format!("the paths could not be serialized: {error}"),
+                        }
+                    })?;
+                    emit(|out| writeln!(out, "{rendered}")).map_err(stdout_error)?;
+                }
+                OutputFormatArg::Text => {
+                    emit(|out| {
+                        writeln!(out, "profiles: {}", paths.config_file.display())?;
+                        writeln!(out, "data: {}", paths.data_dir.display())?;
+                        writeln!(out, "cache: {}", paths.cache_dir.display())?;
+                        writeln!(out, "logs: {}", paths.log_dir.display())
+                    })
+                    .map_err(stdout_error)?;
+                }
+            }
             Ok(ExitClass::Success)
         }
         ConfigCommand::Init { force, dry_run } => init(process, *force, *dry_run),
@@ -76,11 +96,7 @@ pub(crate) fn run(
 
 fn init(process: &Process, force: bool, dry_run: bool) -> Result<ExitClass> {
     let path = &process.paths.config_file;
-    let example = ProfileFile::example();
-    let text = toml::to_string_pretty(&example).map_err(|error| Error::ConfigUnwritable {
-        path: path.clone(),
-        source: std::io::Error::other(error.to_string()),
-    })?;
+    let text = ownpg_core::config::profile::TEMPLATE;
     if dry_run {
         emit(|out| out.write_all(text.as_bytes())).map_err(stdout_error)?;
         return Ok(ExitClass::Success);
@@ -111,8 +127,15 @@ fn load_profiles(process: &Process, profile: &str) -> Result<ProfileFile> {
     Ok(file)
 }
 
-fn read_password(global: &GlobalArgs, process: &Process) -> Result<String> {
-    let no_input = global.no_input || process.env.var("CI").is_some_and(|value| value == "true");
+fn read_password(global: &GlobalArgs, process: &Process) -> Result<Secret> {
+    let no_input = global.no_input
+        || process.env.var("OWNPG_NO_INPUT").is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        || ownpg_core::config::ci_says_no_input(&process.env).unwrap_or(false);
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
         if no_input {
@@ -122,39 +145,52 @@ fn read_password(global: &GlobalArgs, process: &Process) -> Result<String> {
                     .to_owned(),
             });
         }
-        return rpassword::prompt_password("Password (not echoed): ").map_err(|source| {
-            Error::OutputUnwritable {
-                target: "the terminal".to_owned(),
+        return rpassword::prompt_password("Password (not echoed): ")
+            .map(Secret::new)
+            .map_err(|source| Error::InputUnreadable {
+                source_name: "the terminal".to_owned(),
                 source,
-            }
-        });
+            });
     }
     let mut text = String::new();
     stdin
         .lock()
         .read_to_string(&mut text)
-        .map_err(|source| Error::OutputUnwritable {
-            target: "stdin".to_owned(),
+        .map_err(|source| Error::InputUnreadable {
+            source_name: "stdin".to_owned(),
             source,
         })?;
-    Ok(text.trim_end_matches(['\r', '\n']).to_owned())
+    let trimmed = text.trim_end_matches(['\r', '\n']).len();
+    text.truncate(trimmed);
+    Ok(Secret::new(text))
 }
 
 fn set_password(global: &GlobalArgs, process: &Process, profile: &str) -> Result<ExitClass> {
     let mut file = load_profiles(process, profile)?;
     let password = read_password(global, process)?;
-    if password.is_empty() {
+    if password.expose().is_empty() {
         return Err(Error::ArgumentInvalid {
             argument: "password".to_owned(),
             detail: "an empty password was given".to_owned(),
         });
     }
-    store_secret(&keychain_account(profile), "password_keychain", &password)?;
+    let previous = file.profiles.get(profile).cloned();
     if let Some(entry) = file.profiles.get_mut(profile) {
         entry.password = None;
         entry.password_keychain = Some(true);
     }
     file.save(&process.paths.config_file)?;
+    if let Err(error) = store_secret(
+        &keychain_account(profile),
+        "password_keychain",
+        password.expose(),
+    ) {
+        if let Some(previous) = previous {
+            file.profiles.insert(profile.to_owned(), previous);
+            let _ = file.save(&process.paths.config_file);
+        }
+        return Err(error);
+    }
     tracing::info!(profile, "password stored in the platform keychain");
     Ok(ExitClass::Success)
 }
@@ -193,17 +229,13 @@ fn set_ssh_passphrase(global: &GlobalArgs, process: &Process, profile: &str) -> 
         });
     }
     let passphrase = read_password(global, process)?;
-    if passphrase.is_empty() {
+    if passphrase.expose().is_empty() {
         return Err(Error::ArgumentInvalid {
             argument: "passphrase".to_owned(),
             detail: "an empty passphrase was given".to_owned(),
         });
     }
-    store_secret(
-        &ssh_keychain_account(profile),
-        "passphrase_keychain",
-        &passphrase,
-    )?;
+    let previous = file.profiles.get(profile).cloned();
     if let Some(ssh) = file
         .profiles
         .get_mut(profile)
@@ -212,13 +244,23 @@ fn set_ssh_passphrase(global: &GlobalArgs, process: &Process, profile: &str) -> 
         ssh.passphrase_keychain = Some(true);
     }
     file.save(&process.paths.config_file)?;
+    if let Err(error) = store_secret(
+        &ssh_keychain_account(profile),
+        "passphrase_keychain",
+        passphrase.expose(),
+    ) {
+        if let Some(previous) = previous {
+            file.profiles.insert(profile.to_owned(), previous);
+            let _ = file.save(&process.paths.config_file);
+        }
+        return Err(error);
+    }
     tracing::info!(profile, "ssh passphrase stored in the platform keychain");
     Ok(ExitClass::Success)
 }
 
 fn unset_ssh_passphrase(process: &Process, profile: &str) -> Result<ExitClass> {
     let mut file = load_profiles(process, profile)?;
-    forget_secret(&ssh_keychain_account(profile), "passphrase_keychain")?;
     if let Some(ssh) = file
         .profiles
         .get_mut(profile)
@@ -227,17 +269,18 @@ fn unset_ssh_passphrase(process: &Process, profile: &str) -> Result<ExitClass> {
         ssh.passphrase_keychain = None;
     }
     file.save(&process.paths.config_file)?;
+    forget_secret(&ssh_keychain_account(profile), "passphrase_keychain")?;
     tracing::info!(profile, "ssh passphrase removed from the platform keychain");
     Ok(ExitClass::Success)
 }
 
 fn unset_password(process: &Process, profile: &str) -> Result<ExitClass> {
     let mut file = load_profiles(process, profile)?;
-    forget_secret(&keychain_account(profile), "password_keychain")?;
     if let Some(entry) = file.profiles.get_mut(profile) {
         entry.password_keychain = None;
     }
     file.save(&process.paths.config_file)?;
+    forget_secret(&keychain_account(profile), "password_keychain")?;
     tracing::info!(profile, "password removed from the platform keychain");
     Ok(ExitClass::Success)
 }

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use etcetera::{AppStrategy, AppStrategyArgs, choose_app_strategy};
 use ownpg_core::config::{
@@ -19,13 +19,24 @@ pub(crate) struct Process {
 }
 
 pub(crate) fn detect(global: &GlobalArgs) -> Result<Process> {
-    let vars: BTreeMap<String, String> = std::env::vars().collect();
+    let vars: BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            match value.into_string() {
+                Ok(value) => Some((name, value)),
+                Err(_) => {
+                    tracing::debug!(variable = %name, "skipping an environment variable that is not valid UTF-8");
+                    None
+                }
+            }
+        })
+        .collect();
     let home = etcetera::home_dir().ok();
     let os_user = ["USER", "LOGNAME", "USERNAME"]
         .iter()
         .find_map(|name| vars.get(*name).cloned())
         .filter(|user| !user.trim().is_empty());
-    let env = Environment::new(vars, home, os_user);
+    let env = Environment::new(vars, home.clone(), os_user);
     let strategy = choose_app_strategy(AppStrategyArgs {
         top_level_domain: "bd".to_owned(),
         author: "devops".to_owned(),
@@ -36,11 +47,20 @@ pub(crate) fn detect(global: &GlobalArgs) -> Result<Process> {
         value: String::new(),
         detail: error.to_string(),
     })?;
+    let log_dir = if cfg!(target_os = "macos") {
+        home.as_ref()
+            .map(|home| home.join("Library").join("Logs").join("ownpg"))
+    } else {
+        strategy.state_dir().map(|state| state.join("logs"))
+    };
     let mut paths = AppPaths::from_base(
         strategy.config_dir(),
         strategy.data_dir(),
         strategy.cache_dir(),
     );
+    if let Some(log_dir) = log_dir {
+        paths = paths.with_log_dir(log_dir);
+    }
     if let Some(config) = &global.config {
         paths = paths.with_config_file(config.clone());
     }
@@ -70,7 +90,7 @@ pub(crate) fn keychain_lookup(account: &str) -> Result<Option<String>> {
 pub(crate) fn ssh_hints(env: &Environment) -> Hints {
     Hints {
         home: env.home().map(Path::to_path_buf),
-        agent_socket: env.var("SSH_AUTH_SOCK").map(PathBuf::from),
+        agent_socket: ownpg_core::connect::ssh::agent_socket_from(env.var("SSH_AUTH_SOCK")),
         os_user: env.os_user().map(str::to_owned),
     }
 }

@@ -38,18 +38,30 @@ impl Home {
         }
     }
 
+    fn variables(&self) -> Vec<(&'static str, std::path::PathBuf)> {
+        let root = self.dir.path();
+        vec![
+            ("HOME", root.to_path_buf()),
+            ("USERPROFILE", root.to_path_buf()),
+            ("XDG_CONFIG_HOME", root.join("config")),
+            ("XDG_DATA_HOME", root.join("data")),
+            ("XDG_CACHE_HOME", root.join("cache")),
+            ("XDG_STATE_HOME", root.join("state")),
+            ("APPDATA", root.join("AppData").join("Roaming")),
+            ("LOCALAPPDATA", root.join("AppData").join("Local")),
+        ]
+    }
+
     fn apply(&self, command: &mut Command) {
-        command.env("HOME", self.dir.path());
-        command.env("XDG_CONFIG_HOME", self.dir.path().join("config"));
-        command.env("XDG_DATA_HOME", self.dir.path().join("data"));
-        command.env("XDG_CACHE_HOME", self.dir.path().join("cache"));
+        for (name, value) in self.variables() {
+            command.env(name, value);
+        }
     }
 
     fn apply_std(&self, command: &mut std::process::Command) {
-        command.env("HOME", self.dir.path());
-        command.env("XDG_CONFIG_HOME", self.dir.path().join("config"));
-        command.env("XDG_DATA_HOME", self.dir.path().join("data"));
-        command.env("XDG_CACHE_HOME", self.dir.path().join("cache"));
+        for (name, value) in self.variables() {
+            command.env(name, value);
+        }
     }
 }
 
@@ -188,12 +200,28 @@ fn config_path_and_init_write_under_the_config_directory() {
     let home = Home::new();
     let mut path = ownpg();
     home.apply(&mut path);
-    path.args(["config", "path"])
+    let printed = path.args(["config", "path"]).assert().success();
+    let text = String::from_utf8_lossy(&printed.get_output().stdout).into_owned();
+    assert!(text.contains("profiles.toml"), "{text}");
+    assert!(text.contains("data:"), "{text}");
+    assert!(text.contains("cache:"), "{text}");
+    assert!(text.contains("logs:"), "{text}");
+    let profiles_line = text
+        .lines()
+        .find(|line| line.starts_with("profiles: "))
+        .expect("a profiles line");
+    assert!(
+        profiles_line.contains(&home.dir.path().display().to_string()),
+        "the config path must sit under the isolated home on every platform: {profiles_line}"
+    );
+
+    let mut json = ownpg();
+    home.apply(&mut json);
+    json.args(["config", "path", "--format", "json"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("profiles.toml"))
-        .stdout(predicate::str::contains("data:"))
-        .stdout(predicate::str::contains("cache:"));
+        .stdout(predicate::str::contains("\"format_version\": 1"))
+        .stdout(predicate::str::contains("\"logs\":"));
 
     let mut dry = ownpg();
     home.apply(&mut dry);
@@ -296,7 +324,62 @@ fn doctor_reports_the_live_connection_in_json_and_text() {
         .args(["doctor", "--port", "1", "--format", "json"])
         .assert()
         .code(1)
-        .stdout(predicate::str::contains("\"status\": \"failed\""));
+        .stdout(predicate::str::contains("\"status\": \"failed\""))
+        .stdout(predicate::str::contains("caused by:"));
+}
+
+#[test]
+fn a_database_that_refuses_the_connection_exits_with_the_external_class() {
+    let home = Home::new();
+    let mut serve = ownpg();
+    home.apply(&mut serve);
+    serve
+        .args([
+            "serve",
+            "-d",
+            "app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "1",
+            "--no-input",
+        ])
+        .assert()
+        .code(5)
+        .stderr(predicate::str::contains("code: connect.failed"));
+}
+
+#[test]
+fn a_port_of_zero_is_a_usage_error() {
+    ownpg()
+        .args(["serve", "-d", "app", "--port", "0"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--port"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_closed_stdout_pipe_ends_the_manual_quietly() {
+    use std::io::Read;
+    use std::process::Stdio;
+    let binary = assert_cmd::cargo::cargo_bin("ownpg");
+    let mut child = std::process::Command::new(binary)
+        .arg("man")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the manual command starts");
+    drop(child.stdout.take());
+    let status = child.wait().expect("the child exits");
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)
+            .expect("stderr is readable");
+    }
+    assert!(status.success(), "status {status}, stderr: {stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
 }
 
 #[test]

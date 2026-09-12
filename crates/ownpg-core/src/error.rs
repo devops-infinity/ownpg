@@ -31,6 +31,7 @@ impl fmt::Display for ExitClass {
 pub enum ErrorId {
     CommandUnknown,
     OutputUnwritable,
+    InputUnreadable,
     StatementUnparsable,
     StatementMultiple,
     StatementRefused,
@@ -68,6 +69,7 @@ impl ErrorId {
         match self {
             Self::CommandUnknown => "command.unknown",
             Self::OutputUnwritable => "output.unwritable",
+            Self::InputUnreadable => "input.unreadable",
             Self::StatementUnparsable => "statement.unparsable",
             Self::StatementMultiple => "statement.multiple",
             Self::StatementRefused => "statement.refused",
@@ -116,6 +118,13 @@ pub enum Error {
     #[error("output could not be written to {target}")]
     OutputUnwritable {
         target: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("input could not be read from {source_name}")]
+    InputUnreadable {
+        source_name: String,
         #[source]
         source: std::io::Error,
     },
@@ -263,6 +272,7 @@ impl Error {
         match self {
             Self::CommandUnknown { .. } => ErrorId::CommandUnknown,
             Self::OutputUnwritable { .. } => ErrorId::OutputUnwritable,
+            Self::InputUnreadable { .. } => ErrorId::InputUnreadable,
             Self::StatementUnparsable { .. } => ErrorId::StatementUnparsable,
             Self::StatementMultiple { .. } => ErrorId::StatementMultiple,
             Self::StatementRefused { .. } => ErrorId::StatementRefused,
@@ -311,6 +321,7 @@ impl Error {
             | Self::DsnInvalid { .. }
             | Self::ArgumentInvalid { .. } => ExitClass::Usage,
             Self::OutputUnwritable { .. }
+            | Self::InputUnreadable { .. }
             | Self::HandleState { .. }
             | Self::ProtocolFailed { .. }
             | Self::SqlFailed { .. }
@@ -344,6 +355,10 @@ impl Error {
             }
             Self::OutputUnwritable { .. } => {
                 "Check that the target is writable and has free space.".to_owned()
+            }
+            Self::InputUnreadable { .. } => {
+                "Pipe the value on stdin, or run the command in a terminal that can prompt for it."
+                    .to_owned()
             }
             Self::StatementUnparsable { .. } => {
                 "Check the statement against the PostgreSQL manual, and send one statement per call."
@@ -470,6 +485,10 @@ mod tests {
             },
             Error::OutputUnwritable {
                 target: "stdout".to_owned(),
+                source: io_error(),
+            },
+            Error::InputUnreadable {
+                source_name: "stdin".to_owned(),
                 source: io_error(),
             },
             Error::StatementUnparsable {
@@ -647,6 +666,7 @@ mod tests {
                 | ErrorId::DsnInvalid
                 | ErrorId::ArgumentInvalid => ExitClass::Usage,
                 ErrorId::OutputUnwritable
+                | ErrorId::InputUnreadable
                 | ErrorId::HandleState
                 | ErrorId::ProtocolFailed
                 | ErrorId::SqlFailed

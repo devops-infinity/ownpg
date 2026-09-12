@@ -21,9 +21,10 @@ pub(crate) fn log_filter(global: &GlobalArgs, rust_log: Option<&str>) -> EnvFilt
         (false, 1) => "info,ownpg=debug,ownpg_core=debug",
         (false, _) => "trace",
     };
-    let mut env_filter = rust_log
-        .and_then(|value| EnvFilter::try_new(value).ok())
-        .unwrap_or_else(|| EnvFilter::new(base));
+    let mut env_filter = rust_log.map_or_else(
+        || EnvFilter::new(base),
+        |value| EnvFilter::builder().parse_lossy(value),
+    );
     if global.quiet {
         for directive in ["ownpg=error", "ownpg_core=error"] {
             if let Ok(parsed) = directive.parse() {
@@ -64,11 +65,21 @@ pub(crate) fn init(global: &GlobalArgs, paths: &AppPaths) -> Result<LogGuard> {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "ownpg.log".to_owned());
-            std::fs::create_dir_all(directory).map_err(|source| Error::OutputUnwritable {
-                target: directory.display().to_string(),
-                source,
+            ownpg_core::config::profile::create_private_directory(directory).map_err(|source| {
+                Error::OutputUnwritable {
+                    target: directory.display().to_string(),
+                    source,
+                }
             })?;
-            let appender = tracing_appender::rolling::daily(directory, file_name);
+            let appender = tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .max_log_files(KEPT_LOG_FILES)
+                .filename_prefix(file_name)
+                .build(directory)
+                .map_err(|error| Error::OutputUnwritable {
+                    target: directory.display().to_string(),
+                    source: std::io::Error::other(error.to_string()),
+                })?;
             let (writer, guard) = tracing_appender::non_blocking(appender);
             let layer = tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -92,11 +103,13 @@ pub(crate) fn init(global: &GlobalArgs, paths: &AppPaths) -> Result<LogGuard> {
     Ok(LogGuard { _worker: worker })
 }
 
+const KEPT_LOG_FILES: usize = 8;
+
 pub(crate) fn resolve_log_path(path: &Path, paths: &AppPaths) -> std::path::PathBuf {
     if path.components().count() > 1 || path.is_absolute() {
         path.to_path_buf()
     } else {
-        paths.data_dir.join(path)
+        paths.log_dir.join(path)
     }
 }
 
@@ -130,11 +143,16 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_log_file_name_lands_under_the_data_directory() {
+    fn a_bare_log_file_name_lands_under_the_log_directory() {
         let paths = AppPaths::from_base("/c".into(), "/d".into(), "/k".into());
         assert_eq!(
             resolve_log_path(Path::new("ownpg.log"), &paths),
-            Path::new("/d/ownpg.log")
+            Path::new("/d/logs/ownpg.log")
+        );
+        let custom = paths.clone().with_log_dir("/var/log/ownpg".into());
+        assert_eq!(
+            resolve_log_path(Path::new("ownpg.log"), &custom),
+            Path::new("/var/log/ownpg/ownpg.log")
         );
         assert_eq!(
             resolve_log_path(Path::new("/var/log/ownpg.log"), &paths),

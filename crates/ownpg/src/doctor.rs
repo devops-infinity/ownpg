@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ownpg_core::config::{Settings, Sources, resolve};
 use ownpg_core::engine::Engine;
-use ownpg_core::server::audit_sink;
+use ownpg_core::server::audit_probe;
 use ownpg_core::tools::health::{DoctorReport, doctor_report, render_doctor};
 use ownpg_core::{Error, ExitClass, Result};
 use serde::Serialize;
@@ -237,16 +237,16 @@ fn examine(global: &GlobalArgs, args: &DoctorArgs, process: &Process) -> Verdict
                     Error::ConnectFailed { tried, .. } => tried.join("; "),
                     _ => String::new(),
                 };
-                checks.push(check(
-                    "connection",
-                    CheckStatus::Failed,
-                    true,
-                    if attempts.is_empty() {
-                        format!("{error}. {}", error.remedy())
-                    } else {
-                        format!("{error} (tried {attempts}). {}", error.remedy())
-                    },
-                ));
+                let causes = crate::output::cause_chain(&error);
+                let mut detail = error.to_string();
+                if !attempts.is_empty() {
+                    detail.push_str(&format!(" (tried {attempts})"));
+                }
+                if !causes.is_empty() {
+                    detail.push_str(&format!("; caused by: {}", causes.join(" <- ")));
+                }
+                detail.push_str(&format!(". {}", error.remedy()));
+                checks.push(check("connection", CheckStatus::Failed, true, detail));
                 return None;
             }
         };
@@ -347,9 +347,8 @@ async fn run_connected_checks(
         }
         Err(error) => check("public_schema", CheckStatus::Warning, false, error.to_string()),
     });
-    let audit_path = match audit_sink(settings) {
-        Ok(sink) => {
-            let path = sink.path().map(std::path::Path::to_path_buf);
+    let audit_path = match audit_probe(settings) {
+        Ok(path) => {
             checks.push(match &path {
                 Some(path) => check(
                     "audit",
@@ -420,7 +419,7 @@ async fn run_connected_checks(
 fn finish(checks: Vec<Check>, report: Option<DoctorReport>) -> Verdict {
     Verdict {
         format_version: FORMAT_VERSION,
-        version: ownpg_core::VERSION,
+        version: crate::build_info::version_line(),
         status: Verdict::overall(&checks),
         checks,
         report,

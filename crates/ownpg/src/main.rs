@@ -5,6 +5,7 @@ mod config_cmd;
 mod context;
 mod doctor;
 mod logging;
+mod man;
 mod output;
 mod serve;
 
