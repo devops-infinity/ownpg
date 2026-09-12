@@ -25,3 +25,4 @@ serde.workspace = true
 toml.workspace = true
 tempfile.workspace = true
 secrecy.workspace = true
+serde_json.workspace = true
