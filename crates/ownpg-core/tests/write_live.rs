@@ -307,7 +307,7 @@ async fn destructive_statements_need_confirm_without_elicitation_and_are_prompte
     };
     prepare(&scratch).await;
     let (engine, audit) = engine_for(&scratch, Mode::ReadWrite).await;
-    let legacy = serve(
+    let older = serve(
         Arc::clone(&engine),
         Arc::clone(&audit),
         "writer",
@@ -315,19 +315,19 @@ async fn destructive_statements_need_confirm_without_elicitation_and_are_prompte
         ClientLifecycleMode::Initialize,
     )
     .await;
-    let refused = legacy.call("pg_delete", json!({"table": "items"})).await;
+    let refused = older.call("pg_delete", json!({"table": "items"})).await;
     assert_eq!(refused.is_error, Some(true));
     let body = structured(&refused);
     assert_eq!(body["code"], "confirmation.required");
     assert!(body["remedy"].as_str().unwrap().contains("confirm"));
-    let raw = legacy
+    let raw = older
         .call(
             "pg_run_write",
             json!({"sql": "UPDATE items SET qty = 0 WHERE true"}),
         )
         .await;
     assert_eq!(structured(&raw)["code"], "confirmation.required");
-    let confirmed = legacy
+    let confirmed = older
         .call(
             "pg_update",
             json!({"table": "items", "set": {"qty": 0}, "confirm": true}),
@@ -335,7 +335,7 @@ async fn destructive_statements_need_confirm_without_elicitation_and_are_prompte
         .await;
     assert_ne!(confirmed.is_error, Some(true), "{confirmed:?}");
     assert_eq!(structured(&confirmed)["rows_affected"], 3);
-    legacy.finish().await;
+    older.finish().await;
 
     let declining = serve(
         Arc::clone(&engine),

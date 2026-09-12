@@ -1,0 +1,63 @@
+services:
+  ownpg:
+    image: ghcr.io/devops-infinity/ownpg:latest
+    restart: unless-stopped
+    read_only: true
+    environment:
+      OWNPG_HOST: postgres
+      OWNPG_PORT: "5432"
+      OWNPG_USER: app_reader
+      OWNPG_DATABASE: app
+      OWNPG_SCHEMA: public
+      OWNPG_MODE: read-only
+      OWNPG_AUTH: bearer
+      OWNPG_BEARER_TOKENS_FILE: /run/secrets/ownpg_tokens
+      OWNPG_PUBLIC_URL: https://db.example.com/mcp
+      OWNPG_ALLOWED_HOSTS: db.example.com
+      OWNPG_ALLOWED_ORIGINS: https://claude.ai,https://db.example.com
+      PGPASSFILE: /run/secrets/pgpass
+    secrets:
+      - ownpg_tokens
+      - pgpass
+    volumes:
+      - ownpg-state:/var/lib/ownpg
+    tmpfs:
+      - /tmp
+    ports:
+      - "127.0.0.1:8765:8765"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: app
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_admin -d app"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+secrets:
+  ownpg_tokens:
+    file: ./secrets/ownpg_tokens
+  pgpass:
+    file: ./secrets/pgpass
+  postgres_password:
+    file: ./secrets/postgres_password
+
+volumes:
+  ownpg-state:
+  postgres-data:

@@ -35,7 +35,7 @@ pub struct Gatekeeper {
     pub authenticator: Authenticator,
     pub limiter: Limiter,
     pub anonymous: Principal,
-    pub legacy_session_mode: bool,
+    pub older_client_sessions: bool,
     pub metadata_url: String,
     pub public_url: String,
     pub authorization_server: Option<String>,
@@ -46,7 +46,7 @@ impl std::fmt::Debug for Gatekeeper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gatekeeper")
             .field("public_url", &self.public_url)
-            .field("legacy_session_mode", &self.legacy_session_mode)
+            .field("older_client_sessions", &self.older_client_sessions)
             .finish_non_exhaustive()
     }
 }
@@ -139,7 +139,7 @@ pub async fn guard(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !gate.legacy_session_mode && matches!(*request.method(), Method::GET | Method::DELETE) {
+    if !gate.older_client_sessions && matches!(*request.method(), Method::GET | Method::DELETE) {
         return method_not_allowed();
     }
     if !matches!(
@@ -232,7 +232,7 @@ pub fn router(gate: Arc<Gatekeeper>, settings: &Settings) -> Router {
     let server = Arc::clone(&gate.server);
     let http = &settings.http;
     let config = StreamableHttpServerConfig::default()
-        .with_legacy_session_mode(http.legacy_session_mode.value)
+        .with_legacy_session_mode(http.older_client_sessions.value)
         .with_json_response(true)
         .with_cancellation_token(gate.cancel.clone())
         .with_allowed_hosts(http.allowed_hosts.value.clone())
@@ -279,7 +279,7 @@ pub fn gatekeeper(
         authenticator,
         limiter: Limiter::new(http.rate_limit_per_minute.value),
         anonymous,
-        legacy_session_mode: http.legacy_session_mode.value,
+        older_client_sessions: http.older_client_sessions.value,
         metadata_url: http.metadata_url(),
         public_url: http.public_url.value.clone(),
         authorization_server,

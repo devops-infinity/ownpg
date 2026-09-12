@@ -66,7 +66,7 @@ pub struct HttpEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_per_minute: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_session_mode: Option<bool>,
+    pub older_client_sessions: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,7 +124,7 @@ pub struct HttpSettings {
     pub allowed_origins: Resolved<Vec<String>>,
     pub body_cap: Resolved<usize>,
     pub rate_limit_per_minute: Resolved<u32>,
-    pub legacy_session_mode: Resolved<bool>,
+    pub older_client_sessions: Resolved<bool>,
     pub shutdown: Resolved<Duration>,
     pub pool_size: Resolved<u32>,
     pub auth: AuthSettings,
@@ -416,10 +416,10 @@ pub fn resolve_http(
             "the rate limit must allow at least one call per minute",
         ));
     }
-    let legacy_session_mode = pick(
+    let older_client_sessions = pick(
         None,
-        env_bool(env, "OWNPG_LEGACY_SESSION_MODE")?,
-        entry.legacy_session_mode,
+        env_bool(env, "OWNPG_OLDER_CLIENT_SESSIONS")?,
+        entry.older_client_sessions,
     )
     .unwrap_or_else(|| Resolved::preset(false));
     let shutdown = pick(
@@ -574,7 +574,7 @@ pub fn resolve_http(
         allowed_origins,
         body_cap,
         rate_limit_per_minute,
-        legacy_session_mode,
+        older_client_sessions,
         shutdown,
         pool_size,
         auth,
@@ -624,7 +624,7 @@ mod tests {
         assert_eq!(settings.auth, AuthSettings::None);
         assert_eq!(settings.body_cap.value, DEFAULT_BODY_CAP);
         assert_eq!(settings.rate_limit_per_minute.value, 60);
-        assert!(!settings.legacy_session_mode.value);
+        assert!(!settings.older_client_sessions.value);
         assert!(
             settings
                 .allowed_origins

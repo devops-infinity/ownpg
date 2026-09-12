@@ -23,6 +23,20 @@ pub enum Decision {
     Unparsed,
 }
 
+impl Decision {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Refused => "refused",
+            Self::DryRun => "dry_run",
+            Self::ConfirmedArgument => "confirmed_argument",
+            Self::ConfirmedElicitation => "confirmed_elicitation",
+            Self::Unparsed => "unparsed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrincipalKind {

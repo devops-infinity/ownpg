@@ -1,0 +1,135 @@
+name: Image
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - compose.yaml
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - .github/workflows/image.yml
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/devops-infinity/ownpg
+
+jobs:
+  build:
+    name: build and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: ownpg_ci
+          POSTGRES_PASSWORD: ownpg_ci
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ownpg_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a
+        if: startsWith(github.ref, 'refs/tags/v')
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
+
+      - name: Build the amd64 image for the smoke test
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ownpg:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image against the service database
+        run: |
+          set -eu
+          docker run --rm --network host \
+            -e OWNPG_HOST=127.0.0.1 -e OWNPG_PORT=5432 -e OWNPG_USER=ownpg_ci \
+            -e OWNPG_DATABASE=postgres -e PGPASSWORD=ownpg_ci \
+            ownpg:smoke doctor --format json > doctor.json
+          grep -q '"name": "connection"' doctor.json
+          grep -q '"status": "ok"' doctor.json
+          docker run --rm ownpg:smoke --version
+          printf 'ci-smoke-token-0123456789abcdef read-only smoke\n' > tokens
+          chmod 0600 tokens
+          docker run -d --name ownpg-smoke --network host \
+            -e OWNPG_HOST=127.0.0.1 -e OWNPG_PORT=5432 -e OWNPG_USER=ownpg_ci \
+            -e OWNPG_DATABASE=postgres -e PGPASSWORD=ownpg_ci \
+            -e OWNPG_BIND=127.0.0.1:8765 -e OWNPG_AUTH=bearer \
+            -e OWNPG_BEARER_TOKENS='ci-smoke-token-0123456789abcdef read-only smoke' \
+            ownpg:smoke serve --http
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8765/healthz/ready > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8765/healthz/ready
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8765/mcp \
+            -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/list' \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}')
+          test "$status" = "401"
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8765/mcp \
+            -H 'Authorization: Bearer ci-smoke-token-0123456789abcdef' \
+            -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/list' \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}')
+          test "$status" = "200"
+          docker logs ownpg-smoke
+          docker stop ownpg-smoke
+
+      - name: Log in to the registry
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and publish the multi-arch image
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true

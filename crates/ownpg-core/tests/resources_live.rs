@@ -330,7 +330,7 @@ async fn prompts_render_with_arguments_and_complete_names() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_ddl_call_announces_the_table_and_schema_to_a_legacy_client() {
+async fn a_ddl_call_announces_the_table_and_schema_to_a_2025_client() {
     let Some(scratch) = support::scratch().await else {
         return;
     };

@@ -391,7 +391,7 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
             .contains("scope=\"ownpg:write\"")
     );
 
-    let legacy = json!({
+    let older = json!({
         "jsonrpc": "2.0",
         "id": 9,
         "method": "tools/call",
@@ -404,7 +404,7 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")
         .bearer_auth(TOKEN_READ)
-        .body(legacy.to_string())
+        .body(older.to_string())
         .send()
         .await
         .unwrap();
@@ -687,4 +687,60 @@ async fn an_unreachable_key_endpoint_fails_closed() {
             .contains("key endpoint")
     );
     remote.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_are_exported_to_the_configured_collector() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app")
+        .await
+        .unwrap();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .with_test_writer()
+        .try_init();
+    let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&received);
+    let sizes = Arc::clone(&bytes);
+    let app = axum::Router::new().route(
+        "/v1/metrics",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let counter = Arc::clone(&counter);
+            let sizes = Arc::clone(&sizes);
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                sizes.fetch_add(body.len(), std::sync::atomic::Ordering::SeqCst);
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let collector = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let endpoint = format!("http://{address}");
+    let remote = remote(
+        &scratch,
+        None,
+        &[("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str())],
+    )
+    .await;
+    let (status, body, _) = remote.tool("pg_health", None).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _, _) = remote.tool("pg_run_write", None).await;
+    assert_eq!(status, 200);
+    remote.finish().await;
+    assert!(
+        received.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "no metrics payload reached the collector"
+    );
+    assert!(bytes.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    collector.abort();
 }

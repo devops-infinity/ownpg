@@ -200,8 +200,8 @@ pub fn describe(settings: &Settings) -> Vec<SettingLine> {
         &http.rate_limit_per_minute,
     ));
     lines.push(SettingLine::resolved(
-        "http.legacy_session_mode",
-        &http.legacy_session_mode,
+        "http.older_client_sessions",
+        &http.older_client_sessions,
     ));
     lines.push(SettingLine::duration("http.shutdown", &http.shutdown));
     lines.push(SettingLine::resolved("http.pool_size", &http.pool_size));

@@ -667,7 +667,7 @@ async fn a_discover_first_client_and_a_call_first_client_are_answered() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_legacy_initialize_handshake_negotiates_the_2025_revision() {
+async fn an_initialize_handshake_negotiates_the_2025_revision() {
     let Some(scratch) = support::scratch().await else {
         return;
     };

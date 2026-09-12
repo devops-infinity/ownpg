@@ -53,6 +53,9 @@ url.workspace = true
 deadpool.workspace = true
 base64.workspace = true
 ring.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
 
 [dev-dependencies]
 ssh-key.workspace = true
@@ -61,6 +64,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 insta.workspace = true
 http-body-util.workspace = true
+tracing-subscriber.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 openssh.workspace = true

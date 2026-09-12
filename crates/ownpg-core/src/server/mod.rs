@@ -1,4 +1,5 @@
 pub mod http;
+pub mod metrics;
 pub mod prompts;
 pub mod resources;
 pub mod stdio;
@@ -80,7 +81,7 @@ pub struct RoundTrip {
     pub input_responses: Option<rmcp::model::InputResponses>,
     pub elicitation: bool,
     pub progress: Option<tools::Progress>,
-    pub legacy_peer: Option<Peer<RoleServer>>,
+    pub older_peer: Option<Peer<RoleServer>>,
     pub principal: Option<Principal>,
 }
 
@@ -93,6 +94,7 @@ pub struct Server {
     superuser: bool,
     info: InitializeResult,
     sinks: std::sync::Mutex<Vec<SubscriptionSink>>,
+    metrics: Option<metrics::Metrics>,
 }
 
 impl std::fmt::Debug for Server {
@@ -142,6 +144,10 @@ impl Server {
             gate: Arc::new(gate),
         };
         let info = build_info(&settings, &routes, context.engine.features().as_map());
+        let metrics = match (&settings.http.otel_endpoint, transport) {
+            (Some(endpoint), Transport::Http) => Some(metrics::Metrics::start(&endpoint.value)?),
+            _ => None,
+        };
         Ok(Self {
             context,
             routes,
@@ -151,6 +157,7 @@ impl Server {
             superuser,
             info,
             sinks: std::sync::Mutex::new(Vec::new()),
+            metrics,
         })
     }
 
@@ -213,7 +220,7 @@ impl Server {
             progress: round_trip.progress,
             cancel: cancel.clone(),
         };
-        let legacy_peer = round_trip.legacy_peer.clone();
+        let older_peer = round_trip.older_peer.clone();
         let mut work = std::pin::pin!((route.handler)(call));
         let outcome = tokio::select! {
             outcome = &mut work => outcome,
@@ -225,11 +232,12 @@ impl Server {
             }
         };
         self.record(name, &outcome, request_id, started.elapsed(), &principal);
+        self.refresh_handle_gauge().await;
         if route.spec.group == Some(ToolGroup::Ddl)
             && let Ok(Reply::Output(output)) = &outcome
             && output.facts.decision != Some(Decision::DryRun)
         {
-            self.invalidate_resources(&output.facts.relations, legacy_peer)
+            self.invalidate_resources(&output.facts.relations, older_peer)
                 .await;
         }
         Some(outcome)
@@ -238,7 +246,7 @@ impl Server {
     async fn invalidate_resources(
         &self,
         relations: &[String],
-        legacy_peer: Option<Peer<RoleServer>>,
+        older_peer: Option<Peer<RoleServer>>,
     ) {
         let scoped = self.context.settings().schema.value.clone();
         let mut uris = Vec::new();
@@ -263,7 +271,7 @@ impl Server {
                 tracing::debug!(%error, "a resource list change was not delivered");
             }
         }
-        if let Some(peer) = legacy_peer {
+        if let Some(peer) = older_peer {
             for uri in &uris {
                 if let Err(error) = peer
                     .notify_resource_updated(rmcp::model::ResourceUpdatedNotificationParam::new(
@@ -327,7 +335,7 @@ impl Server {
             statement_hash: facts.statement_hash.clone(),
             statement: facts.statement.clone(),
             decision,
-            rule,
+            rule: rule.clone(),
             handle_id: facts.handle_id.clone(),
             duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             row_count: facts.row_count,
@@ -338,6 +346,18 @@ impl Server {
         if let Err(error) = self.audit.record(&entry) {
             tracing::error!(%error, "the audit line could not be written");
         }
+        if let Some(metrics) = &self.metrics {
+            metrics.record_call(tool, decision, rule.as_deref(), duration);
+        }
+    }
+
+    async fn refresh_handle_gauge(&self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let cursors = self.context.engine.open_cursors().await.len();
+        let handles = usize::from(self.context.engine.open_transaction().await.is_some());
+        metrics.set_open_handles((cursors + handles) as u64);
     }
 
     pub async fn shutdown(&self) {
@@ -358,6 +378,9 @@ impl Server {
         }
         if let Err(error) = self.audit.flush() {
             tracing::error!(%error, "the audit log could not be flushed");
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.shutdown().await;
         }
     }
 }
@@ -466,7 +489,7 @@ impl ServerHandler for Server {
                 peer: context.peer.clone(),
                 token,
             });
-        let legacy_peer = context
+        let older_peer = context
             .protocol_version()
             .is_none_or(|version| version.as_str() < ProtocolVersion::V_2026_07_28.as_str())
             .then(|| context.peer.clone());
@@ -475,7 +498,7 @@ impl ServerHandler for Server {
             input_responses: request.input_responses,
             elicitation,
             progress,
-            legacy_peer,
+            older_peer,
             principal: Some(self.principal_for(&context)),
         };
         let outcome = self
