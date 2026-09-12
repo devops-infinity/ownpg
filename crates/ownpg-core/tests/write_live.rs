@@ -576,3 +576,58 @@ async fn write_only_mode_refuses_reads_and_runs_writes() {
     assert!(missing.is_err());
     rig.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unparsed_statements_run_once_through_parse_only_in_read_write_mode_with_confirm() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    prepare(&scratch).await;
+    let sql = "UPDATE items SET qty = qty + 10 WHERE id = 1 RETURNING WITH (OLD AS o, NEW AS n) o.qty, n.qty";
+    let (engine, audit) = engine_for(&scratch, Mode::ReadWrite).await;
+    let rig = serve(engine, audit, "writer", (), ClientLifecycleMode::Initialize).await;
+    let dry = rig
+        .call("pg_run_write", json!({"sql": sql, "dry_run": true}))
+        .await;
+    assert_ne!(dry.is_error, Some(true), "{dry:?}");
+    assert_eq!(structured(&dry)["kind"], "unparsed");
+    assert_eq!(structured(&dry)["class"], "unknown");
+    let unconfirmed = rig.call("pg_run_write", json!({"sql": sql})).await;
+    assert_eq!(structured(&unconfirmed)["code"], "confirmation.required");
+    let ran = rig
+        .call("pg_run_write", json!({"sql": sql, "confirm": true}))
+        .await;
+    assert_ne!(ran.is_error, Some(true), "{ran:?}");
+    assert_eq!(structured(&ran)["rows"][0][0], "1");
+    assert_eq!(structured(&ran)["rows"][0][1], "11");
+    let chained = rig
+        .call(
+            "pg_run_write",
+            json!({"sql": format!("{sql}; DROP TABLE items"), "confirm": true}),
+        )
+        .await;
+    assert_eq!(chained.is_error, Some(true), "{chained:?}");
+    let still_there = rig
+        .call("pg_run_query", json!({"sql": "SELECT count(*) FROM items"}))
+        .await;
+    assert_eq!(structured(&still_there)["rows"][0][0], "3");
+    let data_dir = rig.data_dir.clone();
+    rig.finish().await;
+    let audit_file = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .unwrap();
+    let lines = std::fs::read_to_string(audit_file).unwrap();
+    assert!(lines.contains("\"decision\":\"unparsed\""), "{lines}");
+    assert!(lines.contains("\"operation\":\"unparsed\""), "{lines}");
+
+    let (engine, audit) = engine_for(&scratch, Mode::WriteOnly).await;
+    let rig = serve(engine, audit, "writer", (), ClientLifecycleMode::Initialize).await;
+    let refused = rig
+        .call("pg_run_write", json!({"sql": sql, "confirm": true}))
+        .await;
+    assert_eq!(structured(&refused)["code"], "statement.unparsable");
+    rig.finish().await;
+}

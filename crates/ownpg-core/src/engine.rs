@@ -1012,6 +1012,30 @@ impl Engine {
         .await
     }
 
+    pub async fn run_unparsed(
+        &self,
+        sql: &str,
+        caps: Caps,
+        principal: &str,
+        handle: Option<&str>,
+    ) -> Result<ResultSet> {
+        {
+            let mut primary = self.primary.lock().await;
+            self.ensure_alive(&mut primary).await?;
+            let _tracked = self.track(primary.lane.conn.session());
+            let statement = primary
+                .lane
+                .conn
+                .client()
+                .prepare(sql)
+                .await
+                .map_err(|error| describe_sqlstate(&error))?;
+            drop(statement);
+        }
+        self.run_write_with(sql, caps, principal, handle, false, None)
+            .await
+    }
+
     pub async fn primary_backend_pid(&self) -> Result<i32> {
         let primary = self.primary.lock().await;
         let rows = query_rows(

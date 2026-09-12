@@ -2222,7 +2222,7 @@ expression: tools
   {
     "name": "pg_run_write",
     "title": "Run one write statement",
-    "description": "Run one write statement written in SQL: INSERT, UPDATE, DELETE, MERGE, COPY ... FROM STDIN is refused here (use pg_copy), DO, or CALL. Exactly one statement per call. The statement is parsed and classified first: reads are refused (use pg_run_query), schema changes are refused (use the DDL tools), and destructive shapes (a DELETE or UPDATE without a narrowing WHERE) need confirm: true or the confirmation prompt. dry_run returns the classification without running anything.",
+    "description": "Run one write statement written in SQL: INSERT, UPDATE, DELETE, MERGE, COPY ... FROM STDIN is refused here (use pg_copy), DO, or CALL. Exactly one statement per call. The statement is parsed and classified first: reads are refused (use pg_run_query), schema changes are refused (use the DDL tools), and destructive shapes (a DELETE or UPDATE without a narrowing WHERE) need confirm: true or the confirmation prompt. dry_run returns the classification without running anything. A statement the parser cannot read is refused in read-only and write-only modes; in read-write mode it runs with confirm: true through the extended query protocol, which lets PostgreSQL itself refuse a batch, and the audit record carries the decision unparsed.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
