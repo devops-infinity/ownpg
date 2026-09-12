@@ -528,6 +528,7 @@ async fn a_pooled_engine_opens_one_tunnel_per_pooled_connection() {
     let caps = ownpg_core::shape::Caps {
         row_cap: 10,
         byte_cap: 100_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let alice = engine.begin_transaction("alice").await.unwrap();
     let bob = engine.begin_transaction("bob").await.unwrap();

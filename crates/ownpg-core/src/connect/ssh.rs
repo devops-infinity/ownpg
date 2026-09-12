@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,7 +7,9 @@ use russh::client::{self, AuthResult, Handle, Handler};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
-use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key};
+use russh::keys::{
+    HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key,
+};
 
 use crate::config::{SshSettings, SshTransport, parse_ssh_target};
 use crate::error::{Error, Result};
@@ -105,6 +108,12 @@ impl Handler for HostKeyHandler {
                     if let Err(error) = learn_known_hosts_path(&self.host, self.port, key, path) {
                         tracing::warn!(%error, "the host key could not be recorded");
                     }
+                    tracing::warn!(
+                        host = %self.host,
+                        port = self.port,
+                        fingerprint = %fingerprint,
+                        "a new host key was trusted because ssh_trust_new_host is on"
+                    );
                     Ok(self.record(HostKeyVerdict::Learned(fingerprint)))
                 } else {
                     Ok(self.record(HostKeyVerdict::Unknown(fingerprint)))
@@ -244,6 +253,7 @@ async fn open_in_process(
 ) -> Result<Tunnel> {
     let hops = plan_route(settings, hints)?;
     let timeout = settings.connect_timeout.value;
+    let keys = load_keys(&hops, settings).await?;
     let config = Arc::new(client::Config {
         inactivity_timeout: None,
         keepalive_interval: Some(Duration::from_secs(30)),
@@ -304,7 +314,7 @@ async fn open_in_process(
                 ));
             }
         };
-        authenticate(&mut handle, hop, settings, hints, timeout).await?;
+        authenticate(&mut handle, hop, settings, hints, &keys, timeout).await?;
         route.push(format!("{}@{}:{}", hop.user, hop.host, hop.port));
         handles.push(handle);
     }
@@ -363,11 +373,66 @@ fn host_key_error(
     }
 }
 
+type LoadedKeys = HashMap<PathBuf, std::result::Result<Arc<PrivateKey>, String>>;
+
+async fn load_keys(hops: &[Hop], settings: &SshSettings) -> Result<LoadedKeys> {
+    let mut files: Vec<PathBuf> = hops.iter().flat_map(|hop| hop.key_files.clone()).collect();
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let passphrase = settings
+        .password
+        .as_ref()
+        .map(|value| value.value.expose().to_owned());
+    let host = settings.host.value.clone();
+    tokio::task::spawn_blocking(move || {
+        files
+            .into_iter()
+            .map(|file| {
+                let loaded = match load_secret_key(&file, None) {
+                    Ok(key) => Ok(key),
+                    Err(first) => match passphrase.as_deref() {
+                        Some(phrase) => load_secret_key(&file, Some(phrase)).map_err(|_| first),
+                        None => Err(first),
+                    },
+                };
+                (
+                    file,
+                    loaded.map(Arc::new).map_err(|error| error.to_string()),
+                )
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| ssh_error(&host, format!("the key loading task failed: {error}")))
+}
+
+async fn agent_client(
+    socket: &Path,
+) -> std::result::Result<AgentClient<AgentStream>, russh::keys::Error> {
+    #[cfg(unix)]
+    {
+        AgentClient::connect_uds(socket).await
+    }
+    #[cfg(windows)]
+    {
+        AgentClient::connect_named_pipe(socket).await
+    }
+}
+
+#[cfg(unix)]
+type AgentStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type AgentStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
 async fn authenticate(
     handle: &mut Handle<HostKeyHandler>,
     hop: &Hop,
     settings: &SshSettings,
     hints: &Hints,
+    keys: &LoadedKeys,
     timeout: Duration,
 ) -> Result<()> {
     let hash_alg = tokio::time::timeout(timeout, handle.best_supported_rsa_hash())
@@ -380,7 +445,7 @@ async fn authenticate(
     if settings.agent.value
         && let Some(socket) = &hints.agent_socket
     {
-        match AgentClient::connect_uds(socket).await {
+        match agent_client(socket).await {
             Ok(mut agent) => match agent.request_identities().await {
                 Ok(identities) => {
                     for identity in identities {
@@ -421,21 +486,14 @@ async fn authenticate(
     }
 
     for key_file in &hop.key_files {
-        let passphrase = settings
-            .password
-            .as_ref()
-            .map(|value| value.value.expose().to_owned());
-        let loaded = match load_secret_key(key_file, None) {
-            Ok(key) => Ok(key),
-            Err(first) => match passphrase.as_deref() {
-                Some(phrase) => load_secret_key(key_file, Some(phrase)).map_err(|_| first),
-                None => Err(first),
-            },
-        };
-        let key = match loaded {
-            Ok(key) => key,
-            Err(error) => {
+        let key = match keys.get(key_file) {
+            Some(Ok(key)) => Arc::clone(key),
+            Some(Err(error)) => {
                 tried.push(format!("{} ({error})", key_file.display()));
+                continue;
+            }
+            None => {
+                tried.push(format!("{} (not loaded)", key_file.display()));
                 continue;
             }
         };
@@ -443,7 +501,7 @@ async fn authenticate(
             timeout,
             handle.authenticate_publickey(
                 hop.user.clone(),
-                PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+                PrivateKeyWithHashAlg::new(key, hash_alg),
             ),
         )
         .await;
@@ -509,6 +567,9 @@ async fn open_system(
             KnownHosts::Strict
         })
         .connect_timeout(settings.connect_timeout.value)
+        .control_persist(openssh::ControlPersist::IdleFor(
+            std::num::NonZeroUsize::new(30).unwrap_or(std::num::NonZeroUsize::MIN),
+        ))
         .user(bastion.user.clone())
         .port(bastion.port);
     if let Some(key) = &settings.key_file {
@@ -523,15 +584,19 @@ async fn open_system(
         .connect(&bastion.host)
         .await
         .map_err(|error| ssh_error(&bastion.host, format!("the system ssh failed: {error}")))?;
-    let socket_dir = tempfile::Builder::new()
-        .prefix("ownpg-ssh-")
-        .tempdir()
-        .map_err(|error| {
-            ssh_error(
-                &bastion.host,
-                format!("no directory for the forward socket: {error}"),
-            )
-        })?;
+    let mut socket_dir = tempfile::Builder::new();
+    socket_dir.prefix("ownpg-ssh-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        socket_dir.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let socket_dir = socket_dir.tempdir().map_err(|error| {
+        ssh_error(
+            &bastion.host,
+            format!("no directory for the forward socket: {error}"),
+        )
+    })?;
     let socket_path = socket_dir.path().join("forward.sock");
     session
         .request_port_forward(
@@ -583,9 +648,13 @@ async fn open_system(
 }
 
 pub fn agent_socket_from(value: Option<&str>) -> Option<PathBuf> {
-    value
+    let named = value
         .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
+        .map(PathBuf::from);
+    if cfg!(windows) {
+        return named.or_else(|| Some(PathBuf::from(r"\\.\pipe\openssh-ssh-agent")));
+    }
+    named
 }
 
 pub fn known_hosts_default(home: Option<&Path>) -> Option<PathBuf> {

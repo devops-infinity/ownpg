@@ -13,6 +13,7 @@ pub const BODY_CAP: usize = 1024 * 1024;
 pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
 pub const MIN_TTL: Duration = Duration::from_secs(60);
 pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MAX_STALE: Duration = Duration::from_secs(24 * 60 * 60);
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,7 +235,7 @@ pub fn parse_key_set(body: &[u8]) -> Result<HashMap<String, Arc<VerifyingKey>>, 
 
 #[derive(Clone)]
 struct Cache {
-    keys: HashMap<String, Arc<VerifyingKey>>,
+    keys: Arc<HashMap<String, Arc<VerifyingKey>>>,
     fetched_at: Option<Instant>,
     ttl: Duration,
     last_attempt: Option<Instant>,
@@ -249,6 +250,11 @@ impl Cache {
     fn is_throttled(&self) -> bool {
         self.last_attempt
             .is_some_and(|attempt| attempt.elapsed() < REFRESH_INTERVAL)
+    }
+
+    fn is_stale(&self) -> bool {
+        self.fetched_at
+            .is_none_or(|fetched| fetched.elapsed() >= MAX_STALE)
     }
 }
 
@@ -299,7 +305,7 @@ impl JwksClient {
             url,
             http,
             cache: std::sync::RwLock::new(Cache {
-                keys: HashMap::new(),
+                keys: Arc::new(HashMap::new()),
                 fetched_at: None,
                 ttl: DEFAULT_TTL,
                 last_attempt: None,
@@ -387,7 +393,7 @@ impl JwksClient {
         self.store(|cache| cache.last_attempt = Some(Instant::now()));
         let (keys, ttl) = self.fetch().await?;
         self.store(|cache| {
-            cache.keys = keys;
+            cache.keys = Arc::new(keys);
             cache.ttl = ttl;
             cache.fetched_at = Some(Instant::now());
         });
@@ -406,7 +412,7 @@ impl JwksClient {
         }
         match self.refresh(cache.fetched_at).await {
             Ok(()) => {}
-            Err(error) if cache.keys.is_empty() => return Err(error),
+            Err(error) if cache.keys.is_empty() || cache.is_stale() => return Err(error),
             Err(error) => {
                 tracing::warn!(%error, "the key endpoint did not answer; the cached keys stay in use");
             }
@@ -420,15 +426,20 @@ impl JwksClient {
             return Ok(());
         }
         if cache.is_throttled() {
-            return if cache.keys.is_empty() {
+            return if cache.keys.is_empty() || cache.is_stale() {
                 Err(JwksError::Unreachable(
-                    "the last fetch failed less than a minute ago".to_owned(),
+                    "the last fetch failed less than a minute ago and no usable keys are cached"
+                        .to_owned(),
                 ))
             } else {
                 Ok(())
             };
         }
-        self.refresh(cache.fetched_at).await
+        match self.refresh(cache.fetched_at).await {
+            Ok(()) => Ok(()),
+            Err(error) if cache.keys.is_empty() || cache.is_stale() => Err(error),
+            Err(_) => Ok(()),
+        }
     }
 }
 

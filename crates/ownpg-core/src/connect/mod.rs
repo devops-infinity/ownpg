@@ -110,9 +110,19 @@ impl Drop for Session {
     }
 }
 
+pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
 impl Session {
     pub async fn is_alive(&self) -> bool {
-        !self.client.is_closed() && self.client.check_connection().await.is_ok()
+        if self.client.is_closed() {
+            return false;
+        }
+        matches!(
+            tokio::time::timeout(LIVENESS_TIMEOUT, self.client.check_connection()).await,
+            Ok(Ok(()))
+        )
     }
 
     pub async fn cancel_running_statement(&self) -> Result<()> {
@@ -198,6 +208,7 @@ impl AsyncWrite for TunnelStream {
 pub struct Connector {
     settings: Arc<Settings>,
     ssh_hints: ssh::Hints,
+    tls: tokio::sync::OnceCell<Arc<Tls>>,
 }
 
 impl fmt::Debug for Connector {
@@ -212,7 +223,29 @@ impl Connector {
         Self {
             settings,
             ssh_hints: ssh::Hints::default(),
+            tls: tokio::sync::OnceCell::new(),
         }
+    }
+
+    pub async fn tls(&self) -> Result<Arc<Tls>> {
+        self.tls
+            .get_or_try_init(|| async {
+                let settings = Arc::clone(&self.settings);
+                let target = settings
+                    .connection
+                    .host
+                    .as_ref()
+                    .map_or_else(|| "the database".to_owned(), |host| host.value.clone());
+                tokio::task::spawn_blocking(move || {
+                    tls::build(&settings.connection, &target).map(Arc::new)
+                })
+                .await
+                .map_err(|error| Error::ProtocolFailed {
+                    detail: format!("the TLS setup task failed: {error}"),
+                })?
+            })
+            .await
+            .cloned()
     }
 
     #[must_use]
@@ -316,6 +349,11 @@ impl Connector {
         config.connect_timeout(connection.connect_timeout.value);
         config.application_name(&connection.application_name.value);
         config.keepalives(true);
+        config.keepalives_idle(KEEPALIVE_IDLE);
+        config.keepalives_interval(KEEPALIVE_INTERVAL);
+        config.keepalives_retries(3);
+        #[cfg(target_os = "linux")]
+        config.tcp_user_timeout(connection.connect_timeout.value);
         let mut options = Vec::new();
         if settings.connection.pooled.value != Some(true) {
             options.extend(
@@ -340,9 +378,9 @@ impl Connector {
         let candidates = self.candidates();
         let mut attempts = Vec::new();
         let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        let tls = self.tls().await?;
         for candidate in candidates {
             let target = candidate.endpoint.to_string();
-            let tls = Arc::new(tls::build(&self.settings.connection, &target)?);
             match self.connect_candidate(&candidate, &tls).await {
                 Ok(mut session) => {
                     attempts.push(Attempt {
@@ -400,7 +438,20 @@ impl Connector {
         ssl_mode: SslMode,
     ) -> std::result::Result<Session, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.driver_config(candidate, ssl_mode);
-        let (client, connection) = config.connect(tls.connector.clone()).await?;
+        let budget = self.settings.connection.connect_timeout.value;
+        let (client, connection) =
+            tokio::time::timeout(budget, config.connect(tls.connector.clone()))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "no answer from {} within {} seconds",
+                            candidate.endpoint,
+                            budget.as_secs()
+                        ),
+                    )
+                })??;
         let driver = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::warn!(%error, "the database connection ended");
@@ -464,7 +515,7 @@ impl Connector {
                     tried: Vec::new(),
                     source: "no connection candidate".into(),
                 })?;
-        let tls = Arc::new(tls::build(&self.settings.connection, target_name)?);
+        let tls = self.tls().await?;
         let config = self.driver_config(&candidate, self.settings.connection.sslmode.value);
         let host_name = match &candidate.endpoint {
             Endpoint::Tcp { host, .. } => host.clone(),
@@ -480,10 +531,14 @@ impl Connector {
                 detail: error.to_string(),
                 source: None,
             })?;
+        let budget = self.settings.connection.connect_timeout.value;
         let (client, connection) =
-            config
-                .connect_raw(stream, connect)
+            tokio::time::timeout(budget, config.connect_raw(stream, connect))
                 .await
+                .map_err(|_| Error::ConnectFailed {
+                    tried: vec![format!("{target_name} as {}", candidate.user)],
+                    source: format!("no answer within {} seconds", budget.as_secs()).into(),
+                })?
                 .map_err(|error| Error::ConnectFailed {
                     tried: vec![format!("{target_name} as {}", candidate.user)],
                     source: Box::new(error),
@@ -599,7 +654,7 @@ pub fn session_settings(
         ),
         (
             "idle_in_transaction_session_timeout",
-            (limits.handle_expiry.value + Duration::from_secs(5))
+            crate::engine::expiry_headroom(limits.handle_expiry.value)
                 .as_millis()
                 .to_string(),
         ),
