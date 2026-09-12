@@ -51,6 +51,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 tracing-appender = "0.2.5"
 rpassword = "7.5.4"
 keyring = "4.2.0"
+insta = { version = "1.48.0", features = ["json"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

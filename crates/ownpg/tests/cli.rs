@@ -44,6 +44,13 @@ impl Home {
         command.env("XDG_DATA_HOME", self.dir.path().join("data"));
         command.env("XDG_CACHE_HOME", self.dir.path().join("cache"));
     }
+
+    fn apply_std(&self, command: &mut std::process::Command) {
+        command.env("HOME", self.dir.path());
+        command.env("XDG_CONFIG_HOME", self.dir.path().join("config"));
+        command.env("XDG_DATA_HOME", self.dir.path().join("data"));
+        command.env("XDG_CACHE_HOME", self.dir.path().join("cache"));
+    }
 }
 
 struct Live {
@@ -267,10 +274,7 @@ fn serve_answers_a_client_over_stdio_and_stops_on_eof() {
     if let Ok(path) = std::env::var("PATH") {
         command.env("PATH", path);
     }
-    command.env("HOME", home.dir.path());
-    command.env("XDG_CONFIG_HOME", home.dir.path().join("config"));
-    command.env("XDG_DATA_HOME", home.dir.path().join("data"));
-    command.env("XDG_CACHE_HOME", home.dir.path().join("cache"));
+    home.apply_std(&mut command);
     command.env("OWNPG_HOST", &live.host);
     command.env("OWNPG_PORT", &live.port);
     command.env("OWNPG_USER", &live.user);
@@ -394,4 +398,59 @@ fn an_unknown_manual_command_carries_its_error_id_and_the_usage_class() {
             "try: Use one of: serve, doctor, config, man, completions.",
         ))
         .stderr(predicate::str::contains("code: command.unknown"));
+}
+
+#[test]
+fn the_first_discover_answer_arrives_quickly() {
+    let Some(live) = live() else {
+        return;
+    };
+    let home = Home::new();
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("ownpg"));
+    command.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    home.apply_std(&mut command);
+    command.env("OWNPG_HOST", &live.host);
+    command.env("OWNPG_PORT", &live.port);
+    command.env("OWNPG_USER", &live.user);
+    command.env("OWNPG_DATABASE", &live.database);
+    command.arg("serve");
+    command.stdin(std::process::Stdio::piped());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::null());
+    let started = std::time::Instant::now();
+    let mut child = command.spawn().expect("the server starts");
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    use std::io::{BufRead, Write};
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }}})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let elapsed = started.elapsed();
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    let response: serde_json::Value = serde_json::from_str(&line).expect("a discover answer");
+    assert_eq!(response["id"], 1, "{line}");
+    assert!(response["result"]["supportedVersions"].is_array(), "{line}");
+    eprintln!(
+        "startup to the first discover answer: {} ms",
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "startup took {elapsed:?}"
+    );
 }

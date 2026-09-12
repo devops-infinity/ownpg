@@ -19,6 +19,7 @@ env:
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
   RUST_BACKTRACE: 1
+  INSTA_UPDATE: "no"
 
 jobs:
   house-rules:
@@ -176,6 +177,137 @@ jobs:
           ownpg --version
           ownpg man > /dev/null
           ownpg completions bash > /dev/null
+
+  live:
+    name: live (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["14", "15", "16", "17", "18"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: ownpg_ci
+          POSTGRES_PASSWORD: ownpg_ci
+          POSTGRES_DB: postgres
+          POSTGRES_INITDB_ARGS: --locale=en_US.UTF-8
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ownpg_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      OWNPG_TEST_DSN: postgresql://ownpg_ci:ownpg_ci@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: live-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: live-${{ runner.os }}-
+
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-nextest@0.9.144
+
+      - name: cargo nextest against the live server
+        run: cargo nextest run --workspace --locked --no-tests=warn --color=never
+
+      - name: doctor against the official image
+        env:
+          OWNPG_HOST: 127.0.0.1
+          OWNPG_PORT: "5432"
+          OWNPG_USER: ownpg_ci
+          OWNPG_DATABASE: postgres
+          PGPASSWORD: ownpg_ci
+        run: |
+          cargo run --locked -p ownpg -- doctor --format json > doctor.json
+          grep -q '"name": "connection"' doctor.json
+          grep -q '"status": "ok"' doctor.json
+
+      - name: build the dist binary and time the first discover answer
+        if: matrix.postgres == '18'
+        env:
+          OWNPG_HOST: 127.0.0.1
+          OWNPG_PORT: "5432"
+          OWNPG_USER: ownpg_ci
+          OWNPG_DATABASE: postgres
+          PGPASSWORD: ownpg_ci
+        run: |
+          cargo build --profile dist --locked -p ownpg
+          request='{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+          ./target/dist/ownpg serve <<< "$request" > /dev/null
+          start=$(date +%s%N)
+          answer=$(./target/dist/ownpg serve <<< "$request" | head -n 1)
+          finish=$(date +%s%N)
+          elapsed=$(( (finish - start) / 1000000 ))
+          echo "startup to the first discover answer: ${elapsed} ms"
+          echo "$answer" | grep -q '"supportedVersions"'
+          if [ "$elapsed" -gt 1000 ]; then
+            echo "::error::the first discover answer took ${elapsed} ms; the budget on a shared runner is 1000 ms"
+            exit 1
+          fi
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: ownpg_ci
+          POSTGRES_PASSWORD: ownpg_ci
+          POSTGRES_DB: postgres
+          POSTGRES_INITDB_ARGS: --locale=en_US.UTF-8
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ownpg_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      OWNPG_TEST_DSN: postgresql://ownpg_ci:ownpg_ci@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup component add llvm-tools-preview --toolchain stable
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: coverage-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: coverage-${{ runner.os }}-
+
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-nextest@0.9.144,cargo-llvm-cov@0.9.1
+
+      - name: cargo llvm-cov
+        run: cargo llvm-cov nextest --workspace --locked --no-tests=warn --color=never --fail-under-lines 80 --summary-only
 
   platforms:
     name: platform (${{ matrix.os }})

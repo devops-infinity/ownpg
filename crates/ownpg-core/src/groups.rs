@@ -169,3 +169,72 @@ mod tests {
         assert!(spec("pg_missing").is_none());
     }
 }
+
+#[cfg(test)]
+mod snapshots {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::config::{AppPaths, Environment, FlagLayer, Sources, resolve};
+    use crate::tools::all_routes;
+
+    pub(crate) const TOKEN_BUDGET_BYTES: usize = 24_000;
+
+    fn settings_for(mode: Mode, tools: &str) -> Settings {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = BTreeMap::from([("OWNPG_DATABASE".to_owned(), "app".to_owned())]);
+        if !tools.is_empty() {
+            vars.insert("OWNPG_TOOLS".to_owned(), tools.to_owned());
+        }
+        let env = Environment::new(vars, Some(dir.path().to_path_buf()), None);
+        let paths = AppPaths::from_base(
+            dir.path().join("c"),
+            dir.path().join("d"),
+            dir.path().join("k"),
+        );
+        resolve(
+            FlagLayer {
+                mode: Some(mode),
+                ..FlagLayer::default()
+            },
+            Sources {
+                env: &env,
+                paths,
+                keychain: None,
+            },
+        )
+        .unwrap()
+        .0
+    }
+
+    fn listed(settings: &Settings) -> Vec<rmcp::model::Tool> {
+        let routes = all_routes().unwrap();
+        loaded(settings)
+            .iter()
+            .filter_map(|spec| routes.iter().find(|route| route.spec.name == spec.name))
+            .map(|route| route.tool.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_tool_list_is_stable_per_mode() {
+        for (mode, label) in [
+            (Mode::ReadOnly, "read-only"),
+            (Mode::WriteOnly, "write-only"),
+            (Mode::ReadWrite, "read-write"),
+        ] {
+            let tools = listed(&settings_for(mode, ""));
+            insta::assert_json_snapshot!(format!("tools-list-{label}"), tools);
+        }
+    }
+
+    #[test]
+    fn the_default_set_fits_the_token_budget() {
+        let tools = listed(&settings_for(Mode::ReadOnly, ""));
+        let bytes = serde_json::to_string(&tools).unwrap().len();
+        assert!(
+            bytes <= TOKEN_BUDGET_BYTES,
+            "the default tools/list is {bytes} bytes; the budget is {TOKEN_BUDGET_BYTES} bytes, four per token for 6000 tokens"
+        );
+    }
+}
