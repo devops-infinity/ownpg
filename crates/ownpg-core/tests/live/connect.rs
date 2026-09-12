@@ -1,12 +1,4 @@
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::print_stderr,
-    clippy::indexing_slicing
-)]
-
-mod support;
+use crate::support;
 
 use ownpg_core::config::FlagLayer;
 use ownpg_core::connect::role::RoleProfile;

@@ -1,12 +1,3 @@
-#![allow(dead_code)]
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::print_stderr,
-    clippy::indexing_slicing
-)]
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

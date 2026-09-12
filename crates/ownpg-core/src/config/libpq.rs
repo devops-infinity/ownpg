@@ -685,3 +685,34 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn any_text_parses_as_a_dsn_or_is_refused_without_a_panic(text in "\\PC{0,120}") {
+            let _ = parse_dsn(&text);
+        }
+
+        #[test]
+        fn a_url_dsn_round_trips_its_parts(
+            user in "[a-z][a-z0-9_]{0,11}",
+            host in "[a-z][a-z0-9.-]{0,20}",
+            port in 1u16..=65535,
+            database in "[a-z][a-z0-9_]{0,15}",
+        ) {
+            let text = format!("postgresql://{user}@{host}:{port}/{database}");
+            let layer = parse_dsn(&text).unwrap();
+            prop_assert_eq!(layer.user.as_deref(), Some(user.as_str()));
+            prop_assert_eq!(layer.host.as_deref(), Some(host.as_str()));
+            prop_assert_eq!(layer.port, Some(port));
+            prop_assert_eq!(layer.dbname.as_deref(), Some(database.as_str()));
+        }
+    }
+}

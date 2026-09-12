@@ -1,5 +1,5 @@
 ---
-source: crates/ownpg-core/tests/ddl_live.rs
+source: crates/ownpg-core/tests/live/ddl.rs
 expression: template
 ---
 DO $ownpg_template$

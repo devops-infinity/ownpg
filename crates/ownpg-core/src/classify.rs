@@ -1028,3 +1028,79 @@ mod tests {
         assert!(error.remedy().contains("mode"));
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn sql_like() -> impl Strategy<Value = String> {
+        let word = prop::sample::select(vec![
+            "SELECT",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "FROM",
+            "WHERE",
+            "INTO",
+            "VALUES",
+            "SET",
+            "DROP",
+            "TABLE",
+            "CREATE",
+            "WITH",
+            "AS",
+            "JOIN",
+            "ON",
+            "AND",
+            "OR",
+            "NOT",
+            "NULL",
+            "app.orders",
+            "orders",
+            "id",
+            "1",
+            "'text'",
+            "(",
+            ")",
+            ",",
+            "*",
+            ";",
+            "--",
+            "/*",
+            "*/",
+            "$1",
+            "::int",
+            "pg_catalog.pg_class",
+            "COPY",
+            "TO",
+            "PROGRAM",
+            "STDIN",
+        ]);
+        prop::collection::vec(word, 0..24).prop_map(|words| words.join(" "))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn any_text_classifies_or_is_refused_without_a_panic(sql in "\\PC{0,200}") {
+            let _ = classify(&sql);
+        }
+
+        #[test]
+        fn sql_shaped_text_never_reports_a_read_that_writes(sql in sql_like()) {
+            if let Ok(classification) = classify(&sql) {
+                let upper = classification.kind.as_str();
+                if classification.class == StatementClass::Read {
+                    prop_assert!(
+                        !matches!(upper, "InsertStmt" | "UpdateStmt" | "DeleteStmt" | "CopyStmt" | "DropStmt" | "TruncateStmt"),
+                        "{upper} classified as a read: {sql}"
+                    );
+                }
+                prop_assert_eq!(classification.statement_digest.len(), 64);
+            }
+        }
+    }
+}

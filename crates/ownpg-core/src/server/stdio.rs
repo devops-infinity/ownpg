@@ -211,6 +211,34 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn no_line_longer_than_the_cap_ever_comes_through(
+            lines in proptest::collection::vec("[a-z]{0,20}", 0..8),
+            cap in 1usize..16,
+        ) {
+            let data: Vec<u8> = lines.join("\n").into_bytes();
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            runtime.block_on(async {
+                let reader = LineCapReader::new(std::io::Cursor::new(data), cap);
+                let mut buffered = tokio::io::BufReader::with_capacity(3, reader).lines();
+                loop {
+                    match buffered.next_line().await {
+                        Ok(Some(line)) => proptest::prop_assert!(line.len() <= cap, "{line}"),
+                        Ok(None) => break,
+                        Err(error) => {
+                            proptest::prop_assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+    }
+
     #[tokio::test]
     async fn the_counter_resets_after_every_newline() {
         let data = b"12345678\n12345678\n".to_vec();
