@@ -1,0 +1,165 @@
+name: Release build check
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: plan
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 10
+    outputs:
+      manifest: ${{ steps.plan.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install dist
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf -o cargo-dist-installer.sh \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh
+          echo "b657cf8c04a8b7bc28f39d220f7e6dd11bbd2bdb072c552262bd9ccf597261b5  cargo-dist-installer.sh" | sha256sum -c
+          sh cargo-dist-installer.sh
+      - name: Save the dist binary for later jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dist-binary
+          path: ~/.cargo/bin/dist
+          if-no-files-found: error
+      - id: plan
+        run: |
+          dist plan --tag=${{ github.ref_name }} --output-format=json > plan-dist-manifest.json
+          cat plan-dist-manifest.json
+          manifest="$(jq -c '.' plan-dist-manifest.json)"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+      - name: Upload the plan manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: artifacts-plan-dist-manifest
+          path: plan-dist-manifest.json
+          if-no-files-found: error
+
+  build-local-artifacts:
+    name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
+    needs:
+      - plan
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.manifest).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container && matrix.container.image || null }}
+    env:
+      BUILD_MANIFEST_PATH: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+    steps:
+      - name: Allow long paths on Windows
+        run: |
+          git config --global core.longpaths true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install Rust in the container
+        if: ${{ matrix.container }}
+        shell: bash
+        run: |
+          if ! command -v cargo > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Install dist
+        if: matrix.install_dist.shell != 'pwsh'
+        shell: bash
+        run: ${{ matrix.install_dist.run }}
+      - name: Install dist (pwsh)
+        if: matrix.install_dist.shell == 'pwsh'
+        shell: pwsh
+        run: ${{ matrix.install_dist.run }}
+      - name: Install the system packages this target needs
+        run: |
+          ${{ matrix.packages_install }}
+      - name: Build artifacts
+        shell: bash
+        env:
+          XWIN_INCLUDE_DEBUG_SYMBOLS: "true"
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=${{ github.workspace }}=/ownpg --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+          dist build --tag=${{ github.ref_name }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+      - id: upload-paths
+        name: Collect the upload paths
+        shell: bash
+        run: |
+          {
+            echo "paths<<EOF"
+            dist print-upload-files-from-manifest --manifest dist-manifest.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          cp dist-manifest.json "$BUILD_MANIFEST_PATH"
+      - name: Upload the local artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: artifacts-build-local-${{ join(matrix.targets, '_') }}
+          path: |
+            ${{ steps.upload-paths.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_PATH }}
+          if-no-files-found: error
+
+  build-global-artifacts:
+    name: build-global-artifacts
+    needs:
+      - plan
+      - build-local-artifacts
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 10
+    env:
+      BUILD_MANIFEST_PATH: target/distrib/global-dist-manifest.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install the shared dist binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: dist-binary
+          path: ~/.cargo/bin/
+      - run: chmod +x ~/.cargo/bin/dist
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+      - id: global-build
+        name: dist build --artifacts=global
+        shell: bash
+        run: |
+          dist build --tag=${{ github.ref_name }} --output-format=json --artifacts=global > dist-manifest.json
+
+          {
+            echo "paths<<EOF"
+            jq --raw-output ".upload_files[]" dist-manifest.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          cp dist-manifest.json "$BUILD_MANIFEST_PATH"
+      - name: Upload the global artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: artifacts-build-global
+          path: |
+            ${{ steps.global-build.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_PATH }}
+          if-no-files-found: error

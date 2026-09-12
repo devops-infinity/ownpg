@@ -1,0 +1,19 @@
+Third-party licenses shipped with ownpg
+
+Overview
+{{#each overview}}
+- {{{name}}} ({{id}}): {{count}}
+{{/each}}
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

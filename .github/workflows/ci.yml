@@ -1,0 +1,329 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: 1
+
+jobs:
+  house-rules:
+    name: house rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Refuse the wording the project bans
+        run: |
+          hits=$(git ls-files -- crates tools docs ':(top,glob)*.md' |
+            grep -vE '^docs/planning/|^[0-9]{4}-.*\.md$' |
+            xargs grep -nIE 'legacy|backward.compat|inspired by|based on|ported from|fork of' 2>/dev/null |
+            grep -v '^tools/release\.sh:' | grep -v '^CLAUDE\.md:' | grep -v '^AGENTS\.md:' | grep -v '^constitution\.md:' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::banned wording found"
+            echo "$hits"
+            exit 1
+          fi
+
+      - name: Refuse the em dash the project bans
+        run: |
+          em_dash="$(printf '\342\200\224')"
+          hits=$(git ls-files -- crates tools docs ':(top,glob)*.md' | xargs grep -lI -- "$em_dash" 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "::error::an em dash was found"
+            echo "$hits"
+            exit 1
+          fi
+
+      - name: Refuse the markdown table the project bans
+        run: |
+          hits=$(git ls-files -- ':(top,glob)*.md' docs | xargs grep -nE '^\s*\|.*\|\s*$' 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "::error::a markdown table was found"
+            echo "$hits"
+            exit 1
+          fi
+
+      - name: Confirm CLAUDE.md and AGENTS.md carry the same text
+        run: cmp CLAUDE.md AGENTS.md
+
+      - name: Confirm the documented exit codes match the source
+        run: |
+          declared=$(grep -oE '^\s+[A-Za-z]+ = [0-9]+,' crates/ownpg-core/src/error.rs | grep -oE '[0-9]+' | sort -n | tr '\n' ' ')
+          documented=$(awk '/^## Exit codes/ { keep = 1; next } /^## / { keep = 0 } keep' README.md | grep -oE '^- [^0-9 ][0-9]+' | grep -oE '[0-9]+' | sort -n | tr '\n' ' ')
+          if [ -z "$declared" ] || [ "$declared" != "$documented" ]; then
+            echo "::error::the exit codes in error.rs no longer match what README.md documents"
+            echo "declared: $declared"
+            echo "documented: $documented"
+            exit 1
+          fi
+
+  tool-scripts:
+    name: tool scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: shfmt@3.14.1
+
+      - name: shellcheck tools/*.sh
+        run: shellcheck tools/*.sh
+
+      - name: shfmt tools/*.sh
+        run: shfmt -d tools/*.sh
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c
+          tar -xzf gitleaks.tar.gz gitleaks
+          install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: gitleaks on the history
+        run: gitleaks git --no-banner --redact --exit-code 1 .
+
+      - name: gitleaks on the tree
+        run: gitleaks dir --no-banner --redact --exit-code 1 .
+
+  gate:
+    name: gate (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ["1.89", "stable"]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Confirm the pin still matches rust-version
+        if: matrix.toolchain != 'stable'
+        run: |
+          declared=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$declared" != "${{ matrix.toolchain }}" ]; then
+            echo "::error::Cargo.toml declares rust-version $declared but CI pins ${{ matrix.toolchain }}"
+            exit 1
+          fi
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install "${{ matrix.toolchain }}" --profile minimal --no-self-update
+          rustup component add rustfmt clippy --toolchain "${{ matrix.toolchain }}"
+          rustc --version
+          cargo --version
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: gate-${{ runner.os }}-${{ matrix.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: gate-${{ runner.os }}-${{ matrix.toolchain }}-
+
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-nextest@0.9.144,cargo-machete@0.9.2,cargo-about@0.9.2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets --all-features --locked --color=never
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked --color=never -- -D warnings
+
+      - name: cargo nextest
+        run: cargo nextest run --workspace --all-features --locked --no-tests=warn --color=never
+
+      - name: cargo test --doc
+        run: cargo test --workspace --all-features --locked --doc
+
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+      - name: cargo machete
+        run: cargo machete
+
+      - name: cargo about
+        run: cargo about generate about.hbs -o target/THIRD-PARTY.txt
+
+      - name: cargo install from this checkout
+        run: cargo install --path crates/ownpg --locked --force
+
+      - name: the installed binary answers
+        run: |
+          ownpg --version
+          ownpg man > /dev/null
+          ownpg completions bash > /dev/null
+
+  platforms:
+    name: platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup component add clippy --toolchain stable
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: platform-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: platform-${{ matrix.os }}-
+
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-nextest@0.9.144
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked --color=never -- -D warnings
+
+      - name: cargo nextest
+        run: cargo nextest run --workspace --all-features --locked --no-tests=warn --color=never
+
+      - name: cargo install from this checkout
+        run: cargo install --path crates/ownpg --locked --force
+
+      - name: the installed binary answers
+        shell: bash
+        run: |
+          ownpg --version
+          ownpg man > /dev/null
+          ownpg completions powershell > /dev/null
+
+  targets:
+    name: target (${{ matrix.target }})
+    runs-on: ${{ matrix.on }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-gnu
+            on: ubuntu-latest
+            zig: true
+          - target: x86_64-unknown-linux-musl
+            on: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            on: ubuntu-latest
+            zig: true
+          - target: x86_64-apple-darwin
+            on: macos-latest
+            zig: false
+          - target: aarch64-pc-windows-msvc
+            on: windows-latest
+            zig: false
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install the toolchain and the target
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        if: matrix.zig
+        with:
+          version: 0.16.0
+
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        if: matrix.zig
+        with:
+          tool: cargo-zigbuild@0.23.4
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: target-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: target-${{ matrix.target }}-
+
+      - name: cargo zigbuild
+        if: matrix.zig
+        run: cargo zigbuild --workspace --locked --color=never --target ${{ matrix.target }}
+
+      - name: cargo check
+        if: ${{ !matrix.zig }}
+        env:
+          CFLAGS_aarch64_pc_windows_msvc: /D_mm_pause=__yield
+        run: cargo check --workspace --all-targets --all-features --locked --color=never --target ${{ matrix.target }}
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: "1.89"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install the toolchain
+        run: rustup toolchain install "1.89" --profile minimal --no-self-update
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: package-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: package-${{ runner.os }}-
+
+      - name: cargo publish --dry-run --locked -p ownpg-core
+        run: cargo publish --dry-run --locked -p ownpg-core

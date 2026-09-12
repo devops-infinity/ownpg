@@ -1,0 +1,48 @@
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = false
+deny = [
+  { crate = "atty", reason = "unmaintained; std::io::IsTerminal replaces it" },
+  { crate = "ansi_term", reason = "unmaintained; anstyle replaces it" },
+  { crate = "structopt", reason = "superseded by clap derive" },
+  { crate = "backoff", reason = "unmaintained per RUSTSEC-2025-0012; backon replaces it" },
+  { crate = "lazy_static", reason = "superseded by std::sync::LazyLock", wrappers = [
+    "bindgen",
+  ] },
+  { crate = "exitcode", reason = "last released 2017" },
+  { crate = "anyhow", reason = "the workspace carries one error type with an exit class and a stable id", wrappers = [
+    "prost-derive",
+  ] },
+  { crate = "openssl", reason = "the workspace links rustls only" },
+  { crate = "openssl-sys", reason = "the workspace links rustls only" },
+  { crate = "native-tls", reason = "the workspace links rustls only" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
