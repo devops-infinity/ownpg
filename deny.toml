@@ -47,3 +47,72 @@ deny = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[bans.build]
+allow-build-scripts = [
+  { crate = "anyhow" },
+  { crate = "assert_cmd" },
+  { crate = "async-io" },
+  { crate = "bindgen" },
+  { crate = "clang-sys" },
+  { crate = "crc32fast" },
+  { crate = "crossbeam-utils" },
+  { crate = "curve25519-dalek" },
+  { crate = "generic-array" },
+  { crate = "getrandom" },
+  { crate = "httparse" },
+  { crate = "iana-time-zone-haiku" },
+  { crate = "icu_normalizer_data" },
+  { crate = "icu_properties_data" },
+  { crate = "jni" },
+  { crate = "jni-macros" },
+  { crate = "libc" },
+  { crate = "memoffset" },
+  { crate = "nix" },
+  { crate = "num-traits" },
+  { crate = "ownpg" },
+  { crate = "parking_lot_core" },
+  { crate = "pg_query" },
+  { crate = "portable-atomic" },
+  { crate = "prettyplease" },
+  { crate = "proc-macro2" },
+  { crate = "quote" },
+  { crate = "ref-cast" },
+  { crate = "ring" },
+  { crate = "rmcp" },
+  { crate = "rustix" },
+  { crate = "rustls" },
+  { crate = "rustversion" },
+  { crate = "serde" },
+  { crate = "serde_core" },
+  { crate = "serde_json" },
+  { crate = "system-configuration-sys" },
+  { crate = "thiserror" },
+  { crate = "wasm-bindgen" },
+  { crate = "wasm-bindgen-shared" },
+  { crate = "winapi" },
+  { crate = "winapi-i686-pc-windows-gnu" },
+  { crate = "winapi-x86_64-pc-windows-gnu" },
+  { crate = "windows_aarch64_gnullvm" },
+  { crate = "windows_aarch64_msvc" },
+  { crate = "windows_i686_gnu" },
+  { crate = "windows_i686_gnullvm" },
+  { crate = "windows_i686_msvc" },
+  { crate = "windows_x86_64_gnu" },
+  { crate = "windows_x86_64_gnullvm" },
+  { crate = "windows_x86_64_msvc" },
+  { crate = "wit-bindgen" },
+  { crate = "zerocopy" },
+  { crate = "zmij" },
+]
+executables = "deny"
+interpreted = "warn"
+include-dependencies = true
+include-workspace = true
+
+[[bans.build.bypass]]
+crate = "libloading"
+allow = [
+  { path = "tests/nagisa32.dll", checksum = "5c69b2bd9c8a6ad04165c221075fc9fade1dd66ca697399ace528a5a62328e36" },
+  { path = "tests/nagisa64.dll", checksum = "e20b95e3036f3289421abd100760874d4f455afd33c3b5b64fec56b191f7d477" },
+]

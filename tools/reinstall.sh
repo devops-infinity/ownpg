@@ -409,24 +409,25 @@ if [[ $SKIP_GATE -eq 0 ]]; then
 	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked >/dev/null 2>&1 ||
 		die "the docs do not build; run: RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --all-features --no-deps"
 	say SUCCESS "docs"
-	if command -v cargo-audit >/dev/null 2>&1; then
-		cargo audit --deny warnings >/dev/null 2>&1 || die "cargo audit found an advisory; run: cargo audit --deny warnings"
-		say SUCCESS "advisories"
-	else
-		say WARNING "cargo-audit is not installed; the advisory gate did not run"
+	for tool in cargo-audit cargo-deny cargo-machete; do
+		command -v "$tool" >/dev/null 2>&1 ||
+			die "$tool is not installed, so the gate cannot run; install it with: cargo install --locked $tool (or pass --skip-gate to install without the gate)"
+	done
+	cargo audit --deny warnings >/dev/null 2>&1 || die "cargo audit found an advisory; run: cargo audit --deny warnings"
+	say SUCCESS "advisories"
+	DENY_CODE=0
+	cargo deny check >/dev/null 2>&1 || DENY_CODE=$?
+	if [[ $DENY_CODE -ne 0 ]]; then
+		DENY_NAMES=""
+		((DENY_CODE & 1)) && DENY_NAMES="$DENY_NAMES advisories"
+		((DENY_CODE & 2)) && DENY_NAMES="$DENY_NAMES bans"
+		((DENY_CODE & 4)) && DENY_NAMES="$DENY_NAMES licenses"
+		((DENY_CODE & 8)) && DENY_NAMES="$DENY_NAMES sources"
+		die "cargo deny found a policy violation in:${DENY_NAMES:- an unrecognized check (exit $DENY_CODE)}; run: cargo deny check"
 	fi
-	if command -v cargo-deny >/dev/null 2>&1; then
-		cargo deny check >/dev/null 2>&1 || die "cargo deny found a policy violation; run: cargo deny check"
-		say SUCCESS "dependency policy"
-	else
-		say WARNING "cargo-deny is not installed; the dependency policy gate did not run"
-	fi
-	if command -v cargo-machete >/dev/null 2>&1; then
-		cargo machete >/dev/null 2>&1 || die "cargo machete found an unused dependency; run: cargo machete"
-		say SUCCESS "no unused dependency"
-	else
-		say WARNING "cargo-machete is not installed; the unused-dependency gate did not run"
-	fi
+	say SUCCESS "dependency policy"
+	cargo machete >/dev/null 2>&1 || die "cargo machete found an unused dependency; run: cargo machete"
+	say SUCCESS "no unused dependency"
 else
 	say WARNING "skipping the verification gate"
 fi

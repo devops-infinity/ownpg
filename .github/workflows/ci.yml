@@ -230,10 +230,13 @@ jobs:
 
       - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
         with:
-          tool: cargo-nextest@0.9.144
+          tool: cargo-nextest@0.9.144,cargo-insta@1.48.0
 
       - name: cargo nextest against the live server
         run: cargo nextest run --workspace --locked --no-tests=warn --color=never
+
+      - name: every snapshot file belongs to a test
+        run: cargo insta test --workspace --locked --test-runner nextest --unreferenced=reject --color=never
 
       - name: doctor against the official image
         env:
@@ -267,6 +270,12 @@ jobs:
           echo "$answer" | grep -q '"supportedVersions"'
           if [ "$elapsed" -gt 1000 ]; then
             echo "::error::the first discover answer took ${elapsed} ms; the budget on a shared runner is 1000 ms"
+            exit 1
+          fi
+          size=$(stat -c %s ./target/dist/ownpg)
+          echo "dist binary size: ${size} bytes"
+          if [ "$size" -gt 41943040 ]; then
+            echo "::error::the dist binary is ${size} bytes; the budget is 40 MiB"
             exit 1
           fi
 

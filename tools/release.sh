@@ -10,6 +10,9 @@ CLI_MANIFEST="crates/ownpg/Cargo.toml"
 LOCK_FILE="Cargo.lock"
 CHANGELOG="CHANGELOG.md"
 ATTRIBUTION="THIRD-PARTY.txt"
+MCPB_MANIFEST="mcpb/manifest.json"
+REGISTRY_MANIFEST="server.json"
+MINISIGN_PUB="${OWNPG_MINISIGN_PUB:-minisign.pub}"
 BRANCH="main"
 REMOTE="origin"
 PUBLIC_RELEASE_REPO="devops-infinity/ownpg-releases"
@@ -103,7 +106,7 @@ print_manual_binary_steps() {
 
 print_manual_finish() {
 	say INFO "finish by hand with:"
-	printf '  git add -- %s %s %s %s\n' "$ROOT_MANIFEST" "$CLI_MANIFEST" "$LOCK_FILE" "$CHANGELOG"
+	printf '  git add -- %s\n' "$(tracked_release_files | tr '\n' ' ')"
 	printf '  git commit -m "chore: release %s"\n' "$VERSION"
 	printf '  git tag %s v%s -m "OwnPG v%s"\n' "$(tag_flag)" "$VERSION" "$VERSION"
 	printf '  git push %s %s\n' "$REMOTE" "$BRANCH"
@@ -392,22 +395,30 @@ write_attribution() {
 	[[ -s "$ATTRIBUTION" ]] || die "$ATTRIBUTION came out empty"
 }
 
+tracked_release_files() {
+	local file
+	for file in "$ROOT_MANIFEST" "$CLI_MANIFEST" "$LOCK_FILE" "$CHANGELOG" "$MCPB_MANIFEST" "$REGISTRY_MANIFEST"; do
+		[[ -f "$file" ]] && printf '%s\n' "$file"
+	done
+	return 0
+}
+
 snapshot_tree() {
 	local file
-	for file in "$ROOT_MANIFEST" "$CLI_MANIFEST" "$LOCK_FILE" "$CHANGELOG"; do
+	while IFS= read -r file; do
 		mkdir -p -- "$WORK_DIR/backup/$(dirname -- "$file")"
 		cp -p -- "$file" "$WORK_DIR/backup/$file"
-	done
+	done < <(tracked_release_files)
 	MUTATED=1
 }
 
 restore_tree() {
 	local file
-	for file in "$ROOT_MANIFEST" "$CLI_MANIFEST" "$LOCK_FILE" "$CHANGELOG"; do
+	while IFS= read -r file; do
 		if [[ -f "$WORK_DIR/backup/$file" ]]; then
 			cp -p -- "$WORK_DIR/backup/$file" "$file"
 		fi
-	done
+	done < <(tracked_release_files)
 	MUTATED=0
 }
 
@@ -454,10 +465,24 @@ bump_workspace_version() {
 	rewrite_file "$CLI_MANIFEST" "$dependency_program" -v new="$VERSION" ||
 		die "no ownpg-core dependency version in $CLI_MANIFEST"
 	say SUCCESS "$CLI_MANIFEST ownpg-core dependency is $VERSION"
+
+	jq --arg version "$VERSION" '.version = $version' "$MCPB_MANIFEST" >"$WORK_DIR/mcpb-manifest.json" ||
+		die "could not bump $MCPB_MANIFEST"
+	cat -- "$WORK_DIR/mcpb-manifest.json" >"$MCPB_MANIFEST"
+	say SUCCESS "$MCPB_MANIFEST version is $VERSION"
+
+	jq --arg version "$VERSION" '.version = $version | .packages |= map(if .registryType == "cargo" then .version = $version else . end)' \
+		"$REGISTRY_MANIFEST" >"$WORK_DIR/registry-manifest.json" || die "could not bump $REGISTRY_MANIFEST"
+	cat -- "$WORK_DIR/registry-manifest.json" >"$REGISTRY_MANIFEST"
+	say SUCCESS "$REGISTRY_MANIFEST version is $VERSION"
 }
 
 move_changelog_section() {
 	local today program="$WORK_DIR/changelog.awk"
+	if [[ ! -f "$CHANGELOG" ]]; then
+		say WARNING "$CHANGELOG does not exist; the release notes come from the commit subjects since the previous tag"
+		return 0
+	fi
 	today="$(date +%F)"
 	cat >"$program" <<-'AWK'
 		!done && /^## \[Unreleased\]/ {
@@ -576,6 +601,8 @@ build_dist_artifacts() {
 	local repo_root
 	repo_root="$(pwd)"
 	export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$repo_root=/ownpg --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+	SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+	export SOURCE_DATE_EPOCH
 	rm -rf -- target/distrib
 	local target log manifest reason
 	local -a targets=() built=() skipped=()
@@ -605,24 +632,53 @@ build_dist_artifacts() {
 	done
 	[[ ${#built[@]} -gt 0 ]] || die "no target built; nothing to release"
 	if [[ ${#skipped[@]} -gt 0 ]]; then
-		say WARNING "skipped target(s), releasing the rest: ${skipped[*]}"
+		say WARNING "skipped target(s): ${skipped[*]}"
 		say WARNING "the shell and PowerShell installers still offer every configured target, so"
 		say WARNING "a user on a skipped target gets a failed download, not a clear message"
+		[[ "${OWNPG_ALLOW_PARTIAL:-0}" == "1" ]] ||
+			die "built ${#built[@]} of ${#targets[@]} targets; install the missing cross toolchains, or set OWNPG_ALLOW_PARTIAL=1 to publish this partial set on purpose (crates.io and the tag are already live either way)"
 		if [[ $ASSUME_YES -ne 1 ]]; then
 			[[ -t 0 ]] || die "no terminal to confirm a partial target set on; pass --yes for an unattended run"
 			local typed=""
-			printf 'built %s of %s targets (%s); type %s to publish this partial set, anything else stops here (crates.io and the tag are already live either way): ' \
+			printf 'built %s of %s targets (%s); type %s to publish this partial set, anything else stops here: ' \
 				"${#built[@]}" "${#targets[@]}" "${built[*]}" "$VERSION"
 			IFS= read -r typed || true
 			[[ "$typed" == "$VERSION" ]] ||
 				die "that did not match $VERSION; crates.io and the tag are already live, finish the binaries by hand when ready"
 		fi
 	fi
+	smoke_test_host_archive "${built[@]}"
 	sign_macos_binaries "${built[@]}"
 	sign_windows_binaries "${built[@]}"
 	build_mcpb_bundles "${built[@]}"
 	run "dist build --artifacts=global" dist build --tag="v$VERSION" --artifacts=global --no-local-paths
 	cp -- "$ATTRIBUTION" target/distrib/ || die "could not place $ATTRIBUTION next to the archives"
+}
+
+host_triple() {
+	rustc -vV | awk '/^host:/ { print $2 }'
+}
+
+smoke_test_host_archive() {
+	local host target archive stage printed
+	host="$(host_triple)"
+	for target in "$@"; do
+		[[ "$target" == "$host" ]] || continue
+		archive="target/distrib/$BIN_CRATE-$target.tar.gz"
+		[[ -f "$archive" ]] || die "$archive is missing; dist did not produce the archive for $host"
+		stage="$WORK_DIR/smoke-$target"
+		rm -rf -- "$stage"
+		mkdir -p -- "$stage"
+		tar -xzf "$archive" -C "$stage" || die "could not unpack $archive for the smoke test"
+		printed="$("$stage/$BIN_CRATE-$target/$BIN_CRATE" --version 2>&1 || true)"
+		[[ "$printed" == "$BIN_CRATE $VERSION ("* ]] ||
+			die "the shipped $target binary prints '$printed', expected '$BIN_CRATE $VERSION (commit ..., built ...)'"
+		[[ "$printed" != *"commit unknown"* && "$printed" != *"built unknown"* ]] ||
+			die "the shipped $target binary carries an unknown build stamp: $printed"
+		say SUCCESS "the shipped $target archive runs and reports $VERSION"
+		return 0
+	done
+	say WARNING "no archive was built for this host ($host); the shipped binary was not run here"
 }
 
 sign_macos_binaries() {
@@ -661,6 +717,8 @@ sign_windows_binaries() {
 	fi
 	[[ -f "$cert" ]] || die "OWNPG_WINDOWS_SIGN_CERT points at $cert, which does not exist"
 	require_tools osslsigncode
+	local pass_file="$WORK_DIR/windows-sign.pass"
+	(umask 077 && printf '%s' "$pass" >"$pass_file") || die "could not stage the signing password"
 	local target archive stage exe
 	for target in "$@"; do
 		[[ "$target" == *-pc-windows-msvc ]] || continue
@@ -672,13 +730,14 @@ sign_windows_binaries() {
 		unzip -q "$archive" -d "$stage" || die "could not unpack $archive"
 		exe="$(find "$stage" -type f -name "$BIN_CRATE.exe" | head -n 1)"
 		[[ -n "$exe" ]] || die "$archive holds no $BIN_CRATE.exe"
-		run "osslsigncode ($target)" osslsigncode sign -pkcs12 "$cert" -pass "$pass" -n "OwnPG" -i "$RELEASE_URL_BASE" -t http://timestamp.digicert.com -in "$exe" -out "$exe.signed"
+		run "osslsigncode ($target)" osslsigncode sign -pkcs12 "$cert" -readpass "$pass_file" -n "OwnPG" -i "$RELEASE_URL_BASE" -t http://timestamp.digicert.com -in "$exe" -out "$exe.signed"
 		mv -f -- "$exe.signed" "$exe" || die "could not replace $exe with the signed binary"
 		run "osslsigncode verify ($target)" osslsigncode verify -in "$exe"
 		rm -f -- "$archive"
 		(cd "$stage" && zip -q -r "$REPO/$archive" .) || die "could not repack $archive after signing"
 		say SUCCESS "signed $target"
 	done
+	rm -f -- "$pass_file"
 }
 
 publish_homebrew_formula() {
@@ -769,7 +828,7 @@ build_mcpb_bundles() {
 
 write_server_json() {
 	local bundle name sha packages
-	packages="$(jq -c --arg version "$VERSION" '.packages | map(select(.registryType == "cargo") | .version = $version)' server.json)"
+	packages="$(jq -c --arg version "$VERSION" '.packages | map(select(.registryType == "cargo") | .version = $version)' "$REGISTRY_MANIFEST")"
 	shopt -s nullglob
 	for bundle in target/distrib/*.mcpb; do
 		name="$(basename "$bundle")"
@@ -778,16 +837,37 @@ write_server_json() {
 			'. + [{registryType: "mcpb", registryBaseUrl: "https://github.com", identifier: $url, version: $version, fileSha256: $sha, transport: {type: "stdio"}}]' <<<"$packages")"
 	done
 	shopt -u nullglob
-	jq --arg version "$VERSION" --argjson packages "$packages" '.version = $version | .packages = $packages' server.json >"$WORK_DIR/server.json" || die "could not rewrite server.json"
-	mv -- "$WORK_DIR/server.json" server.json
-	say SUCCESS "server.json carries $VERSION and $(jq '.packages | length' server.json) package entries"
+	jq --arg version "$VERSION" --argjson packages "$packages" '.version = $version | .packages = $packages' "$REGISTRY_MANIFEST" >"target/distrib/$REGISTRY_MANIFEST" || die "could not write the filled $REGISTRY_MANIFEST"
+	say SUCCESS "target/distrib/$REGISTRY_MANIFEST carries $VERSION and $(jq '.packages | length' "target/distrib/$REGISTRY_MANIFEST") package entries"
 }
 
 sign_checksums() {
 	local sums="target/distrib/sha256.sum"
 	[[ -f "$sums" ]] || die "$sums is missing; the global build did not produce a checksum file"
-	run "minisign -Sm $sums" minisign -Sm "$sums" -s "$MINISIGN_KEY" -t "OwnPG $VERSION"
+	STEP="minisign -Sm $sums"
+	if [[ -t 0 ]]; then
+		minisign -Sm "$sums" -s "$MINISIGN_KEY" -t "OwnPG $VERSION" </dev/tty || die "minisign failed"
+	else
+		minisign -Sm "$sums" -s "$MINISIGN_KEY" -t "OwnPG $VERSION" || die "minisign failed; it needs a terminal to ask for the key password"
+	fi
 	[[ -f "$sums.minisig" ]] || die "minisign did not write $sums.minisig"
+	say SUCCESS "signed $sums"
+	if [[ -f "$MINISIGN_PUB" ]]; then
+		cp -- "$MINISIGN_PUB" target/distrib/minisign.pub || die "could not place the minisign public key next to the checksums"
+		say SUCCESS "minisign.pub ships next to sha256.sum.minisig"
+	else
+		say WARNING "$MINISIGN_PUB is missing; users get a signature they cannot check until the public key is committed at the repository root"
+	fi
+}
+
+release_notes_from_git() {
+	local previous
+	previous="$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null || true)"
+	if [[ -n "$previous" ]]; then
+		git log --no-merges --format='- %s' "$previous..HEAD"
+	else
+		git log --no-merges --format='- %s'
+	fi
 }
 
 changelog_section() {
@@ -834,10 +914,15 @@ publish_github_release() {
 	[[ ${#assets[@]} -gt 0 ]] || die "target/distrib has no files; nothing to upload"
 
 	local problem
-	if problem="$(changelog_section_problem)"; then
-		die "$CHANGELOG: $problem; fix it by hand before the release notes can be trusted"
+	if [[ -f "$CHANGELOG" ]]; then
+		if problem="$(changelog_section_problem)"; then
+			die "$CHANGELOG: $problem; fix it by hand before the release notes can be trusted"
+		fi
+		changelog_section >"$notes"
+	else
+		release_notes_from_git >"$notes"
+		grep -q '[^[:space:]]' "$notes" || die "no commits since the previous tag; nothing to write into the release notes"
 	fi
-	changelog_section >"$notes"
 
 	local view="$WORK_DIR/gh-view-${target_repo//\//-}.json" view_err="$WORK_DIR/gh-view-${target_repo//\//-}.err"
 	if gh release view "v$VERSION" "${repo_flag[@]}" --json assets >"$view" 2>"$view_err"; then
@@ -1133,7 +1218,7 @@ publish_crate "$BIN_CRATE"
 wait_for_crate "$BIN_CRATE"
 
 step "commit, tag, push"
-git add -- "$ROOT_MANIFEST" "$CLI_MANIFEST" "$LOCK_FILE" "$CHANGELOG" || die "git add failed"
+tracked_release_files | xargs git add -- || die "git add failed"
 if git diff --cached --quiet; then
 	say WARNING "nothing staged; the bump is already committed"
 else
@@ -1161,7 +1246,7 @@ sign_checksums
 
 step "registry manifest"
 write_server_json
-say INFO "publish to the MCP Registry by hand once the release is up: mcp-publisher login github && mcp-publisher publish"
+say INFO "publish to the MCP Registry by hand once the release is up: mcp-publisher login github && (cd target/distrib && mcp-publisher publish)"
 
 step "GitHub Release"
 publish_github_release ""

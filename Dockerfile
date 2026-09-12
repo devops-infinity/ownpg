@@ -1,9 +1,17 @@
 FROM rust:1.97.1-trixie@sha256:b1b3c9c0d921d7fa0a6d1f9ec7e4eab87f8c8ec97644c3d791450f131dec813f AS build
+ARG OWNPG_BUILD_COMMIT=unknown
+ARG SOURCE_DATE_EPOCH=
+ENV OWNPG_BUILD_COMMIT=$OWNPG_BUILD_COMMIT \
+    SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock about.toml about.hbs LICENSE-MIT LICENSE-APACHE ./
 COPY crates ./crates
-RUN cargo build --profile dist --locked -p ownpg \
-    && install -m 0755 target/dist/ownpg /ownpg
+RUN cargo install --locked cargo-auditable@0.7.5 cargo-about@0.9.2 \
+    && cargo auditable build --profile dist --locked -p ownpg \
+    && cargo about generate about.hbs -o THIRD-PARTY.txt \
+    && install -m 0755 target/dist/ownpg /ownpg \
+    && mkdir -p /doc \
+    && install -m 0644 THIRD-PARTY.txt LICENSE-MIT LICENSE-APACHE /doc/
 
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
 LABEL org.opencontainers.image.title="OwnPG" \
@@ -11,6 +19,7 @@ LABEL org.opencontainers.image.title="OwnPG" \
       org.opencontainers.image.source="https://github.com/devops-infinity/ownpg-releases" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 COPY --from=build /ownpg /usr/local/bin/ownpg
+COPY --from=build /doc/ /usr/share/doc/ownpg/
 ENV OWNPG_BIND=0.0.0.0:8765 \
     OWNPG_NO_INPUT=true \
     XDG_CONFIG_HOME=/var/lib/ownpg/config \
