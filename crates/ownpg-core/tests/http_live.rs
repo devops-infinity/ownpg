@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 const PROTOCOL: &str = "2026-07-28";
 const TOKEN_READ: &str = "reader-token-0123456789abcdef";
 const TOKEN_WRITE: &str = "writer-token-0123456789abcdef";
+const TOKEN_WRITE_ONLY: &str = "write-only-token-0123456789abcdef";
 
 struct Remote {
     base: String,
@@ -341,7 +342,9 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
         .batch_execute("CREATE SCHEMA app; CREATE TABLE app.t (id int)")
         .await
         .unwrap();
-    let tokens = format!("{TOKEN_READ} read-only reader;{TOKEN_WRITE} read-write writer");
+    let tokens = format!(
+        "{TOKEN_READ} read-only reader;{TOKEN_WRITE} read-write writer;{TOKEN_WRITE_ONLY} write-only writeonly"
+    );
     let remote = remote(
         &scratch,
         Some(AuthMode::Bearer),
@@ -431,6 +434,70 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     assert_eq!(status, 200, "{text}");
     let answer: Value = serde_json::from_str(&text).unwrap();
     assert_ne!(result_of(&answer)["isError"], true, "{answer}");
+
+    let list = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "resources/list",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": PROTOCOL,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    });
+    let response = remote
+        .post(&list)
+        .bearer_auth(TOKEN_WRITE_ONLY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    let refused: Value = response.json().await.unwrap();
+    assert_eq!(refused["error"], "insufficient_scope");
+    let response = remote
+        .post(&list)
+        .bearer_auth(TOKEN_READ)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let older_list = json!({"jsonrpc": "2.0", "id": 5, "method": "resources/list", "params": {}});
+    let response = remote
+        .client
+        .post(format!("{}/mcp", remote.base))
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .bearer_auth(TOKEN_WRITE_ONLY)
+        .body(older_list.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ownpg:read"),
+        "{answer}"
+    );
+
+    let mut last = 401;
+    for _ in 0..70 {
+        let (status, _, _) = remote
+            .tool("pg_health", Some("wrong-token-0123456789"))
+            .await;
+        last = status;
+        if status == 429 {
+            break;
+        }
+    }
+    assert_eq!(last, 429, "guessing tokens is not throttled");
     remote.finish().await;
 }
 

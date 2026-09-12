@@ -131,11 +131,11 @@ pub fn list_templates() -> ListResourceTemplatesResult {
 }
 
 impl Server {
-    fn resource_call(&self) -> Call {
+    fn resource_call(&self, principal: &super::Principal) -> Call {
         Call {
             context: self.context.clone(),
             arguments: rmcp::model::JsonObject::new(),
-            principal: self.principal.name.clone(),
+            principal: principal.name.clone(),
             request_state: None,
             input_responses: None,
             elicitation: false,
@@ -197,10 +197,14 @@ impl Server {
             .with_cache_scope(CacheScope::Private))
     }
 
-    pub async fn read_resource_item(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
+    pub async fn read_resource_item(
+        &self,
+        uri: &str,
+        principal: &super::Principal,
+    ) -> Result<ReadResourceResult, ErrorData> {
         let settings = self.context.settings();
         let target = parse_uri(uri, &settings.database.value, &settings.schema.value)?;
-        let call = self.resource_call();
+        let call = self.resource_call(principal);
         let outcome = match &target {
             Target::Schema => {
                 crate::tools::objects::list_objects(

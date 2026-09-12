@@ -180,12 +180,88 @@ impl Server {
 
     #[must_use]
     pub fn principal_for(&self, context: &RequestContext<RoleServer>) -> Principal {
-        context
+        let carried = context
             .extensions
             .get::<::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<Principal>())
-            .cloned()
-            .unwrap_or_else(|| self.principal.clone())
+            .cloned();
+        match (carried, self.context.transport) {
+            (Some(principal), _) => principal,
+            (None, Transport::Stdio) => self.principal.clone(),
+            (None, Transport::Http) => Principal::from_token(
+                "unauthenticated".to_owned(),
+                PrincipalKind::Bearer,
+                Vec::new(),
+            ),
+        }
+    }
+
+    fn require_scope(
+        &self,
+        principal: &Principal,
+        scope: &'static str,
+        request: &str,
+        request_id: &str,
+        started: Instant,
+    ) -> std::result::Result<(), ErrorData> {
+        if principal.allows(scope) {
+            return Ok(());
+        }
+        let error = crate::error::Error::ScopeInsufficient {
+            scope: scope.to_owned(),
+        };
+        self.record_plain(
+            request,
+            request_id.to_owned(),
+            started.elapsed(),
+            principal,
+            Decision::Refused,
+            Some(format!("token lacks scope {scope}")),
+            Some(error.id().as_str().to_owned()),
+        );
+        Err(ErrorData::invalid_request(error.to_string(), None))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_plain(
+        &self,
+        request: &str,
+        request_id: String,
+        duration: Duration,
+        principal: &Principal,
+        decision: Decision,
+        rule: Option<String>,
+        outcome: Option<String>,
+    ) {
+        let settings = self.context.settings();
+        let entry = Entry {
+            request_id,
+            tool: request.to_owned(),
+            operation: None,
+            mode: settings.mode.value,
+            transport: self.context.transport,
+            principal: principal.name.clone(),
+            principal_kind: principal.kind,
+            database: settings.database.value.clone(),
+            schema: settings.schema.value.clone(),
+            statement_class: None,
+            statement_hash: None,
+            statement: None,
+            decision,
+            rule: rule.clone(),
+            handle_id: None,
+            duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            row_count: None,
+            truncated: false,
+            outcome,
+            superuser: self.superuser,
+        };
+        if let Err(error) = self.audit.record(&entry) {
+            tracing::error!(%error, "the audit line could not be written");
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.record_call(request, decision, rule.as_deref(), duration);
+        }
     }
 
     pub async fn call(
@@ -434,10 +510,15 @@ fn request_id_from(context: &RequestContext<RoleServer>) -> String {
         "request_id",
         "requestId",
     ] {
-        if let Some(value) = context.meta.get(key).and_then(serde_json::Value::as_str)
-            && !value.is_empty()
-        {
-            return value.chars().take(128).collect();
+        if let Some(value) = context.meta.get(key).and_then(serde_json::Value::as_str) {
+            let clean: String = value
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+                .take(128)
+                .collect();
+            if !clean.is_empty() {
+                return clean;
+            }
         }
     }
     format!("{:016x}", rand::random::<u64>())
@@ -473,7 +554,7 @@ impl ServerHandler for Server {
     ) -> std::result::Result<CallToolResponse, ErrorData> {
         let name = request.name.to_string();
         let request_id = request_id_from(&context);
-        let span = tracing::info_span!("tool", tool = %name, request_id = %request_id);
+        let span = tracing::info_span!("tool", tool = ?name, request_id = %request_id);
         let _guard = span.enter();
         let arguments = request.arguments.unwrap_or_default();
         let elicitation = context
@@ -522,9 +603,29 @@ impl ServerHandler for Server {
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListResourcesResult, ErrorData> {
-        self.list_resource_items().await
+        let started = Instant::now();
+        let request_id = request_id_from(&context);
+        let principal = self.principal_for(&context);
+        self.require_scope(
+            &principal,
+            groups::SCOPE_READ,
+            "resources/list",
+            &request_id,
+            started,
+        )?;
+        let result = self.list_resource_items().await;
+        self.record_plain(
+            "resources/list",
+            request_id,
+            started.elapsed(),
+            &principal,
+            Decision::Allowed,
+            None,
+            result.as_ref().err().map(|error| error.message.to_string()),
+        );
+        result
     }
 
     async fn list_resource_templates(
@@ -540,12 +641,29 @@ impl ServerHandler for Server {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ReadResourceResponse, ErrorData> {
+        let started = Instant::now();
         let request_id = request_id_from(&context);
-        let span = tracing::info_span!("resource", uri = %request.uri, request_id = %request_id);
+        let span = tracing::info_span!("resource", uri = ?request.uri, request_id = %request_id);
         let _guard = span.enter();
-        self.read_resource_item(&request.uri)
-            .await
-            .map(ReadResourceResponse::Complete)
+        let principal = self.principal_for(&context);
+        self.require_scope(
+            &principal,
+            groups::SCOPE_READ,
+            "resources/read",
+            &request_id,
+            started,
+        )?;
+        let result = self.read_resource_item(&request.uri, &principal).await;
+        self.record_plain(
+            "resources/read",
+            request_id,
+            started.elapsed(),
+            &principal,
+            Decision::Allowed,
+            None,
+            result.as_ref().err().map(|error| error.message.to_string()),
+        );
+        result.map(ReadResourceResponse::Complete)
     }
 
     async fn list_prompts(
@@ -559,8 +677,18 @@ impl ServerHandler for Server {
     async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<GetPromptResponse, ErrorData> {
+        let started = Instant::now();
+        let request_id = request_id_from(&context);
+        let principal = self.principal_for(&context);
+        self.require_scope(
+            &principal,
+            groups::SCOPE_READ,
+            "prompts/get",
+            &request_id,
+            started,
+        )?;
         self.prompt_result(&request)
             .map(GetPromptResponse::Complete)
     }
@@ -568,9 +696,29 @@ impl ServerHandler for Server {
     async fn complete(
         &self,
         request: CompleteRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CompleteResult, ErrorData> {
-        self.completion(&request).await
+        let started = Instant::now();
+        let request_id = request_id_from(&context);
+        let principal = self.principal_for(&context);
+        self.require_scope(
+            &principal,
+            groups::SCOPE_READ,
+            "completion/complete",
+            &request_id,
+            started,
+        )?;
+        let result = self.completion(&request).await;
+        self.record_plain(
+            "completion/complete",
+            request_id,
+            started.elapsed(),
+            &principal,
+            Decision::Allowed,
+            None,
+            result.as_ref().err().map(|error| error.message.to_string()),
+        );
+        result
     }
 
     fn accepted_subscription_filter(

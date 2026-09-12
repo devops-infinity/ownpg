@@ -148,6 +148,9 @@ pub async fn guard(
     ) {
         return method_not_allowed();
     }
+    if let Err(wait) = gate.limiter.check(&format!("addr:{}", peer.ip())) {
+        return too_many(wait);
+    }
     let authorization = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -177,15 +180,21 @@ pub async fn guard(
     {
         return gate.challenge(&Rejection::insufficient(route.spec.scope));
     }
-    let limit_key = if key.is_empty() {
-        format!("addr:{}", peer.ip())
-    } else {
-        format!("token:{key}")
-    };
-    if let Err(wait) = gate.limiter.check(&limit_key) {
-        return too_many(wait);
+    if matches!(
+        method_header.as_str(),
+        "resources/list"
+            | "resources/read"
+            | "resources/templates/list"
+            | "prompts/list"
+            | "prompts/get"
+            | "completion/complete"
+    ) && !principal.allows(crate::groups::SCOPE_READ)
+    {
+        return gate.challenge(&Rejection::insufficient(crate::groups::SCOPE_READ));
     }
-    if let Err(wait) = gate.limiter.check(&format!("addr:{}", peer.ip())) {
+    if !key.is_empty()
+        && let Err(wait) = gate.limiter.check(&format!("token:{key}"))
+    {
         return too_many(wait);
     }
     request.extensions_mut().insert(principal);
@@ -201,7 +210,13 @@ async fn live() -> Response {
     (StatusCode::OK, "live").into_response()
 }
 
-async fn ready(State(gate): State<Arc<Gatekeeper>>) -> Response {
+async fn ready(
+    State(gate): State<Arc<Gatekeeper>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(wait) = gate.limiter.check(&format!("ready:{}", peer.ip())) {
+        return too_many(wait);
+    }
     if !gate.server.engine().is_alive().await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -210,9 +225,10 @@ async fn ready(State(gate): State<Arc<Gatekeeper>>) -> Response {
             .into_response();
     }
     if let Err(detail) = gate.authenticator.ready().await {
+        tracing::warn!(%detail, "the key endpoint is not ready");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("not ready: the key endpoint is not reachable ({detail})"),
+            "not ready: the key endpoint is not reachable",
         )
             .into_response();
     }

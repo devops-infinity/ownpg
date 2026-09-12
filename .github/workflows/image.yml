@@ -74,13 +74,12 @@ jobs:
           grep -q '"name": "connection"' doctor.json
           grep -q '"status": "ok"' doctor.json
           docker run --rm ownpg:smoke --version
-          printf 'ci-smoke-token-0123456789abcdef read-only smoke\n' > tokens
-          chmod 0600 tokens
+          smoke_token="$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
           docker run -d --name ownpg-smoke --network host \
             -e OWNPG_HOST=127.0.0.1 -e OWNPG_PORT=5432 -e OWNPG_USER=ownpg_ci \
             -e OWNPG_DATABASE=postgres -e PGPASSWORD=ownpg_ci \
             -e OWNPG_BIND=127.0.0.1:8765 -e OWNPG_AUTH=bearer \
-            -e OWNPG_BEARER_TOKENS='ci-smoke-token-0123456789abcdef read-only smoke' \
+            -e OWNPG_BEARER_TOKENS="$smoke_token read-only smoke" \
             ownpg:smoke serve --http
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8765/healthz/ready > /dev/null; then break; fi
@@ -93,7 +92,7 @@ jobs:
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}')
           test "$status" = "401"
           status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8765/mcp \
-            -H 'Authorization: Bearer ci-smoke-token-0123456789abcdef' \
+            -H "Authorization: Bearer $smoke_token" \
             -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/list' \
             -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}')

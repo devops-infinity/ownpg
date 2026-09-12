@@ -122,7 +122,11 @@ fn parse_scopes(text: &str) -> Option<Vec<String>> {
 
 impl BearerTokens {
     pub fn parse(text: &str, source: &str) -> Result<Self> {
-        let mut tokens = Vec::new();
+        Self::parse_labeled(text, source, "token")
+    }
+
+    fn parse_labeled(text: &str, source: &str, label: &str) -> Result<Self> {
+        let mut tokens: Vec<BearerToken> = Vec::new();
         for (index, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -133,7 +137,21 @@ impl BearerTokens {
             let grant = parts.next().unwrap_or("read-only");
             let name = parts
                 .next()
-                .map_or_else(|| format!("token-{}", index + 1), str::to_owned);
+                .map_or_else(|| format!("{label}-{}", index + 1), str::to_owned);
+            if tokens.iter().any(|known| known.name == name) {
+                return Err(Error::ConfigInvalid {
+                    setting: source.to_owned(),
+                    value: name,
+                    detail: "two bearer tokens carry the same name; names must be distinct because handles and audit lines are attributed by name".to_owned(),
+                });
+            }
+            if tokens.iter().any(|known| known.secret == secret.as_bytes()) {
+                return Err(Error::ConfigInvalid {
+                    setting: source.to_owned(),
+                    value: format!("line {}", index + 1),
+                    detail: "the same bearer token appears twice".to_owned(),
+                });
+            }
             if secret.len() < 16 || secret.len() > MAX_TOKEN_BYTES {
                 return Err(Error::ConfigInvalid {
                     setting: source.to_owned(),
@@ -172,7 +190,31 @@ impl BearerTokens {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::parse(&text, &path.display().to_string())
+        Self::parse_labeled(&text, &path.display().to_string(), "file")
+    }
+
+    fn merge(&mut self, other: Self, source: &str) -> Result<()> {
+        for token in other.tokens {
+            if self.tokens.iter().any(|known| known.name == token.name) {
+                return Err(Error::ConfigInvalid {
+                    setting: source.to_owned(),
+                    value: token.name,
+                    detail:
+                        "a bearer token with this name is already configured from another source"
+                            .to_owned(),
+                });
+            }
+            if self.tokens.iter().any(|known| known.secret == token.secret) {
+                return Err(Error::ConfigInvalid {
+                    setting: source.to_owned(),
+                    value: token.name,
+                    detail: "this bearer token is already configured from another source"
+                        .to_owned(),
+                });
+            }
+            self.tokens.push(token);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -408,15 +450,17 @@ impl Authenticator {
             } => {
                 let mut tokens = BearerTokens::default();
                 if let Some(file) = tokens_file {
-                    tokens
-                        .tokens
-                        .extend(BearerTokens::from_file(&file.value)?.tokens);
+                    tokens.merge(
+                        BearerTokens::from_file(&file.value)?,
+                        &file.value.display().to_string(),
+                    )?;
                 }
                 if *tokens_from_environment && let Some(text) = environment_tokens {
                     let normalized = text.replace(';', "\n");
-                    tokens
-                        .tokens
-                        .extend(BearerTokens::parse(&normalized, "OWNPG_BEARER_TOKENS")?.tokens);
+                    tokens.merge(
+                        BearerTokens::parse_labeled(&normalized, "OWNPG_BEARER_TOKENS", "env")?,
+                        "OWNPG_BEARER_TOKENS",
+                    )?;
                 }
                 if tokens.is_empty() {
                     return Err(Error::ConfigInvalid {
@@ -519,6 +563,32 @@ mod tests {
         assert_eq!(reader.scopes, vec![SCOPE_READ.to_owned()]);
         let writer = tokens.lookup(b"zyxwvutsrqponmlk9876").unwrap();
         assert_eq!(writer.name, "token-3");
+        assert!(
+            BearerTokens::parse(
+                "abcdefghijklmnop0123 read-only a\nabcdefghijklmnop0123 read-write b\n",
+                "test"
+            )
+            .is_err()
+        );
+        assert!(
+            BearerTokens::parse(
+                "abcdefghijklmnop0123 read-only same\nzyxwvutsrqponmlk9876 read-write same\n",
+                "test"
+            )
+            .is_err()
+        );
+        let mut merged =
+            BearerTokens::parse_labeled("abcdefghijklmnop0123 read-only\n", "f", "file").unwrap();
+        assert_eq!(merged.tokens[0].name, "file-1");
+        let env =
+            BearerTokens::parse_labeled("zyxwvutsrqponmlk9876 read-only\n", "e", "env").unwrap();
+        assert_eq!(env.tokens[0].name, "env-1");
+        merged.merge(env, "e").unwrap();
+        assert_eq!(merged.len(), 2);
+        let clash =
+            BearerTokens::parse_labeled("abcdefghijklmnop0123 read-only other\n", "e", "env")
+                .unwrap();
+        assert!(merged.merge(clash, "e").is_err());
         assert_eq!(
             writer.scopes,
             vec![SCOPE_READ.to_owned(), SCOPE_WRITE.to_owned()]

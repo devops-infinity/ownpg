@@ -232,11 +232,24 @@ pub fn parse_key_set(body: &[u8]) -> Result<HashMap<String, Arc<VerifyingKey>>, 
     Ok(keys)
 }
 
+#[derive(Clone)]
 struct Cache {
     keys: HashMap<String, Arc<VerifyingKey>>,
     fetched_at: Option<Instant>,
     ttl: Duration,
     last_attempt: Option<Instant>,
+}
+
+impl Cache {
+    fn fresh(&self) -> bool {
+        self.fetched_at
+            .is_some_and(|fetched| fetched.elapsed() < self.ttl)
+    }
+
+    fn throttled(&self) -> bool {
+        self.last_attempt
+            .is_some_and(|attempt| attempt.elapsed() < REFRESH_INTERVAL)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -250,7 +263,8 @@ pub enum JwksError {
 pub struct JwksClient {
     url: String,
     http: reqwest::Client,
-    cache: Mutex<Cache>,
+    cache: std::sync::RwLock<Cache>,
+    refreshing: Mutex<()>,
 }
 
 impl std::fmt::Debug for JwksClient {
@@ -284,18 +298,33 @@ impl JwksClient {
         Ok(Self {
             url,
             http,
-            cache: Mutex::new(Cache {
+            cache: std::sync::RwLock::new(Cache {
                 keys: HashMap::new(),
                 fetched_at: None,
                 ttl: DEFAULT_TTL,
                 last_attempt: None,
             }),
+            refreshing: Mutex::new(()),
         })
     }
 
     #[must_use]
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    fn snapshot(&self) -> Cache {
+        self.cache
+            .read()
+            .map(|cache| cache.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    fn store(&self, update: impl FnOnce(&mut Cache)) {
+        match self.cache.write() {
+            Ok(mut cache) => update(&mut cache),
+            Err(poisoned) => update(&mut poisoned.into_inner()),
+        }
     }
 
     async fn fetch(&self) -> Result<(HashMap<String, Arc<VerifyingKey>>, Duration), JwksError> {
@@ -340,45 +369,66 @@ impl JwksClient {
         Ok((parse_key_set(&body)?, ttl))
     }
 
-    async fn refresh(&self, cache: &mut Cache) -> Result<(), JwksError> {
-        cache.last_attempt = Some(Instant::now());
+    async fn refresh(&self, seen: Option<Instant>) -> Result<(), JwksError> {
+        let _serial = self.refreshing.lock().await;
+        let current = self.snapshot();
+        if current.fetched_at != seen && current.fresh() {
+            return Ok(());
+        }
+        if current.throttled() {
+            return if current.keys.is_empty() {
+                Err(JwksError::Unreachable(
+                    "the last fetch failed less than a minute ago".to_owned(),
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        self.store(|cache| cache.last_attempt = Some(Instant::now()));
         let (keys, ttl) = self.fetch().await?;
-        cache.keys = keys;
-        cache.ttl = ttl;
-        cache.fetched_at = Some(Instant::now());
+        self.store(|cache| {
+            cache.keys = keys;
+            cache.ttl = ttl;
+            cache.fetched_at = Some(Instant::now());
+        });
         Ok(())
     }
 
     pub async fn key(&self, kid: &str) -> Result<Option<Arc<VerifyingKey>>, JwksError> {
-        let mut cache = self.cache.lock().await;
-        let fresh = cache
-            .fetched_at
-            .is_some_and(|fetched| fetched.elapsed() < cache.ttl);
-        if !fresh {
-            self.refresh(&mut cache).await?;
+        let cache = self.snapshot();
+        if cache.fresh() {
+            if let Some(key) = cache.keys.get(kid) {
+                return Ok(Some(Arc::clone(key)));
+            }
+            if cache.throttled() {
+                return Ok(None);
+            }
         }
-        if let Some(key) = cache.keys.get(kid) {
-            return Ok(Some(Arc::clone(key)));
+        match self.refresh(cache.fetched_at).await {
+            Ok(()) => {}
+            Err(error) if cache.keys.is_empty() => return Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "the key endpoint did not answer; the cached keys stay in use");
+            }
         }
-        let recently_tried = cache
-            .last_attempt
-            .is_some_and(|attempt| attempt.elapsed() < REFRESH_INTERVAL);
-        if recently_tried {
-            return Ok(None);
-        }
-        self.refresh(&mut cache).await?;
-        Ok(cache.keys.get(kid).cloned())
+        Ok(self.snapshot().keys.get(kid).cloned())
     }
 
     pub async fn ready(&self) -> Result<(), JwksError> {
-        let mut cache = self.cache.lock().await;
-        let fresh = cache
-            .fetched_at
-            .is_some_and(|fetched| fetched.elapsed() < cache.ttl);
-        if fresh {
+        let cache = self.snapshot();
+        if cache.fresh() {
             return Ok(());
         }
-        self.refresh(&mut cache).await
+        if cache.throttled() {
+            return if cache.keys.is_empty() {
+                Err(JwksError::Unreachable(
+                    "the last fetch failed less than a minute ago".to_owned(),
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        self.refresh(cache.fetched_at).await
     }
 }
 

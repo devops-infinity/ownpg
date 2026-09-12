@@ -364,6 +364,7 @@ pub fn resolve_http(
         env.var("OWNPG_ALLOWED_HOSTS").map(parse_list),
         entry.allowed_hosts.clone(),
     )
+    .filter(|resolved| !resolved.value.is_empty())
     .unwrap_or_else(|| Resolved::preset(default_hosts));
     let mut default_origins: Vec<String> = [
         format!("http://localhost:{}", bind.value.port()),
@@ -382,6 +383,7 @@ pub fn resolve_http(
         env.var("OWNPG_ALLOWED_ORIGINS").map(parse_list),
         entry.allowed_origins.clone(),
     )
+    .filter(|resolved| !resolved.value.is_empty())
     .unwrap_or_else(|| Resolved::preset(default_origins));
     let body_cap = pick(
         None,
@@ -582,17 +584,65 @@ pub fn resolve_http(
         state_key_file,
         otel_endpoint,
     };
-    if settings.enabled && !settings.is_loopback() && settings.auth.mode() == AuthMode::None {
-        return Err(invalid(
-            "bind",
-            &settings.bind.value.to_string(),
-            "a bind address outside the loopback interface needs --auth bearer or --auth oauth",
-        ));
+    if settings.enabled && settings.auth.mode() == AuthMode::None {
+        if !settings.is_loopback() {
+            return Err(invalid(
+                "bind",
+                &settings.bind.value.to_string(),
+                "a bind address outside the loopback interface needs --auth bearer or --auth oauth",
+            ));
+        }
+        if let Some(host) = url::Url::parse(&settings.public_url.value)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_owned))
+            && !is_local_host(&host)
+        {
+            return Err(invalid(
+                "http.public_url",
+                &settings.public_url.value,
+                "a public URL outside the loopback interface needs --auth bearer or --auth oauth",
+            ));
+        }
+        if let Some(host) = settings
+            .allowed_hosts
+            .value
+            .iter()
+            .find(|host| !is_local_host(host))
+        {
+            return Err(invalid(
+                "http.allowed_hosts",
+                host,
+                "a host outside the loopback interface needs --auth bearer or --auth oauth",
+            ));
+        }
+        if !mode.allows_writes() {
+            tracing::debug!("HTTP without authentication on loopback in a read mode");
+        }
     }
-    if settings.enabled && settings.auth.mode() == AuthMode::None && !mode.allows_writes() {
-        tracing::debug!("HTTP without authentication on loopback in a read mode");
+    if settings.enabled
+        && !settings.is_loopback()
+        && settings.public_url.value.starts_with("http://")
+    {
+        tracing::warn!(
+            public_url = %settings.public_url.value,
+            "the public URL uses plain http, so bearer tokens travel in clear text; put TLS in front of this server"
+        );
     }
     Ok(settings)
+}
+
+fn is_local_host(host: &str) -> bool {
+    let bare = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        host.rsplit_once(':')
+            .filter(|(name, port)| {
+                !name.contains(':') && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+            })
+            .map_or(host, |(name, _)| name)
+    };
+    bare.eq_ignore_ascii_case("localhost")
+        || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 #[cfg(test)]
@@ -715,6 +765,68 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("https"), "{error}");
+    }
+
+    #[test]
+    fn a_public_url_or_host_outside_loopback_needs_authentication() {
+        let flags = HttpFlags {
+            enabled: true,
+            ..HttpFlags::default()
+        };
+        let error = resolve_http(
+            &flags,
+            &env(&[("OWNPG_PUBLIC_URL", "https://db.example.com/mcp")]),
+            None,
+            Mode::ReadOnly,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--auth"), "{error}");
+        let error = resolve_http(
+            &flags,
+            &env(&[("OWNPG_ALLOWED_HOSTS", "localhost,db.example.com")]),
+            None,
+            Mode::ReadOnly,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("db.example.com"), "{error}");
+        let settings = resolve_http(
+            &flags,
+            &env(&[("OWNPG_ALLOWED_HOSTS", "localhost:8765,[::1]:8765,127.0.0.1")]),
+            None,
+            Mode::ReadOnly,
+        )
+        .unwrap();
+        assert_eq!(settings.allowed_hosts.value.len(), 3);
+        assert!(is_local_host("[::1]:8765"));
+        assert!(is_local_host("LOCALHOST"));
+        assert!(!is_local_host("db.example.com:443"));
+    }
+
+    #[test]
+    fn an_empty_host_or_origin_list_keeps_the_defaults() {
+        let flags = HttpFlags {
+            enabled: true,
+            ..HttpFlags::default()
+        };
+        let settings = resolve_http(
+            &flags,
+            &env(&[
+                ("OWNPG_ALLOWED_HOSTS", ","),
+                ("OWNPG_ALLOWED_ORIGINS", " , "),
+            ]),
+            None,
+            Mode::ReadOnly,
+        )
+        .unwrap();
+        assert!(!settings.allowed_hosts.value.is_empty());
+        assert!(!settings.allowed_origins.value.is_empty());
+        assert_eq!(settings.allowed_hosts.origin, Origin::Preset);
+        let entry = HttpEntry {
+            allowed_hosts: Some(Vec::new()),
+            ..HttpEntry::default()
+        };
+        let settings = resolve_http(&flags, &env(&[]), Some(&entry), Mode::ReadOnly).unwrap();
+        assert!(!settings.allowed_hosts.value.is_empty());
     }
 
     #[test]
