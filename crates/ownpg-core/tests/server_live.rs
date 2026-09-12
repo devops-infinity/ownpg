@@ -140,6 +140,12 @@ async fn the_default_tool_list_is_the_seven_read_tools_in_registry_order() {
     let info = rig.client.peer_info().unwrap();
     assert_eq!(info.server_info.as_ref().unwrap().name, "ownpg");
     assert!(info.instructions.as_ref().unwrap().contains("app"));
+    assert!(
+        info.instructions
+            .as_ref()
+            .unwrap()
+            .contains("Server features by version: merge=")
+    );
     assert_eq!(rig.finish().await, ownpg_core::ExitClass::Success);
 }
 
