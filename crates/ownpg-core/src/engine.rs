@@ -156,9 +156,85 @@ struct WriteHandle {
     expires_at: Instant,
 }
 
+pub struct SessionManager {
+    connector: Arc<Connector>,
+}
+
+impl std::fmt::Debug for SessionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionManager").finish_non_exhaustive()
+    }
+}
+
+impl deadpool::managed::Manager for SessionManager {
+    type Type = Session;
+    type Error = Error;
+
+    async fn create(&self) -> Result<Session> {
+        self.connector.connect().await
+    }
+
+    async fn recycle(
+        &self,
+        session: &mut Session,
+        _metrics: &deadpool::managed::Metrics,
+    ) -> deadpool::managed::RecycleResult<Error> {
+        if session.is_alive().await {
+            Ok(())
+        } else {
+            Err(deadpool::managed::RecycleError::Message(
+                "the pooled connection is closed".into(),
+            ))
+        }
+    }
+}
+
+pub type Pool = deadpool::managed::Pool<SessionManager>;
+type Pooled = deadpool::managed::Object<SessionManager>;
+
+fn pool_error(error: deadpool::managed::PoolError<Error>) -> Error {
+    match error {
+        deadpool::managed::PoolError::Backend(error) => error,
+        other => Error::ProtocolFailed {
+            detail: format!("no pooled connection was available: {other}"),
+        },
+    }
+}
+
+enum Conn {
+    Owned(Session),
+    Pooled(Pooled),
+}
+
+impl std::fmt::Debug for Conn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(session) => f.debug_tuple("Owned").field(&session.info.target).finish(),
+            Self::Pooled(object) => f.debug_tuple("Pooled").field(&object.info.target).finish(),
+        }
+    }
+}
+
+impl Conn {
+    fn session(&self) -> &Session {
+        match self {
+            Self::Owned(session) => session,
+            Self::Pooled(object) => object,
+        }
+    }
+
+    fn client(&self) -> &tokio_postgres::Client {
+        &self.session().client
+    }
+
+    async fn is_alive(&self) -> bool {
+        self.session().is_alive().await
+    }
+}
+
 #[derive(Debug)]
 struct Lane {
-    session: Session,
+    conn: Conn,
     in_read_transaction: bool,
     cursors: BTreeMap<String, Cursor>,
     next_cursor: u64,
@@ -166,8 +242,12 @@ struct Lane {
 
 impl Lane {
     fn new(session: Session) -> Self {
+        Self::around(Conn::Owned(session))
+    }
+
+    const fn around(conn: Conn) -> Self {
         Self {
-            session,
+            conn,
             in_read_transaction: false,
             cursors: BTreeMap::new(),
             next_cursor: 0,
@@ -189,9 +269,11 @@ struct Primary {
 
 pub struct Engine {
     settings: Arc<Settings>,
-    connector: Connector,
+    connector: Arc<Connector>,
     primary: Mutex<Primary>,
     secondary: Mutex<Option<Lane>>,
+    pool: Option<Pool>,
+    pinned: Mutex<Vec<Lane>>,
     cancel: std::sync::Mutex<Vec<tokio_postgres::CancelToken>>,
     role: tokio::sync::OnceCell<RoleProfile>,
     features: Features,
@@ -219,10 +301,35 @@ enum LaneChoice {
 
 impl Engine {
     pub async fn start(settings: Arc<Settings>, hints: Hints) -> Result<Self> {
-        let connector = Connector::new(Arc::clone(&settings)).with_ssh_hints(hints);
+        Self::start_with(settings, hints, false).await
+    }
+
+    pub async fn start_pooled(settings: Arc<Settings>, hints: Hints) -> Result<Self> {
+        Self::start_with(settings, hints, true).await
+    }
+
+    async fn start_with(settings: Arc<Settings>, hints: Hints, pooled: bool) -> Result<Self> {
+        let connector = Arc::new(Connector::new(Arc::clone(&settings)).with_ssh_hints(hints));
         let session = connector.connect().await?;
         let features = Features::from_version(session.info.server_version_num);
         let cancel = std::sync::Mutex::new(vec![session.cancel.clone()]);
+        let pool = if pooled {
+            let size = usize::try_from(settings.http.pool_size.value).unwrap_or(4);
+            let pool = Pool::builder(SessionManager {
+                connector: Arc::clone(&connector),
+            })
+            .max_size(size)
+            .runtime(deadpool::Runtime::Tokio1)
+            .build()
+            .map_err(|error| Error::ProtocolFailed {
+                detail: format!("the connection pool could not be built: {error}"),
+            })?;
+            let warm = pool.get().await.map_err(pool_error)?;
+            drop(warm);
+            Some(pool)
+        } else {
+            None
+        };
         let engine = Self {
             settings,
             connector,
@@ -232,6 +339,8 @@ impl Engine {
                 closed: BTreeMap::new(),
             }),
             secondary: Mutex::new(None),
+            pool,
+            pinned: Mutex::new(Vec::new()),
             cancel,
             role: tokio::sync::OnceCell::new(),
             features,
@@ -240,6 +349,22 @@ impl Engine {
             engine.role().await?.enforce(true)?;
         }
         Ok(engine)
+    }
+
+    #[must_use]
+    pub fn pool_size(&self) -> Option<usize> {
+        self.pool.as_ref().map(|pool| pool.status().max_size)
+    }
+
+    async fn checkout(&self) -> Result<Lane> {
+        let Some(pool) = &self.pool else {
+            return Err(Error::ProtocolFailed {
+                detail: "no connection pool is open".to_owned(),
+            });
+        };
+        let object = pool.get().await.map_err(pool_error)?;
+        self.remember_cancel(object.cancel.clone());
+        Ok(Lane::around(Conn::Pooled(object)))
     }
 
     #[must_use]
@@ -253,20 +378,20 @@ impl Engine {
     }
 
     pub async fn info(&self) -> SessionInfo {
-        self.primary.lock().await.lane.session.info.clone()
+        self.primary.lock().await.lane.conn.session().info.clone()
     }
 
     pub async fn role(&self) -> Result<&RoleProfile> {
         self.role
             .get_or_try_init(|| async {
                 let primary = self.primary.lock().await;
-                RoleProfile::load(&primary.lane.session.client).await
+                RoleProfile::load(primary.lane.conn.client()).await
             })
             .await
     }
 
     pub async fn is_alive(&self) -> bool {
-        self.primary.lock().await.lane.session.is_alive().await
+        self.primary.lock().await.lane.conn.is_alive().await
     }
 
     pub async fn cancel_running_statement(&self) -> Result<()> {
@@ -308,6 +433,9 @@ impl Engine {
         if let Some(lane) = self.secondary.lock().await.as_ref() {
             out.extend(summaries(lane, now));
         }
+        for lane in self.pinned.lock().await.iter() {
+            out.extend(summaries(lane, now));
+        }
         out
     }
 
@@ -323,6 +451,12 @@ impl Engine {
             swept += sweep_expired(lane).await?;
             finish_if_idle(lane).await?;
         }
+        let mut pinned = self.pinned.lock().await;
+        for lane in pinned.iter_mut() {
+            swept += sweep_expired(lane).await?;
+            finish_if_idle(lane).await?;
+        }
+        pinned.retain(|lane| !lane.cursors.is_empty());
         Ok(swept)
     }
 
@@ -339,6 +473,16 @@ impl Engine {
         {
             close_cursor_now(lane, id).await?;
             return finish_if_idle(lane).await;
+        }
+        let mut pinned = self.pinned.lock().await;
+        if let Some(position) = pinned.iter().position(|lane| lane.cursors.contains_key(id)) {
+            let mut lane = pinned.remove(position);
+            close_cursor_now(&mut lane, id).await?;
+            let outcome = finish_if_idle(&mut lane).await;
+            if !lane.cursors.is_empty() {
+                pinned.push(lane);
+            }
+            return outcome;
         }
         Err(Error::HandleState {
             handle: id.to_owned(),
@@ -358,7 +502,7 @@ impl Engine {
 
     async fn ensure_secondary(&self, slot: &mut Option<Lane>) -> Result<()> {
         let alive = match slot {
-            Some(lane) => lane.session.is_alive().await,
+            Some(lane) => lane.conn.is_alive().await,
             None => false,
         };
         if alive {
@@ -373,6 +517,14 @@ impl Engine {
 
     pub async fn run_read(&self, sql: &str, is_select: bool, caps: Caps) -> Result<ResultSet> {
         let expiry = self.settings.limits.handle_expiry.value;
+        if self.pool.is_some() {
+            let mut lane = self.checkout().await?;
+            let result = read_on_lane(&mut lane, sql, is_select, caps, expiry).await;
+            if !lane.cursors.is_empty() {
+                self.pinned.lock().await.push(lane);
+            }
+            return result;
+        }
         match self.read_lane().await? {
             LaneChoice::Primary => {
                 let mut primary = self.primary.lock().await;
@@ -405,6 +557,19 @@ impl Engine {
                 return fetch_on_lane(lane, id, caps, expiry).await;
             }
         }
+        let mut pinned = self.pinned.lock().await;
+        for lane in pinned.iter_mut() {
+            sweep_expired(lane).await?;
+        }
+        if let Some(position) = pinned.iter().position(|lane| lane.cursors.contains_key(id)) {
+            let mut lane = pinned.remove(position);
+            let result = fetch_on_lane(&mut lane, id, caps, expiry).await;
+            if !lane.cursors.is_empty() {
+                pinned.push(lane);
+            }
+            return result;
+        }
+        pinned.retain(|lane| !lane.cursors.is_empty());
         Err(Error::HandleState {
             handle: id.to_owned(),
             state: "unknown or expired".to_owned(),
@@ -417,11 +582,15 @@ impl Engine {
         params: &'a [&'a (dyn ToSql + Sync)],
     ) -> futures_util::future::BoxFuture<'a, Result<Vec<tokio_postgres::Row>>> {
         Box::pin(async move {
+            if self.pool.is_some() {
+                let lane = self.checkout().await?;
+                return query_rows(lane.conn.client(), sql, params).await;
+            }
             match self.read_lane().await? {
                 LaneChoice::Primary => {
                     let mut primary = self.primary.lock().await;
                     self.ensure_alive(&mut primary).await?;
-                    query_rows(&primary.lane.session, sql, params).await
+                    query_rows(primary.lane.conn.client(), sql, params).await
                 }
                 LaneChoice::Secondary => {
                     let mut slot = self.secondary.lock().await;
@@ -429,7 +598,7 @@ impl Engine {
                     let lane = slot.as_ref().ok_or_else(|| Error::ProtocolFailed {
                         detail: "the second connection is missing".to_owned(),
                     })?;
-                    query_rows(&lane.session, sql, params).await
+                    query_rows(lane.conn.client(), sql, params).await
                 }
             }
         })
@@ -440,7 +609,7 @@ impl Engine {
     }
 
     async fn ensure_alive(&self, primary: &mut Primary) -> Result<()> {
-        if primary.lane.session.is_alive().await {
+        if primary.lane.conn.is_alive().await {
             return Ok(());
         }
         tracing::warn!("the database connection was lost; reconnecting once");
@@ -463,9 +632,9 @@ impl Engine {
         }
         if let Some(handle) = primary.write.take() {
             tracing::info!(handle = %handle.id, "the transaction handle expired; rolling back");
-            let outcome = primary.lane.session.client.batch_execute("ROLLBACK").await;
+            let outcome = primary.lane.conn.client().batch_execute("ROLLBACK").await;
             if let Err(error) = outcome
-                && !primary.lane.session.client.is_closed()
+                && !primary.lane.conn.client().is_closed()
             {
                 return Err(describe_sqlstate(&error));
             }
@@ -529,8 +698,8 @@ impl Engine {
         rollback_all(&mut primary.lane).await?;
         primary
             .lane
-            .session
-            .client
+            .conn
+            .client()
             .batch_execute("BEGIN")
             .await
             .map_err(|error| describe_sqlstate(&error))?;
@@ -593,7 +762,7 @@ impl Engine {
         let mut primary = self.primary.lock().await;
         self.expire_write_handle(&mut primary).await?;
         Self::check_handle(&mut primary, id, principal)?;
-        if primary.lane.session.client.is_closed() {
+        if primary.lane.conn.client().is_closed() {
             if let Some(handle) = primary.write.take() {
                 primary.closed.insert(handle.id, HandleState::Lost);
             }
@@ -602,7 +771,7 @@ impl Engine {
                 state: "lost".to_owned(),
             });
         }
-        let outcome = primary.lane.session.client.batch_execute(statement).await;
+        let outcome = primary.lane.conn.client().batch_execute(statement).await;
         let Some(handle) = primary.write.take() else {
             return Err(Error::HandleState {
                 handle: id.to_owned(),
@@ -618,7 +787,7 @@ impl Engine {
                 Ok(info)
             }
             Err(error) => {
-                let final_state = if primary.lane.session.client.is_closed() {
+                let final_state = if primary.lane.conn.client().is_closed() {
                     HandleState::Lost
                 } else {
                     HandleState::RolledBack
@@ -636,8 +805,8 @@ impl Engine {
         let quoted = crate::render::quote_ident(name);
         primary
             .lane
-            .session
-            .client
+            .conn
+            .client()
             .batch_execute(&format!("SAVEPOINT {quoted}"))
             .await
             .map_err(|error| describe_sqlstate(&error))?;
@@ -663,8 +832,8 @@ impl Engine {
         let quoted = crate::render::quote_ident(name);
         primary
             .lane
-            .session
-            .client
+            .conn
+            .client()
             .batch_execute(&format!("ROLLBACK TO SAVEPOINT {quoted}"))
             .await
             .map_err(|error| describe_sqlstate(&error))?;
@@ -708,7 +877,7 @@ impl Engine {
             let mut primary = self.primary.lock().await;
             self.expire_write_handle(&mut primary).await?;
             Self::check_handle(&mut primary, id, principal)?;
-            if primary.lane.session.client.is_closed() {
+            if primary.lane.conn.client().is_closed() {
                 if let Some(handle) = primary.write.take() {
                     primary.closed.insert(handle.id, HandleState::Lost);
                 }
@@ -717,12 +886,12 @@ impl Engine {
                     state: "lost".to_owned(),
                 });
             }
-            let result = timed(&primary.lane.session, timeout, true, || {
-                guarded_statement(&primary.lane.session, sql, caps)
+            let result = timed(primary.lane.conn.client(), timeout, true, || {
+                guarded_statement(primary.lane.conn.client(), sql, caps)
             })
             .await;
             let expiry = self.settings.limits.handle_expiry.value;
-            if primary.lane.session.client.is_closed() {
+            if primary.lane.conn.client().is_closed() {
                 if let Some(handle) = primary.write.take() {
                     primary.closed.insert(handle.id, HandleState::Lost);
                 }
@@ -744,8 +913,8 @@ impl Engine {
         sweep_expired(&mut primary.lane).await?;
         finish_if_idle(&mut primary.lane).await?;
         if !primary.lane.in_read_transaction {
-            return timed(&primary.lane.session, timeout, false, || {
-                autocommit_statement(&primary.lane.session, sql, caps)
+            return timed(primary.lane.conn.client(), timeout, false, || {
+                autocommit_statement(primary.lane.conn.client(), sql, caps)
             })
             .await;
         }
@@ -764,8 +933,8 @@ impl Engine {
                     .to_owned(),
             });
         }
-        timed(&lane.session, timeout, false, || {
-            autocommit_statement(&lane.session, sql, caps)
+        timed(lane.conn.client(), timeout, false, || {
+            autocommit_statement(lane.conn.client(), sql, caps)
         })
         .await
     }
@@ -773,7 +942,7 @@ impl Engine {
     pub async fn primary_backend_pid(&self) -> Result<i32> {
         let primary = self.primary.lock().await;
         let rows = query_rows(
-            &primary.lane.session,
+            primary.lane.conn.client(),
             "SELECT pg_catalog.pg_backend_pid()",
             &[],
         )
@@ -792,12 +961,16 @@ impl Engine {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<tokio_postgres::Row>> {
+        if self.pool.is_some() {
+            let lane = self.checkout().await?;
+            return query_rows(lane.conn.client(), sql, params).await;
+        }
         let mut slot = self.secondary.lock().await;
         self.ensure_secondary(&mut slot).await?;
         let lane = slot.as_ref().ok_or_else(|| Error::ProtocolFailed {
             detail: "the second connection is missing".to_owned(),
         })?;
-        query_rows(&lane.session, sql, params).await
+        query_rows(lane.conn.client(), sql, params).await
     }
 
     pub async fn copy_in(
@@ -832,7 +1005,7 @@ impl Engine {
                 }
             }
         }
-        let client = &primary.lane.session.client;
+        let client = &primary.lane.conn.client();
         let sink = client
             .copy_in(sql)
             .await
@@ -861,16 +1034,16 @@ impl Engine {
         let session = match choice {
             LaneChoice::Primary => {
                 self.ensure_alive(&mut primary).await?;
-                &primary.lane.session
+                primary.lane.conn.session()
             }
             LaneChoice::Secondary => {
                 self.ensure_secondary(&mut slot).await?;
-                &slot
-                    .as_ref()
+                slot.as_ref()
                     .ok_or_else(|| Error::ProtocolFailed {
                         detail: "the second connection is missing".to_owned(),
                     })?
-                    .session
+                    .conn
+                    .session()
             }
         };
         let stream = session
@@ -915,7 +1088,7 @@ impl Engine {
         sweep_expired(&mut primary.lane).await?;
         finish_if_idle(&mut primary.lane).await?;
         if !primary.lane.in_read_transaction {
-            return discard_after(&primary.lane.session, sql, caps).await;
+            return discard_after(primary.lane.conn.client(), sql, caps).await;
         }
         drop(primary);
         let mut slot = self.secondary.lock().await;
@@ -931,30 +1104,42 @@ impl Engine {
                 state: "open on both connections; close a cursor or let it expire first".to_owned(),
             });
         }
-        discard_after(&lane.session, sql, caps).await
+        discard_after(lane.conn.client(), sql, caps).await
     }
 
     pub async fn release_everything(&self) -> Result<()> {
         {
             let mut primary = self.primary.lock().await;
             if let Some(handle) = primary.write.take() {
-                if !primary.lane.session.client.is_closed() {
-                    let _ = primary.lane.session.client.batch_execute("ROLLBACK").await;
+                if !primary.lane.conn.client().is_closed() {
+                    let _ = primary.lane.conn.client().batch_execute("ROLLBACK").await;
                 }
                 primary.closed.insert(handle.id, HandleState::RolledBack);
             }
-            if primary.lane.session.client.is_closed() {
+            if primary.lane.conn.client().is_closed() {
                 primary.lane.forget_state();
             } else {
                 rollback_all(&mut primary.lane).await?;
             }
         }
         if let Some(lane) = self.secondary.lock().await.as_mut() {
-            if lane.session.client.is_closed() {
+            if lane.conn.client().is_closed() {
                 lane.forget_state();
             } else {
                 rollback_all(lane).await?;
             }
+        }
+        let mut pinned = self.pinned.lock().await;
+        for lane in pinned.iter_mut() {
+            if lane.conn.client().is_closed() {
+                lane.forget_state();
+            } else {
+                let _ = rollback_all(lane).await;
+            }
+        }
+        pinned.clear();
+        if let Some(pool) = &self.pool {
+            pool.close();
         }
         Ok(())
     }
@@ -971,12 +1156,11 @@ fn summaries(lane: &Lane, now: Instant) -> Vec<CursorSummary> {
 }
 
 async fn query_rows(
-    session: &Session,
+    client: &tokio_postgres::Client,
     sql: &str,
     params: &[&(dyn ToSql + Sync)],
 ) -> Result<Vec<tokio_postgres::Row>> {
-    let stream = session
-        .client
+    let stream = client
         .query_raw(sql, params.iter().copied())
         .await
         .map_err(|error| describe_sqlstate(&error))?;
@@ -1004,7 +1188,7 @@ async fn read_on_lane(
     let outcome = if is_select && lane.cursors.len() < CURSOR_CAP {
         read_through_cursor(lane, sql, caps, expiry).await
     } else {
-        guarded_statement(&lane.session, sql, caps).await
+        guarded_statement(lane.conn.client(), sql, caps).await
     };
     match outcome {
         Ok(result) => {
@@ -1012,7 +1196,7 @@ async fn read_on_lane(
             Ok(result)
         }
         Err(error) => {
-            if lane.session.client.is_closed() {
+            if lane.conn.client().is_closed() {
                 lane.forget_state();
             } else {
                 let _ = finish_if_idle(lane).await;
@@ -1038,7 +1222,7 @@ async fn fetch_on_lane(
     let columns = cursor.columns.clone();
     let estimate = cursor.estimate;
     let mut pending = std::mem::take(&mut cursor.pending);
-    let page = page_from_cursor(&lane.session, &name, &mut pending, columns, caps).await;
+    let page = page_from_cursor(lane.conn.client(), &name, &mut pending, columns, caps).await;
     let (collector, more) = match page {
         Ok(page) => page,
         Err(error) => {
@@ -1065,7 +1249,7 @@ async fn read_through_cursor(
     caps: Caps,
     expiry: Duration,
 ) -> Result<ResultSet> {
-    let client = &lane.session.client;
+    let client = &lane.conn.client();
     client
         .batch_execute(&format!("SAVEPOINT {SAVEPOINT}"))
         .await
@@ -1098,7 +1282,14 @@ async fn read_through_cursor(
         return Err(describe_sqlstate(&error));
     }
     let mut pending = VecDeque::new();
-    let page = page_from_cursor(&lane.session, &name, &mut pending, columns.clone(), caps).await;
+    let page = page_from_cursor(
+        lane.conn.client(),
+        &name,
+        &mut pending,
+        columns.clone(),
+        caps,
+    )
+    .await;
     let (collector, more) = match page {
         Ok(page) => page,
         Err(error) => {
@@ -1141,8 +1332,8 @@ async fn begin_read(lane: &mut Lane) -> Result<()> {
     if lane.in_read_transaction {
         return Ok(());
     }
-    lane.session
-        .client
+    lane.conn
+        .client()
         .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY")
         .await
         .map_err(|error| describe_sqlstate(&error))?;
@@ -1162,8 +1353,8 @@ async fn rollback_all(lane: &mut Lane) -> Result<()> {
     lane.cursors.clear();
     if lane.in_read_transaction {
         lane.in_read_transaction = false;
-        lane.session
-            .client
+        lane.conn
+            .client()
             .batch_execute("ROLLBACK")
             .await
             .map_err(|error| describe_sqlstate(&error))?;
@@ -1181,8 +1372,8 @@ async fn finish_if_idle(lane: &mut Lane) -> Result<()> {
 async fn close_cursor_now(lane: &mut Lane, id: &str) -> Result<()> {
     if let Some(cursor) = lane.cursors.remove(id) {
         let closed = lane
-            .session
-            .client
+            .conn
+            .client()
             .batch_execute(&format!("CLOSE {}", cursor.name))
             .await;
         if let Err(error) = closed {
@@ -1208,12 +1399,11 @@ async fn sweep_expired(lane: &mut Lane) -> Result<usize> {
 }
 
 async fn fetch_rows(
-    session: &Session,
+    client: &tokio_postgres::Client,
     cursor: &str,
     count: usize,
 ) -> Result<Vec<SimpleQueryMessage>> {
-    session
-        .client
+    client
         .simple_query(&format!("FETCH FORWARD {count} FROM {cursor}"))
         .await
         .map_err(|error| describe_sqlstate(&error))
@@ -1259,8 +1449,11 @@ fn collect_messages(messages: Vec<SimpleQueryMessage>, caps: Caps) -> ResultSet 
     result
 }
 
-async fn guarded_statement(session: &Session, sql: &str, caps: Caps) -> Result<ResultSet> {
-    let client = &session.client;
+async fn guarded_statement(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    caps: Caps,
+) -> Result<ResultSet> {
     client
         .batch_execute(&format!("SAVEPOINT {SAVEPOINT}"))
         .await
@@ -1280,7 +1473,7 @@ async fn guarded_statement(session: &Session, sql: &str, caps: Caps) -> Result<R
 }
 
 async fn timed<F, Fut>(
-    session: &Session,
+    client: &tokio_postgres::Client,
     timeout: Option<Duration>,
     local: bool,
     run: F,
@@ -1293,8 +1486,7 @@ where
         return run().await;
     };
     let scope = if local { "SET LOCAL" } else { "SET" };
-    session
-        .client
+    client
         .batch_execute(&format!(
             "{scope} statement_timeout = '{}ms'",
             timeout.as_millis()
@@ -1302,11 +1494,8 @@ where
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     let result = run().await;
-    if !local && !session.client.is_closed() {
-        let reset = session
-            .client
-            .batch_execute("RESET statement_timeout")
-            .await;
+    if !local && !client.is_closed() {
+        let reset = client.batch_execute("RESET statement_timeout").await;
         if let Err(error) = reset {
             tracing::warn!(%error, "statement_timeout could not be reset");
         }
@@ -1314,25 +1503,31 @@ where
     result
 }
 
-async fn autocommit_statement(session: &Session, sql: &str, caps: Caps) -> Result<ResultSet> {
-    let messages = session
-        .client
+async fn autocommit_statement(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    caps: Caps,
+) -> Result<ResultSet> {
+    let messages = client
         .simple_query(sql)
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     Ok(collect_messages(messages, caps))
 }
 
-async fn discard_after(session: &Session, sql: &str, caps: Caps) -> Result<ResultSet> {
-    session
-        .client
+async fn discard_after(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    caps: Caps,
+) -> Result<ResultSet> {
+    client
         .batch_execute("BEGIN")
         .await
         .map_err(|error| describe_sqlstate(&error))?;
-    let result = guarded_statement(session, sql, caps).await;
-    let rolled_back = session.client.batch_execute("ROLLBACK").await;
+    let result = guarded_statement(client, sql, caps).await;
+    let rolled_back = client.batch_execute("ROLLBACK").await;
     if let Err(error) = rolled_back
-        && !session.client.is_closed()
+        && !client.is_closed()
     {
         return Err(describe_sqlstate(&error));
     }
@@ -1340,7 +1535,7 @@ async fn discard_after(session: &Session, sql: &str, caps: Caps) -> Result<Resul
 }
 
 async fn page_from_cursor(
-    session: &Session,
+    client: &tokio_postgres::Client,
     cursor: &str,
     pending: &mut VecDeque<Vec<Option<String>>>,
     columns: Vec<Column>,
@@ -1350,7 +1545,7 @@ async fn page_from_cursor(
     let mut exhausted = false;
     while pending.len() < wanted && !exhausted {
         let requested = wanted - pending.len();
-        let batch = fetch_rows(session, cursor, requested).await?;
+        let batch = fetch_rows(client, cursor, requested).await?;
         let mut received = 0usize;
         for message in batch {
             if let SimpleQueryMessage::Row(row) = message {

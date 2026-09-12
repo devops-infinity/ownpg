@@ -1,3 +1,4 @@
+pub mod http;
 pub mod prompts;
 pub mod resources;
 pub mod stdio;
@@ -36,6 +37,7 @@ pub const WEBSITE_URL: &str = "https://github.com/devops-infinity/ownpg-releases
 pub struct Principal {
     pub name: String,
     pub kind: PrincipalKind,
+    pub scopes: Option<Vec<String>>,
 }
 
 impl Principal {
@@ -45,12 +47,30 @@ impl Principal {
             Some(user) if !user.is_empty() => Self {
                 name: user.to_owned(),
                 kind: PrincipalKind::OsUser,
+                scopes: None,
             },
             _ => Self {
                 name: "local".to_owned(),
                 kind: PrincipalKind::Local,
+                scopes: None,
             },
         }
+    }
+
+    #[must_use]
+    pub fn from_token(name: String, kind: PrincipalKind, scopes: Vec<String>) -> Self {
+        Self {
+            name,
+            kind,
+            scopes: Some(scopes),
+        }
+    }
+
+    #[must_use]
+    pub fn allows(&self, scope: &str) -> bool {
+        self.scopes
+            .as_ref()
+            .is_none_or(|scopes| scopes.iter().any(|held| held == scope))
     }
 }
 
@@ -61,6 +81,7 @@ pub struct RoundTrip {
     pub elicitation: bool,
     pub progress: Option<tools::Progress>,
     pub legacy_peer: Option<Peer<RoleServer>>,
+    pub principal: Option<Principal>,
 }
 
 pub struct Server {
@@ -108,11 +129,17 @@ impl Server {
             .enumerate()
             .map(|(position, route)| (route.spec.name, position))
             .collect();
+        let gate = match &settings.http.state_key_file {
+            Some(path) if transport == Transport::Http => {
+                tools::confirm::Gate::from_key_file(&path.value)?
+            }
+            _ => tools::confirm::Gate::new(),
+        };
         let context = Context {
             engine,
             transport,
             audit_path: audit.path().map(std::path::Path::to_path_buf),
-            gate: Arc::new(tools::confirm::Gate::new()),
+            gate: Arc::new(gate),
         };
         let info = build_info(&settings, &routes, context.engine.features().as_map());
         Ok(Self {
@@ -144,6 +171,16 @@ impl Server {
             .and_then(|position| self.routes.get(*position))
     }
 
+    #[must_use]
+    pub fn principal_for(&self, context: &RequestContext<RoleServer>) -> Principal {
+        context
+            .extensions
+            .get::<::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Principal>())
+            .cloned()
+            .unwrap_or_else(|| self.principal.clone())
+    }
+
     pub async fn call(
         &self,
         name: &str,
@@ -154,10 +191,22 @@ impl Server {
     ) -> Option<Outcome> {
         let route = self.route(name)?;
         let started = Instant::now();
+        let principal = round_trip
+            .principal
+            .clone()
+            .unwrap_or_else(|| self.principal.clone());
+        if !principal.allows(route.spec.scope) {
+            let outcome: Outcome = Err(crate::error::Error::ScopeInsufficient {
+                scope: route.spec.scope.to_owned(),
+            }
+            .into());
+            self.record(name, &outcome, request_id, started.elapsed(), &principal);
+            return Some(outcome);
+        }
         let call = Call {
             context: self.context.clone(),
             arguments,
-            principal: self.principal.name.clone(),
+            principal: principal.name.clone(),
             request_state: round_trip.request_state,
             input_responses: round_trip.input_responses,
             elicitation: round_trip.elicitation,
@@ -175,7 +224,7 @@ impl Server {
                 work.await
             }
         };
-        self.record(name, &outcome, request_id, started.elapsed());
+        self.record(name, &outcome, request_id, started.elapsed(), &principal);
         if route.spec.group == Some(ToolGroup::Ddl)
             && let Ok(Reply::Output(output)) = &outcome
             && output.facts.decision != Some(Decision::DryRun)
@@ -231,7 +280,14 @@ impl Server {
         }
     }
 
-    fn record(&self, tool: &str, outcome: &Outcome, request_id: String, duration: Duration) {
+    fn record(
+        &self,
+        tool: &str,
+        outcome: &Outcome,
+        request_id: String,
+        duration: Duration,
+        principal: &Principal,
+    ) {
         let settings = self.context.settings();
         let (facts, decision, rule, result) = match outcome {
             Ok(Reply::Output(output)) => (
@@ -263,8 +319,8 @@ impl Server {
             operation: facts.operation.clone(),
             mode: settings.mode.value,
             transport: self.context.transport,
-            principal: self.principal.name.clone(),
-            principal_kind: self.principal.kind,
+            principal: principal.name.clone(),
+            principal_kind: principal.kind,
             database: settings.database.value.clone(),
             schema: settings.schema.value.clone(),
             statement_class: facts.statement_class.clone(),
@@ -420,6 +476,7 @@ impl ServerHandler for Server {
             elicitation,
             progress,
             legacy_peer,
+            principal: Some(self.principal_for(&context)),
         };
         let outcome = self
             .call(&name, arguments, request_id, context.ct.clone(), round_trip)

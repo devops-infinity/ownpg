@@ -118,7 +118,20 @@ pub(crate) fn flag_layer(
         audit_path: serve.and_then(|serve| serve.audit_path.clone()),
         pg_bindir: serve.and_then(|serve| serve.pg_bindir.clone()),
         output_dir: serve.and_then(|serve| serve.output_dir.clone()),
+        http: ownpg_core::config::HttpFlags {
+            enabled: serve.is_some_and(|serve| serve.http),
+            bind: serve.and_then(|serve| serve.bind.clone()),
+            auth: serve.and_then(|serve| serve.auth.map(auth_of)),
+        },
     })
+}
+
+pub(crate) const fn auth_of(auth: crate::cli::AuthArg) -> ownpg_core::config::AuthMode {
+    match auth {
+        crate::cli::AuthArg::None => ownpg_core::config::AuthMode::None,
+        crate::cli::AuthArg::Bearer => ownpg_core::config::AuthMode::Bearer,
+        crate::cli::AuthArg::Oauth => ownpg_core::config::AuthMode::Oauth,
+    }
 }
 
 pub(crate) const fn mode_of(mode: ModeArg) -> Mode {

@@ -195,7 +195,8 @@ impl ToolFailure {
         match self.0.error {
             Error::StatementRefused { .. }
             | Error::RoleRefused { .. }
-            | Error::ConfirmationRequired { .. } => Decision::Refused,
+            | Error::ConfirmationRequired { .. }
+            | Error::ScopeInsufficient { .. } => Decision::Refused,
             _ => Decision::Allowed,
         }
     }
@@ -209,6 +210,7 @@ impl ToolFailure {
                 Some(format!("{operation} needs confirmation"))
             }
             Error::ArgumentInvalid { argument, .. } => Some(format!("argument `{argument}`")),
+            Error::ScopeInsufficient { scope } => Some(format!("token lacks scope {scope}")),
             _ => None,
         }
     }

@@ -43,9 +43,30 @@ impl Gate {
     #[must_use]
     pub fn new() -> Self {
         let key: [u8; 32] = rand::random();
+        Self::with_key(&key)
+    }
+
+    #[must_use]
+    pub fn with_key(key: &[u8]) -> Self {
         Self {
             codec: RequestStateCodec::new_unchecked(key.to_vec()),
         }
+    }
+
+    pub fn from_key_file(path: &std::path::Path) -> Result<Self, Error> {
+        crate::config::profile::refuse_open_permissions(path)?;
+        let bytes = std::fs::read(path).map_err(|source| Error::ConfigUnreadable {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if bytes.len() < 32 {
+            return Err(Error::ConfigInvalid {
+                setting: "http.state_key_file".to_owned(),
+                value: path.display().to_string(),
+                detail: "the key file needs at least 32 bytes".to_owned(),
+            });
+        }
+        Ok(Self::with_key(&bytes))
     }
 
     pub fn seal(&self, pending: &Pending) -> Result<String, Error> {

@@ -94,6 +94,8 @@ pub struct ProfileEntry {
     pub no_input: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<super::http::HttpEntry>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

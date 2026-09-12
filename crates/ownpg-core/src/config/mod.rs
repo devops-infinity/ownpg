@@ -1,5 +1,6 @@
 pub mod describe;
 pub mod environment;
+pub mod http;
 pub mod libpq;
 pub mod presets;
 pub mod profile;
@@ -13,6 +14,9 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 pub use environment::Environment;
+pub use http::{
+    AuthMode, AuthSettings, HttpEntry, HttpFlags, HttpSettings, MCP_PATH, OauthSettings,
+};
 pub use resolve::{
     FlagLayer, KeychainLookup, Sources, SshTarget, Warning, parse_ssh_target, parse_tool_groups,
     resolve,
@@ -430,6 +434,7 @@ pub struct Settings {
     pub pg_bindir: Option<Resolved<PathBuf>>,
     pub output_dir: Option<Resolved<PathBuf>>,
     pub no_input: Resolved<bool>,
+    pub http: HttpSettings,
     pub paths: AppPaths,
 }
 

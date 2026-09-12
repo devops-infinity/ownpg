@@ -34,6 +34,7 @@ pub struct FlagLayer {
     pub audit_path: Option<PathBuf>,
     pub pg_bindir: Option<PathBuf>,
     pub output_dir: Option<PathBuf>,
+    pub http: super::http::HttpFlags,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,6 +545,7 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
     )
     .resolve();
 
+    let http = super::http::resolve_http(&flags.http, env, profile.http.as_ref(), mode.value)?;
     let settings = Settings {
         profile: profile_name,
         mode,
@@ -575,6 +577,7 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
         pg_bindir,
         output_dir,
         no_input,
+        http,
         paths: sources.paths,
     };
     Ok((settings, warnings))

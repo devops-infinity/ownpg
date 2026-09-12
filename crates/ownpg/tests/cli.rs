@@ -145,16 +145,42 @@ fn no_command_means_serve_and_a_missing_database_is_a_usage_error() {
 }
 
 #[test]
-fn the_http_transport_is_refused_in_this_build() {
+fn a_public_http_bind_without_authentication_is_refused_before_connecting() {
     let home = Home::new();
     let mut command = ownpg();
     home.apply(&mut command);
     command
-        .args(["serve", "--http", "-d", "app"])
+        .args([
+            "serve",
+            "--http",
+            "--bind",
+            "0.0.0.0:0",
+            "--auth",
+            "none",
+            "-d",
+            "app",
+        ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("--http"))
-        .stderr(predicate::str::contains("code: argument.invalid"));
+        .stderr(predicate::str::contains("--auth"))
+        .stderr(predicate::str::contains("code: config.invalid"));
+    let mut bearer = ownpg();
+    home.apply(&mut bearer);
+    bearer
+        .args([
+            "serve",
+            "--http",
+            "--bind",
+            "0.0.0.0:0",
+            "--auth",
+            "bearer",
+            "-d",
+            "app",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("OWNPG_BEARER_TOKENS"))
+        .stderr(predicate::str::contains("code: config.invalid"));
 }
 
 #[test]

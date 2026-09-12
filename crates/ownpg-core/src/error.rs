@@ -58,6 +58,7 @@ pub enum ErrorId {
     SubprocessFailed,
     ArgumentInvalid,
     ConfirmationRequired,
+    ScopeInsufficient,
 }
 
 impl ErrorId {
@@ -93,6 +94,7 @@ impl ErrorId {
             Self::SubprocessFailed => "subprocess.failed",
             Self::ArgumentInvalid => "argument.invalid",
             Self::ConfirmationRequired => "confirmation.required",
+            Self::ScopeInsufficient => "scope.insufficient",
         }
     }
 }
@@ -241,6 +243,9 @@ pub enum Error {
 
     #[error("this operation changes or removes data and needs a confirmation")]
     ConfirmationRequired { operation: String },
+
+    #[error("the token does not carry the `{scope}` scope this tool needs")]
+    ScopeInsufficient { scope: String },
 }
 
 impl Error {
@@ -276,6 +281,7 @@ impl Error {
             Self::SubprocessFailed { .. } => ErrorId::SubprocessFailed,
             Self::ArgumentInvalid { .. } => ErrorId::ArgumentInvalid,
             Self::ConfirmationRequired { .. } => ErrorId::ConfirmationRequired,
+            Self::ScopeInsufficient { .. } => ErrorId::ScopeInsufficient,
         }
     }
 
@@ -304,7 +310,8 @@ impl Error {
             | Self::StatementRefused { .. }
             | Self::RoleRefused { .. }
             | Self::SshHostKeyUnknown { .. }
-            | Self::ConfirmationRequired { .. } => ExitClass::Refused,
+            | Self::ConfirmationRequired { .. }
+            | Self::ScopeInsufficient { .. } => ExitClass::Refused,
             Self::ConnectFailed { .. }
             | Self::TlsFailed { .. }
             | Self::SshFailed { .. }
@@ -423,6 +430,9 @@ impl Error {
             }
             Self::ConfirmationRequired { operation } => {
                 format!("Call again with `confirm: true` to run `{operation}`, or with `dry_run: true` to see the SQL first.")
+            }
+            Self::ScopeInsufficient { scope } => {
+                format!("Ask the identity provider for a token that carries the `{scope}` scope, or use a bearer token bound to a mode that allows this tool.")
             }
         }
     }
@@ -550,6 +560,9 @@ mod tests {
             Error::ConfirmationRequired {
                 operation: "DROP TABLE".to_owned(),
             },
+            Error::ScopeInsufficient {
+                scope: "ownpg:write".to_owned(),
+            },
         ]
     }
 
@@ -624,7 +637,8 @@ mod tests {
                 | ErrorId::StatementRefused
                 | ErrorId::RoleRefused
                 | ErrorId::SshHostKeyUnknown
-                | ErrorId::ConfirmationRequired => ExitClass::Refused,
+                | ErrorId::ConfirmationRequired
+                | ErrorId::ScopeInsufficient => ExitClass::Refused,
                 ErrorId::ConnectFailed
                 | ErrorId::TlsFailed
                 | ErrorId::SshFailed

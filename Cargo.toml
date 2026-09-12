@@ -43,6 +43,16 @@ sha2 = "0.11.0"
 time = { version = "0.3.55", features = ["formatting", "std"] }
 rand = "0.10.2"
 ssh-key = { version = "0.7.0-rc.11", default-features = false, features = ["ed25519", "std", "rand_core"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+governor = "0.10.4"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "system-proxy"] }
+deadpool = { version = "0.13.1", default-features = false, features = ["managed", "rt_tokio_1"] }
+base64 = "0.23.1"
+ring = "0.17.14"
+subtle = "2.6.1"
+http = "1.5.0"
+url = "2.5.8"
+http-body-util = "0.1.5"
 rmcp = { version = "3.3.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server", "elicitation", "request-state", "schemars"] }
 schemars = "1.2.2"
 tokio-util = { version = "0.7.19", default-features = false }

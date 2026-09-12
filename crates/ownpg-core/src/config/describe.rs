@@ -181,6 +181,68 @@ pub fn describe(settings: &Settings) -> Vec<SettingLine> {
         settings.output_dir.as_ref(),
     ));
     lines.push(SettingLine::resolved("no_input", &settings.no_input));
+    let http = &settings.http;
+    lines.push(SettingLine::resolved("http.bind", &http.bind));
+    lines.push(SettingLine::resolved("http.public_url", &http.public_url));
+    lines.push(SettingLine::new(
+        "http.allowed_hosts",
+        http.allowed_hosts.value.join(","),
+        http.allowed_hosts.origin,
+    ));
+    lines.push(SettingLine::new(
+        "http.allowed_origins",
+        http.allowed_origins.value.join(","),
+        http.allowed_origins.origin,
+    ));
+    lines.push(SettingLine::resolved("http.body_cap_bytes", &http.body_cap));
+    lines.push(SettingLine::resolved(
+        "http.rate_limit_per_minute",
+        &http.rate_limit_per_minute,
+    ));
+    lines.push(SettingLine::resolved(
+        "http.legacy_session_mode",
+        &http.legacy_session_mode,
+    ));
+    lines.push(SettingLine::duration("http.shutdown", &http.shutdown));
+    lines.push(SettingLine::resolved("http.pool_size", &http.pool_size));
+    lines.push(SettingLine::new(
+        "http.auth",
+        http.auth.mode().as_str(),
+        http.auth_origin,
+    ));
+    match &http.auth {
+        crate::config::AuthSettings::Bearer {
+            tokens_file,
+            tokens_from_environment,
+        } => {
+            lines.push(SettingLine::path("http.tokens_file", tokens_file.as_ref()));
+            lines.push(SettingLine::new(
+                "http.tokens_from_environment",
+                tokens_from_environment.to_string(),
+                Origin::Environment,
+            ));
+        }
+        crate::config::AuthSettings::Oauth(oauth) => {
+            lines.push(SettingLine::resolved("http.oauth_issuer", &oauth.issuer));
+            lines.push(SettingLine::resolved(
+                "http.oauth_jwks_url",
+                &oauth.jwks_url,
+            ));
+            lines.push(SettingLine::resolved(
+                "http.oauth_audience",
+                &oauth.audience,
+            ));
+        }
+        crate::config::AuthSettings::None => {}
+    }
+    lines.push(SettingLine::path(
+        "http.state_key_file",
+        http.state_key_file.as_ref(),
+    ));
+    lines.push(SettingLine::optional(
+        "http.otel_endpoint",
+        http.otel_endpoint.as_ref(),
+    ));
     lines.push(SettingLine::new(
         "config_file",
         display(&settings.paths.config_file),
