@@ -2,6 +2,14 @@
     dead_code,
     reason = "each integration test binary uses the subset of helpers it needs"
 )]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::print_stderr,
+    clippy::indexing_slicing,
+    reason = "clippy.toml exempts test modules, and an integration test is a separate crate it cannot reach"
+)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

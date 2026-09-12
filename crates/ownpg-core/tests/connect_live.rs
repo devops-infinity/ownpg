@@ -1,3 +1,12 @@
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::print_stderr,
+    clippy::indexing_slicing,
+    reason = "clippy.toml exempts test modules, and an integration test is a separate crate it cannot reach"
+)]
+
 mod support;
 
 use ownpg_core::config::FlagLayer;
@@ -64,10 +73,8 @@ async fn a_running_statement_can_be_cancelled_from_another_task() {
         .await
         .expect("the scratch database connects");
     let cancel = session.cancel.clone();
-    let sleeper = tokio::spawn({
-        let client_task = async move { session.client.batch_execute("SELECT pg_sleep(10)").await };
-        client_task
-    });
+    let sleeper =
+        tokio::spawn(async move { session.client.batch_execute("SELECT pg_sleep(10)").await });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let tls = ownpg_core::connect::tls::build(
         &scratch.settings(FlagLayer::default()).connection,
