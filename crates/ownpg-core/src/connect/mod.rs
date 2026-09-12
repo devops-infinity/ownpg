@@ -1,4 +1,5 @@
 pub mod role;
+pub mod ssh;
 pub mod tls;
 
 use std::fmt;
@@ -92,6 +93,7 @@ pub struct Session {
     pub info: SessionInfo,
     tls: Arc<Tls>,
     driver: tokio::task::JoinHandle<()>,
+    keep: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 impl fmt::Debug for Session {
@@ -130,6 +132,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 #[derive(Clone)]
 pub struct Connector {
     settings: Arc<Settings>,
+    ssh_hints: ssh::Hints,
 }
 
 impl fmt::Debug for Connector {
@@ -141,7 +144,16 @@ impl fmt::Debug for Connector {
 impl Connector {
     #[must_use]
     pub fn new(settings: Arc<Settings>) -> Self {
-        Self { settings }
+        Self {
+            settings,
+            ssh_hints: ssh::Hints::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_ssh_hints(mut self, hints: ssh::Hints) -> Self {
+        self.ssh_hints = hints;
+        self
     }
 
     #[must_use]
@@ -266,6 +278,9 @@ impl Connector {
     }
 
     pub async fn connect(&self) -> Result<Session> {
+        if let Some(ssh) = &self.settings.ssh {
+            return self.connect_through_ssh(ssh).await;
+        }
         let candidates = self.candidates();
         let mut attempts = Vec::new();
         let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
@@ -342,6 +357,35 @@ impl Connector {
         };
         self.finish(client, driver, tls, candidate.endpoint.to_string(), via)
             .await
+    }
+
+    async fn connect_through_ssh(&self, ssh: &crate::config::SshSettings) -> Result<Session> {
+        let candidate = self
+            .candidates()
+            .into_iter()
+            .find(|candidate| !candidate.endpoint.is_socket())
+            .ok_or_else(|| Error::SshFailed {
+                host: ssh.host.value.clone(),
+                detail: "a tunnel needs a TCP host and port on the far side; a socket directory cannot be forwarded".to_owned(),
+                source: None,
+            })?;
+        let Endpoint::Tcp {
+            host: target_host,
+            port: target_port,
+        } = candidate.endpoint
+        else {
+            return Err(Error::SshFailed {
+                host: ssh.host.value.clone(),
+                detail: "a tunnel needs a TCP host and port on the far side".to_owned(),
+                source: None,
+            });
+        };
+        let tunnel = ssh::open(ssh, &target_host, target_port, &self.ssh_hints).await?;
+        let (stream, route, keep) = tunnel.into_parts();
+        let target_name = format!("{target_host}:{target_port} via {}", route.join(" -> "));
+        let mut session = self.connect_over(stream, &target_name, Via::Ssh).await?;
+        session.keep = keep;
+        Ok(session)
     }
 
     pub async fn connect_over<S>(&self, stream: S, target_name: &str, via: Via) -> Result<Session>
@@ -457,6 +501,7 @@ impl Connector {
             },
             tls: Arc::clone(tls),
             driver,
+            keep: Vec::new(),
         })
     }
 }
