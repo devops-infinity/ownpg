@@ -1,0 +1,5 @@
+---
+source: crates/ownpg-core/tests/ddl_live.rs
+expression: create
+---
+CREATE TABLE "app"."customers" ("id" bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "email" text NOT NULL UNIQUE, "created_at" timestamptz DEFAULT now() NOT NULL, "score" integer CHECK (score >= 0))

@@ -80,6 +80,11 @@ impl Features {
     }
 
     #[must_use]
+    pub const fn security_invoker(self) -> bool {
+        self.server_version_num >= 150_000
+    }
+
+    #[must_use]
     pub fn as_map(self) -> BTreeMap<&'static str, bool> {
         BTreeMap::from([
             ("pg_stat_io", self.stat_io()),

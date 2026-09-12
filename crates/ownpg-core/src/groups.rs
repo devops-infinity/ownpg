@@ -138,6 +138,60 @@ pub const PG_TRANSACTION: ToolSpec = write_tool(
     false,
 );
 
+const fn ddl_tool(name: &'static str, title: &'static str) -> ToolSpec {
+    write_tool(name, title, ToolGroup::Ddl, true, false)
+}
+
+pub const PG_TABLE: ToolSpec = ddl_tool("pg_table", "Create, alter, or drop a table");
+pub const PG_COLUMN: ToolSpec = ddl_tool("pg_column", "Change a column");
+pub const PG_CONSTRAINT: ToolSpec = ddl_tool("pg_constraint", "Manage a constraint");
+pub const PG_INDEX: ToolSpec = ddl_tool("pg_index", "Create, drop, or rebuild an index");
+pub const PG_VIEW: ToolSpec = ddl_tool("pg_view", "Create, drop, or refresh a view");
+pub const PG_SEQUENCE: ToolSpec = ddl_tool("pg_sequence", "Create, alter, or drop a sequence");
+pub const PG_ROUTINE: ToolSpec = ddl_tool(
+    "pg_routine",
+    "Create, alter, or drop a function or procedure",
+);
+pub const PG_TRIGGER: ToolSpec = ddl_tool("pg_trigger", "Create, drop, or toggle a trigger");
+pub const PG_TYPE: ToolSpec = ddl_tool("pg_type", "Create, alter, or drop a type");
+pub const PG_EXTENSION: ToolSpec =
+    ddl_tool("pg_extension", "Install, update, or drop an extension");
+pub const PG_COMMENT: ToolSpec = write_tool(
+    "pg_comment",
+    "Set or remove a comment",
+    ToolGroup::Ddl,
+    false,
+    true,
+);
+pub const PG_ROLE: ToolSpec = write_tool(
+    "pg_role",
+    "Create, alter, or drop a role",
+    ToolGroup::Roles,
+    true,
+    false,
+);
+pub const PG_GRANT: ToolSpec = write_tool(
+    "pg_grant",
+    "Grant or revoke privileges",
+    ToolGroup::Roles,
+    true,
+    true,
+);
+pub const PG_POLICY: ToolSpec = write_tool(
+    "pg_policy",
+    "Manage row-level security",
+    ToolGroup::Roles,
+    true,
+    false,
+);
+pub const PG_PRIVILEGES: ToolSpec = write_tool(
+    "pg_privileges",
+    "List privileges or apply a template",
+    ToolGroup::Roles,
+    false,
+    true,
+);
+
 pub const TOOLS: &[ToolSpec] = &[
     PG_LIST_OBJECTS,
     PG_DESCRIBE,
@@ -153,6 +207,21 @@ pub const TOOLS: &[ToolSpec] = &[
     PG_RUN_WRITE,
     PG_COPY,
     PG_TRANSACTION,
+    PG_TABLE,
+    PG_COLUMN,
+    PG_CONSTRAINT,
+    PG_INDEX,
+    PG_VIEW,
+    PG_SEQUENCE,
+    PG_ROUTINE,
+    PG_TRIGGER,
+    PG_TYPE,
+    PG_EXTENSION,
+    PG_COMMENT,
+    PG_ROLE,
+    PG_GRANT,
+    PG_POLICY,
+    PG_PRIVILEGES,
 ];
 
 #[must_use]
