@@ -206,7 +206,16 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
     assert!(arguments.contains(&file_argument.as_str()), "{arguments:?}");
     assert!(!rig.output_dir.join("app.dump").exists());
 
-    for bad in ["../escape", ".hidden", "a b", ""] {
+    for bad in [
+        "../escape",
+        ".hidden",
+        "a b",
+        "",
+        "con",
+        "NUL.dump",
+        "trailing.",
+        "x.ownpg-partial",
+    ] {
         let failure = rig.failed("pg_dump", json!({"file": bad})).await;
         assert_eq!(failure["code"], "argument.invalid", "{bad:?}: {failure}");
     }
@@ -271,8 +280,15 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
     assert_eq!(dumped["exit_code"], 0, "{dumped}");
     let dump_file = rig.output_dir.join("app.dump");
     assert!(dumped["output_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(dumped["output"], dump_file.display().to_string());
+    assert!(!rig.output_dir.join("app.dump.ownpg-partial").exists());
     #[cfg(unix)]
     assert_eq!(permission_bits(&dump_file), 0o600);
+    let repeat = rig
+        .failed("pg_dump", json!({"file": "app.dump", "format": "custom"}))
+        .await;
+    assert_eq!(repeat["code"], "argument.invalid", "{repeat}");
+    assert!(dump_file.metadata().unwrap().len() > 0);
 
     let plain = rig
         .ok(

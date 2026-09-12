@@ -77,16 +77,33 @@ pub fn find_program(settings: &Settings, name: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
+const FORWARDED_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "PGCLIENTENCODING",
+    "PGTZ",
+    "PGDATESTYLE",
+    "PGGEQO",
+    "PGSYSCONFDIR",
+    "PGLOCALEDIR",
+    "PGSSLNEGOTIATION",
+    "PGSSLSNI",
+    "PGSSLCERTMODE",
+    "PGSSLCRL",
+    "PGSSLCRLDIR",
+    "PGGSSENCMODE",
+    "PGREQUIREPEER",
+    "PGTARGETSESSIONATTRS",
+];
+
 fn base_command(program: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(program);
     command.env_clear();
-    for key in ["PATH", "HOME", "SYSTEMROOT", "TEMP", "TMP"] {
+    for key in FORWARDED_ENVIRONMENT {
         if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
-    for (key, value) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("PG") {
             command.env(key, value);
         }
     }
@@ -199,8 +216,15 @@ async fn connection_env(call: &Call) -> Result<ConnectionEnv> {
     }
     let mut passfile = None;
     if let Some(password) = &connection.password {
+        crate::config::profile::create_private_directory(&settings.paths.data_dir).map_err(
+            |error| Error::ConfigUnwritable {
+                path: settings.paths.data_dir.clone(),
+                source: error,
+            },
+        )?;
+        sweep_stale_passfiles(&settings.paths.data_dir);
         let mut file = tempfile::Builder::new()
-            .prefix("ownpg-pgpass-")
+            .prefix(PASSFILE_PREFIX)
             .tempfile_in(&settings.paths.data_dir)
             .map_err(|error| Error::ConfigUnwritable {
                 path: settings.paths.data_dir.clone(),
@@ -229,6 +253,30 @@ async fn connection_env(call: &Call) -> Result<ConnectionEnv> {
         vars,
         _passfile: passfile,
     })
+}
+
+const PASSFILE_PREFIX: &str = "ownpg-pgpass-";
+const STALE_PASSFILE_AGE: Duration = Duration::from_secs(86_400);
+
+pub fn sweep_stale_passfiles(data_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(PASSFILE_PREFIX) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_PASSFILE_AGE);
+        if stale && let Err(error) = std::fs::remove_file(entry.path()) {
+            tracing::debug!(%error, "a stale password file could not be removed");
+        }
+    }
 }
 
 fn restrict_file(path: &Path) -> Result<()> {
@@ -278,68 +326,151 @@ fn output_dir(call: &Call) -> Result<PathBuf> {
             detail: "output_dir must be an absolute path".to_owned(),
         });
     }
-    std::fs::create_dir_all(path).map_err(|error| Error::ConfigUnwritable {
-        path: path.clone(),
-        source: error,
+    crate::config::profile::create_private_directory(path).map_err(|error| {
+        Error::ConfigUnwritable {
+            path: path.clone(),
+            source: error,
+        }
     })?;
+    if let Some(mode) = writable_by_others(path)? {
+        return Err(Error::ConfigInvalid {
+            setting: "output_dir".to_owned(),
+            value: path.display().to_string(),
+            detail: format!(
+                "other users can write into the directory (mode {mode:o}); dumps go only into a directory that other users cannot change"
+            ),
+        });
+    }
     Ok(path.clone())
 }
 
+#[cfg(unix)]
+fn writable_by_others(path: &Path) -> Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).map_err(|source| Error::ConfigUnreadable {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mode = metadata.mode() & 0o777;
+    Ok((mode & 0o022 != 0).then_some(mode))
+}
+
+#[cfg(not(unix))]
+fn writable_by_others(_path: &Path) -> Result<Option<u32>> {
+    Ok(None)
+}
+
+const RESERVED_WINDOWS_STEMS: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
 fn output_name(argument: &str, value: &str) -> Result<String> {
     let name = value.trim();
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let valid = !name.is_empty()
         && name.len() <= 128
         && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !RESERVED_WINDOWS_STEMS.contains(&stem.as_str())
+        && !name.ends_with(PARTIAL_SUFFIX)
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !valid {
         return Err(Error::ArgumentInvalid {
             argument: argument.to_owned(),
-            detail: "use a plain file name of letters, digits, dots, underscores, and hyphens that does not start with a dot; it lands inside output_dir".to_owned(),
+            detail: "use a plain file name of letters, digits, dots, underscores, and hyphens that does not start or end with a dot and is not a reserved device name; it lands inside output_dir".to_owned(),
         });
     }
     Ok(name.to_owned())
 }
 
-fn prepared_file(dir: &Path, name: &str) -> Result<PathBuf> {
+const PARTIAL_SUFFIX: &str = ".ownpg-partial";
+
+fn refuse_existing(path: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Err(Error::ArgumentInvalid {
+            argument: "file".to_owned(),
+            detail: format!(
+                "{} already exists inside output_dir; choose another name, nothing is overwritten",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn staging_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}{PARTIAL_SUFFIX}"))
+}
+
+fn prepared_file(dir: &Path, name: &str) -> Result<(PathBuf, PathBuf)> {
     let path = dir.join(name);
+    refuse_existing(&path)?;
+    let staging = staging_path(dir, name);
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     options
-        .open(&path)
+        .open(&staging)
         .map_err(|error| Error::ConfigUnwritable {
-            path: path.clone(),
+            path: staging.clone(),
             source: error,
         })?;
-    restrict_file(&path)?;
-    Ok(path)
+    restrict_file(&staging)?;
+    Ok((path, staging))
 }
 
-fn prepared_directory(dir: &Path, name: &str) -> Result<PathBuf> {
+fn prepared_directory(dir: &Path, name: &str) -> Result<(PathBuf, PathBuf)> {
     let path = dir.join(name);
-    std::fs::create_dir_all(&path).map_err(|error| Error::ConfigUnwritable {
-        path: path.clone(),
+    refuse_existing(&path)?;
+    let staging = staging_path(dir, name);
+    std::fs::create_dir(&staging).map_err(|error| Error::ConfigUnwritable {
+        path: staging.clone(),
         source: error,
     })?;
-    restrict_directory(&path)?;
-    Ok(path)
+    restrict_directory(&staging)?;
+    Ok((path, staging))
 }
 
 fn existing_input(dir: &Path, name: &str) -> Result<PathBuf> {
     let path = dir.join(name);
-    if !path.exists() {
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| Error::ArgumentInvalid {
+        argument: "file".to_owned(),
+        detail: format!("{} does not exist inside output_dir", path.display()),
+    })?;
+    if metadata.file_type().is_symlink() {
         return Err(Error::ArgumentInvalid {
             argument: "file".to_owned(),
-            detail: format!("{} does not exist inside output_dir", path.display()),
+            detail: format!(
+                "{} is a symbolic link; restore reads only files that live inside output_dir",
+                path.display()
+            ),
         });
     }
     Ok(path)
+}
+
+fn discard_staging(staging: &Path, is_directory: bool) {
+    let outcome = if is_directory {
+        std::fs::remove_dir_all(staging)
+    } else {
+        std::fs::remove_file(staging)
+    };
+    if let Err(error) = outcome
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, path = %staging.display(), "the partial output could not be removed");
+    }
 }
 
 fn absolute_directory(argument: &str, value: &str) -> Result<PathBuf> {
@@ -463,6 +594,7 @@ struct Job {
     program: &'static str,
     arguments: Vec<String>,
     output: Option<PathBuf>,
+    staging: Option<PathBuf>,
     output_is_directory: bool,
     cwd: Option<PathBuf>,
     dry_run: bool,
@@ -484,6 +616,7 @@ fn synthetic_classification(
         relations: Vec::new(),
         functions: Vec::new(),
         fingerprint: sha256_hex(command.as_bytes()).chars().take(16).collect(),
+        statement_digest: sha256_hex(command.as_bytes()),
         normalized: command.to_owned(),
         runs_outside_transaction: true,
         explain_analyze: false,
@@ -517,7 +650,10 @@ async fn run_program(call: &Call, job: Job) -> Outcome {
         operation: Some(job.tool.to_owned()),
         statement_class: Some("host".to_owned()),
         statement_hash: Some(classification.fingerprint.clone()),
-        statement: Some(command.chars().take(200).collect()),
+        statement: Some(crate::shape::cut_graphemes(
+            &command,
+            crate::audit::SHORT_STATEMENT_CAP,
+        )),
         ..AuditFacts::default()
     };
     let output_text = job.output.as_ref().map(|path| path.display().to_string());
@@ -629,6 +765,24 @@ async fn run_program(call: &Call, job: Job) -> Outcome {
     };
     drop(env);
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let succeeded = status.as_ref().is_ok_and(std::process::ExitStatus::success);
+    if let Some(staging) = &job.staging {
+        if succeeded {
+            if let (Some(output), Err(error)) = (
+                &job.output,
+                std::fs::rename(staging, job.output.as_deref().unwrap_or(staging)),
+            ) {
+                discard_staging(staging, job.output_is_directory);
+                return Err(ToolFailure::from(Error::ConfigUnwritable {
+                    path: output.clone(),
+                    source: error,
+                })
+                .with_facts(facts));
+            }
+        } else {
+            discard_staging(staging, job.output_is_directory);
+        }
+    }
     let status = status.map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
     if !status.success() {
         let last = stderr_lines
@@ -810,14 +964,19 @@ pub fn dump(call: Call, args: DumpArgs) -> BoxFuture<'static, Outcome> {
         if call.progress.is_some() {
             arguments.push("--verbose".to_owned());
         }
-        let output = if args.dry_run {
-            dir.join(&name)
+        let (output, staging) = if args.dry_run {
+            (dir.join(&name), None)
         } else if args.format == DumpFormat::Directory {
-            prepared_directory(&dir, &name)?
+            let (output, staging) = prepared_directory(&dir, &name)?;
+            (output, Some(staging))
         } else {
-            prepared_file(&dir, &name)?
+            let (output, staging) = prepared_file(&dir, &name)?;
+            (output, Some(staging))
         };
-        arguments.push(format!("--file={}", output.display()));
+        arguments.push(format!(
+            "--file={}",
+            staging.as_deref().unwrap_or(&output).display()
+        ));
         run_program(
             &call,
             Job {
@@ -825,6 +984,7 @@ pub fn dump(call: Call, args: DumpArgs) -> BoxFuture<'static, Outcome> {
                 program: "pg_dump",
                 arguments,
                 output: Some(output),
+                staging,
                 output_is_directory: args.format == DumpFormat::Directory,
                 cwd: None,
                 dry_run: args.dry_run,
@@ -868,12 +1028,16 @@ pub fn dumpall_globals(call: Call, args: DumpallArgs) -> BoxFuture<'static, Outc
         if call.progress.is_some() {
             arguments.push("--verbose".to_owned());
         }
-        let output = if args.dry_run {
-            dir.join(&name)
+        let (output, staging) = if args.dry_run {
+            (dir.join(&name), None)
         } else {
-            prepared_file(&dir, &name)?
+            let (output, staging) = prepared_file(&dir, &name)?;
+            (output, Some(staging))
         };
-        arguments.push(format!("--file={}", output.display()));
+        arguments.push(format!(
+            "--file={}",
+            staging.as_deref().unwrap_or(&output).display()
+        ));
         run_program(
             &call,
             Job {
@@ -881,6 +1045,7 @@ pub fn dumpall_globals(call: Call, args: DumpallArgs) -> BoxFuture<'static, Outc
                 program: "pg_dumpall",
                 arguments,
                 output: Some(output),
+                staging,
                 output_is_directory: false,
                 cwd: None,
                 dry_run: args.dry_run,
@@ -988,6 +1153,7 @@ pub fn restore(call: Call, args: RestoreArgs) -> BoxFuture<'static, Outcome> {
                 program: "pg_restore",
                 arguments,
                 output: None,
+                staging: None,
                 output_is_directory: false,
                 cwd: None,
                 dry_run: args.dry_run,
@@ -1095,12 +1261,16 @@ pub fn basebackup(call: Call, args: BasebackupArgs) -> BoxFuture<'static, Outcom
             arguments.push("--progress".to_owned());
             arguments.push("--verbose".to_owned());
         }
-        let output = if args.dry_run {
-            dir.join(&name)
+        let (output, staging) = if args.dry_run {
+            (dir.join(&name), None)
         } else {
-            prepared_directory(&dir, &name)?
+            let (output, staging) = prepared_directory(&dir, &name)?;
+            (output, Some(staging))
         };
-        arguments.push(format!("--pgdata={}", output.display()));
+        arguments.push(format!(
+            "--pgdata={}",
+            staging.as_deref().unwrap_or(&output).display()
+        ));
         run_program(
             &call,
             Job {
@@ -1108,6 +1278,7 @@ pub fn basebackup(call: Call, args: BasebackupArgs) -> BoxFuture<'static, Outcom
                 program: "pg_basebackup",
                 arguments,
                 output: Some(output),
+                staging,
                 output_is_directory: true,
                 cwd: None,
                 dry_run: args.dry_run,
@@ -1218,6 +1389,7 @@ pub fn upgrade_check(call: Call, args: UpgradeCheckArgs) -> BoxFuture<'static, O
                 program: "pg_upgrade",
                 arguments,
                 output: None,
+                staging: None,
                 output_is_directory: false,
                 cwd: Some(dir),
                 dry_run: args.dry_run,
@@ -1259,9 +1431,25 @@ mod tests {
     #[test]
     fn output_names_stay_inside_the_output_directory() {
         assert_eq!(output_name("file", " app.dump ").unwrap(), "app.dump");
-        for bad in ["", ".hidden", "../up", "a/b", "a b", "a\\b", "..", "\u{0}"] {
+        for bad in [
+            "",
+            ".hidden",
+            "../up",
+            "a/b",
+            "a b",
+            "a\\b",
+            "..",
+            "\u{0}",
+            "con",
+            "CON",
+            "nul.dump",
+            "COM1.sql",
+            "trailing.",
+            "x.ownpg-partial",
+        ] {
             assert!(output_name("file", bad).is_err(), "{bad:?}");
         }
+        assert_eq!(output_name("file", "console.dump").unwrap(), "console.dump");
         let long = "a".repeat(129);
         assert!(output_name("file", &long).is_err());
     }
