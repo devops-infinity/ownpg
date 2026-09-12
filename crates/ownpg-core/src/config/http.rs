@@ -515,11 +515,26 @@ pub fn resolve_http(
                     issuer.value.trim_end_matches('/')
                 ))
             });
-            if !jwks_url.value.starts_with("https://") {
+            let jwks_parsed = url::Url::parse(jwks_url.value.trim()).map_err(|error| {
+                invalid(
+                    "http.oauth_jwks_url",
+                    &jwks_url.value,
+                    &format!("not a URL: {error}"),
+                )
+            })?;
+            let jwks_loopback = jwks_parsed.host_str().is_some_and(|host| {
+                host == "localhost"
+                    || host
+                        .trim_matches(['[', ']'])
+                        .parse::<IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            });
+            if jwks_parsed.scheme() != "https" && !(jwks_parsed.scheme() == "http" && jwks_loopback)
+            {
                 return Err(invalid(
                     "http.oauth_jwks_url",
                     &jwks_url.value,
-                    "the JWKS URL must use https",
+                    "the JWKS URL must use https unless it points at the loopback interface",
                 ));
             }
             let audience = pick(
