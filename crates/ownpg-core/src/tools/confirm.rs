@@ -18,7 +18,7 @@ pub const REQUEST_KEY: &str = "confirm";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pending {
     pub tool: String,
-    pub statement_digest: String,
+    pub sql_sha256: String,
     pub principal: String,
     pub nonce: u64,
 }
@@ -125,7 +125,7 @@ impl Gate {
         if let Some(sealed) = call.request_state.as_deref() {
             let pending = self.open(sealed)?;
             if pending.tool != tool
-                || pending.statement_digest != classification.statement_digest
+                || pending.sql_sha256 != classification.sql_sha256
                 || pending.principal != call.principal
             {
                 return Err(Error::ConfirmationRequired {
@@ -156,7 +156,7 @@ impl Gate {
         if call.can_elicit {
             let sealed = self.seal(&Pending {
                 tool: tool.to_owned(),
-                statement_digest: classification.statement_digest.clone(),
+                sql_sha256: classification.sql_sha256.clone(),
                 principal: call.principal.clone(),
                 nonce: rand::random(),
             })?;
@@ -251,7 +251,7 @@ mod tests {
         let gate = Gate::new();
         let pending = Pending {
             tool: "pg_delete".to_owned(),
-            statement_digest: "abc".to_owned(),
+            sql_sha256: "abc".to_owned(),
             principal: "tester".to_owned(),
             nonce: 7,
         };

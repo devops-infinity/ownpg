@@ -3,7 +3,7 @@ use ownpg_core::{Error, ExitClass, Result};
 
 use crate::cli::{Cli, Command, ServeArgs, ShellArg};
 use crate::output::{emit, report_error, stdout_error};
-use crate::{config_cmd, context, doctor, logging, serve};
+use crate::{audit_cmd, config_cmd, context, doctor, logging, serve};
 
 pub(crate) fn run(args: Cli) -> ExitClass {
     let outcome = dispatch(args);
@@ -23,8 +23,8 @@ fn dispatch(args: Cli) -> Result<ExitClass> {
         _ => {}
     }
     let process = context::detect(&args.global)?;
-    let human = !matches!(args.command, None | Some(Command::Serve(_)));
-    let _log_guard = logging::init(&args.global, &process.paths, human)?;
+    let human_output = !matches!(args.command, None | Some(Command::Serve(_)));
+    let _log_guard = logging::init(&args.global, &process.paths, human_output)?;
     match args.command {
         None => {
             let defaults = ServeArgs {
@@ -42,9 +42,7 @@ fn dispatch(args: Cli) -> Result<ExitClass> {
         Some(Command::Serve(serve_args)) => serve::run(&args.global, &serve_args, &process),
         Some(Command::Doctor(doctor_args)) => doctor::run(&args.global, &doctor_args, &process),
         Some(Command::Config(config)) => config_cmd::run(&args.global, &config, &process),
-        Some(Command::Audit(crate::cli::AuditCommand::Verify { path })) => {
-            config_cmd::verify_audit(&path)
-        }
+        Some(Command::Audit(crate::cli::AuditCommand::Verify { path })) => audit_cmd::verify(&path),
         Some(Command::Man { .. } | Command::Completions { .. }) => Ok(ExitClass::Success),
     }
 }

@@ -166,9 +166,9 @@ impl Server {
         };
         let sweeper = {
             let engine = Arc::clone(&context.engine);
-            let every = engine.sweep_interval();
+            let interval = engine.sweep_interval();
             tokio::spawn(async move {
-                let mut tick = tokio::time::interval(every);
+                let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 tick.tick().await;
                 loop {
@@ -385,7 +385,7 @@ impl Server {
             return;
         };
         match parked.iter_mut().find(|(id, _)| id == handle) {
-            Some((_, held)) => held.extend(relations.iter().cloned()),
+            Some((_, parked_relations)) => parked_relations.extend(relations.iter().cloned()),
             None => {
                 while parked.len() >= PARKED_INVALIDATION_CAP {
                     parked.pop_front();

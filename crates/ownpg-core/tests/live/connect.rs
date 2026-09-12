@@ -24,13 +24,13 @@ async fn a_tcp_connection_pins_the_schema_reads_the_version_and_the_role() {
     assert!(session.info.server_version_num >= 140_000);
     assert_eq!(session.info.attempts.len(), 1);
     assert!(session.info.attempts[0].outcome.is_ok());
-    let path: String = session
+    let search_path: String = session
         .client
         .query_one("SHOW search_path", &[])
         .await
         .unwrap()
         .get(0);
-    assert_eq!(path, "app");
+    assert_eq!(search_path, "app");
     let timeout: String = session
         .client
         .query_one("SHOW statement_timeout", &[])
@@ -38,13 +38,13 @@ async fn a_tcp_connection_pins_the_schema_reads_the_version_and_the_role() {
         .unwrap()
         .get(0);
     assert_eq!(timeout, "30s");
-    let idle: String = session
+    let idle_timeout: String = session
         .client
         .query_one("SHOW idle_in_transaction_session_timeout", &[])
         .await
         .unwrap()
         .get(0);
-    assert_eq!(idle, "65s");
+    assert_eq!(idle_timeout, "65s");
     let role = RoleProfile::load(&session.client).await.unwrap();
     assert_eq!(role.name, scratch.user);
     assert!(session.is_alive().await);

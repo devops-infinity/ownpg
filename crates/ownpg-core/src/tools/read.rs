@@ -296,7 +296,7 @@ async fn explain_estimate(context: &Context, sql: &str) -> Result<i64, ToolFailu
     let explain_sql = format!("EXPLAIN (FORMAT JSON) {sql}");
     let result = context
         .engine
-        .run_read(&explain_sql, context.caps(1_000).whole_cells())
+        .run_read(&explain_sql, context.caps(1_000).without_cell_cap())
         .await?;
     let text: String = result
         .rows
@@ -453,7 +453,7 @@ pub fn explain(call: Call, args: ExplainArgs) -> BoxFuture<'static, Outcome> {
         };
         let classification = classify_checked(&call, &statement).await?;
         let facts = facts_for(&classification);
-        let caps = context.caps(1_000).whole_cells();
+        let caps = context.caps(1_000).without_cell_cap();
         let writes = classification.class != StatementClass::Read;
         let result = if writes {
             context.engine.run_and_rollback(&statement, caps).await

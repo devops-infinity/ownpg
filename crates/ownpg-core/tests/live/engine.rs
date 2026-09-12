@@ -253,8 +253,8 @@ async fn pooled_mode_pins_every_setting_per_transaction_with_set_local() {
         byte_cap: 100_000,
         cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
-    let path = engine.run_read("SHOW search_path", caps).await.unwrap();
-    assert_eq!(path.rows[0][0].as_deref(), Some(r#""""#));
+    let search_path = engine.run_read("SHOW search_path", caps).await.unwrap();
+    assert_eq!(search_path.rows[0][0].as_deref(), Some(r#""""#));
     let timeout = engine
         .run_read("SHOW statement_timeout", caps)
         .await

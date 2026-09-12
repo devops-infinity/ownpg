@@ -164,7 +164,7 @@ pub struct Classification {
     pub relations: Vec<RelationName>,
     pub functions: Vec<String>,
     pub fingerprint: String,
-    pub statement_digest: String,
+    pub sql_sha256: String,
     pub normalized: String,
     pub runs_outside_transaction: bool,
     pub explain_analyze: bool,
@@ -211,7 +211,7 @@ pub fn classify(sql: &str) -> Result<Classification> {
     let fingerprint = pg_query::fingerprint(sql)
         .map(|value| value.hex)
         .unwrap_or_default();
-    let statement_digest = crate::audit::sha256_hex(sql.trim().as_bytes());
+    let sql_sha256 = crate::audit::sha256_hex(sql.trim().as_bytes());
     let normalized = pg_query::normalize(sql).unwrap_or_default();
     let top = tree
         .pointer("/stmts/0/stmt/node")
@@ -236,7 +236,7 @@ pub fn classify(sql: &str) -> Result<Classification> {
         relations: found.relations,
         functions: found.functions.clone(),
         fingerprint,
-        statement_digest,
+        sql_sha256,
         normalized,
         runs_outside_transaction: false,
         explain_analyze: false,
@@ -1092,14 +1092,14 @@ mod properties {
         #[test]
         fn sql_shaped_text_never_reports_a_read_that_writes(sql in sql_like()) {
             if let Ok(classification) = classify(&sql) {
-                let upper = classification.kind.as_str();
+                let kind = classification.kind.as_str();
                 if classification.class == StatementClass::Read {
                     prop_assert!(
-                        !matches!(upper, "InsertStmt" | "UpdateStmt" | "DeleteStmt" | "CopyStmt" | "DropStmt" | "TruncateStmt"),
-                        "{upper} classified as a read: {sql}"
+                        !matches!(kind, "InsertStmt" | "UpdateStmt" | "DeleteStmt" | "CopyStmt" | "DropStmt" | "TruncateStmt"),
+                        "{kind} classified as a read: {sql}"
                     );
                 }
-                prop_assert_eq!(classification.statement_digest.len(), 64);
+                prop_assert_eq!(classification.sql_sha256.len(), 64);
             }
         }
     }

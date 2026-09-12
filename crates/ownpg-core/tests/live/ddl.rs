@@ -243,10 +243,10 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
         json!({"operation": "create", "name": "orders_status_idx", "table": "orders", "columns": ["status", "id DESC"], "where_clause": "status <> 'done'"}),
     )
     .await;
-    let concurrent_inside = rig
+    let begun = rig
         .call("pg_transaction", json!({"operation": "begin"}))
         .await;
-    let handle = concurrent_inside.structured_content.unwrap()["handle"]["id"]
+    let handle = begun.structured_content.unwrap()["handle"]["id"]
         .as_str()
         .unwrap()
         .to_owned();

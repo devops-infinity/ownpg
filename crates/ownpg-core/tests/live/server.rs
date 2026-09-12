@@ -20,7 +20,7 @@ struct Rig {
     server_task: tokio::task::JoinHandle<ownpg_core::Result<ownpg_core::ExitClass>>,
 }
 
-async fn prepare(scratch: &support::Scratch) {
+async fn seed_schema(scratch: &support::Scratch) {
     let client = scratch.client().await;
     client
         .batch_execute(
@@ -104,7 +104,7 @@ async fn the_default_tool_list_is_the_seven_read_tools_in_registry_order() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, Mode::ReadOnly).await;
     let listed = rig.client.list_tools(None).await.unwrap();
     let names: Vec<&str> = listed.tools.iter().map(|tool| tool.name.as_ref()).collect();
@@ -146,7 +146,7 @@ async fn write_only_mode_hides_the_read_tools() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, Mode::WriteOnly).await;
     let listed = rig.client.list_tools(None).await.unwrap();
     let names: Vec<&str> = listed.tools.iter().map(|tool| tool.name.as_ref()).collect();
@@ -179,7 +179,7 @@ async fn run_query_pages_sanitizes_and_refuses_writes_with_structured_errors() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, Mode::ReadOnly).await;
 
     let first = rig
@@ -255,11 +255,11 @@ async fn run_query_pages_sanitizes_and_refuses_writes_with_structured_errors() {
     assert_eq!(structured["code"], "sql.failed");
     assert_eq!(structured["sqlstate"], "25006");
 
-    let two = rig
+    let two_statements = rig
         .call("pg_run_query", json!({"sql": "SELECT 1; SELECT 2"}))
         .await;
     assert_eq!(
-        two.structured_content.unwrap()["code"],
+        two_statements.structured_content.unwrap()["code"],
         "statement.multiple"
     );
 
@@ -272,8 +272,8 @@ async fn run_query_pages_sanitizes_and_refuses_writes_with_structured_errors() {
     );
 
     rig.finish().await;
-    let lines = verify_chain(&audit_file_path(&scratch)).expect("the audit chain verifies");
-    assert!(lines >= 8, "{lines} audit lines");
+    let line_count = verify_chain(&audit_file_path(&scratch)).expect("the audit chain verifies");
+    assert!(line_count >= 8, "{line_count} audit lines");
     let content = std::fs::read_to_string(audit_file_path(&scratch)).unwrap();
     assert!(content.contains("\"decision\":\"refused\""));
     assert!(content.contains("\"outcome\":\"25006\""));
@@ -284,8 +284,8 @@ async fn run_query_pages_sanitizes_and_refuses_writes_with_structured_errors() {
 }
 
 fn audit_file_path(scratch: &support::Scratch) -> std::path::PathBuf {
-    let data = &scratch.paths.data_dir;
-    std::fs::read_dir(data)
+    let data_dir = &scratch.paths.data_dir;
+    std::fs::read_dir(data_dir)
         .unwrap()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -298,7 +298,7 @@ async fn the_catalog_tools_list_describe_count_and_explain() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, Mode::ReadOnly).await;
 
     let listed = rig
@@ -518,7 +518,7 @@ async fn health_and_doctor_report_without_secrets() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, Mode::ReadOnly).await;
     let health = rig.call("pg_health", json!({})).await;
     assert_ne!(health.is_error, Some(true), "{health:?}");
@@ -575,8 +575,8 @@ async fn a_discover_first_client_and_a_call_first_client_are_answered() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
-    for first in ["discover", "call"] {
+    seed_schema(&scratch).await;
+    for first_request in ["discover", "call"] {
         let settings = Arc::new(scratch.settings(FlagLayer {
             schema: Some("app".to_owned()),
             ..FlagLayer::default()
@@ -605,7 +605,7 @@ async fn a_discover_first_client_and_a_call_first_client_are_answered() {
             "io.modelcontextprotocol/clientCapabilities": {},
             "io.modelcontextprotocol/clientInfo": {"name": "raw-test", "version": "0"}
         });
-        let request = if first == "discover" {
+        let request = if first_request == "discover" {
             json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {"_meta": meta}})
         } else {
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"_meta": meta, "name": "pg_count", "arguments": {"table": "orders"}}})
@@ -617,7 +617,7 @@ async fn a_discover_first_client_and_a_call_first_client_are_answered() {
         let line = lines.next_line().await.unwrap().expect("a response line");
         let response: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(response["id"], 1, "{line}");
-        if first == "discover" {
+        if first_request == "discover" {
             let versions = response["result"]["supportedVersions"].as_array().unwrap();
             assert!(versions.iter().any(|v| v == "2026-07-28"), "{line}");
             assert!(versions.iter().any(|v| v == "2025-11-25"), "{line}");
@@ -663,7 +663,7 @@ async fn an_initialize_handshake_negotiates_the_2025_revision() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, Mode::ReadOnly).await;
     let info = rig.client.peer_info().unwrap();
     assert_eq!(info.protocol_version.as_str(), "2025-11-25");
@@ -682,7 +682,7 @@ async fn the_bypass_corpus_is_refused_by_the_live_read_only_server() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let watcher = scratch.client().await;
     let before: i64 = watcher
         .query_one("SELECT count(*) FROM app.orders", &[])
@@ -690,7 +690,7 @@ async fn the_bypass_corpus_is_refused_by_the_live_read_only_server() {
         .unwrap()
         .get(0);
     let rig = rig(&scratch, Mode::ReadOnly).await;
-    let mut refused = 0;
+    let mut refused_count = 0;
     for sql in ownpg_core::classify::BYPASS_CORPUS {
         let result = rig.call("pg_run_query", json!({"sql": sql})).await;
         assert_eq!(
@@ -709,9 +709,9 @@ async fn the_bypass_corpus_is_refused_by_the_live_read_only_server() {
             ),
             "{sql} ended with {code} instead of a classifier refusal"
         );
-        refused += 1;
+        refused_count += 1;
     }
-    assert!(refused >= 40);
+    assert!(refused_count >= 40);
     let literal = rig
         .call(
             "pg_run_query",
@@ -727,10 +727,10 @@ async fn the_bypass_corpus_is_refused_by_the_live_read_only_server() {
         .get(0);
     assert_eq!(before, after, "no corpus statement reached the table");
     let content = std::fs::read_to_string(audit_file_path(&scratch)).unwrap();
-    let refusals = content.matches("\"decision\":\"refused\"").count();
+    let logged_refusals = content.matches("\"decision\":\"refused\"").count();
     assert!(
-        refusals >= refused,
-        "{refusals} refusals logged for {refused} inputs"
+        logged_refusals >= refused_count,
+        "{logged_refusals} refusals logged for {refused_count} inputs"
     );
     assert!(
         !content.contains("needle-literal-7") && !content.contains("id = 4242"),

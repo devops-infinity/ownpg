@@ -648,13 +648,13 @@ async fn open_system(
 }
 
 pub fn agent_socket_from(value: Option<&str>) -> Option<PathBuf> {
-    let named = value
+    let explicit = value
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from);
     if cfg!(windows) {
-        return named.or_else(|| Some(PathBuf::from(r"\\.\pipe\openssh-ssh-agent")));
+        return explicit.or_else(|| Some(PathBuf::from(r"\\.\pipe\openssh-ssh-agent")));
     }
-    named
+    explicit
 }
 
 pub fn known_hosts_default(home: Option<&Path>) -> Option<PathBuf> {

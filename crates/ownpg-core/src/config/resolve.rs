@@ -131,7 +131,7 @@ fn env_u64(env: &Environment, name: &str) -> Result<Option<u64>> {
 }
 
 #[must_use]
-pub fn ci_says_no_input(env: &Environment) -> Option<bool> {
+pub fn ci_no_input(env: &Environment) -> Option<bool> {
     let raw = env.var("CI")?;
     let lowered = raw.trim().to_ascii_lowercase();
     (!matches!(lowered.as_str(), "0" | "false" | "no" | "off")).then_some(true)
@@ -591,7 +591,7 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
 
     let no_input = Pick::new(
         flags.no_input,
-        env_bool(env, "OWNPG_NO_INPUT")?.or(ci_says_no_input(env)),
+        env_bool(env, "OWNPG_NO_INPUT")?.or(ci_no_input(env)),
         profile.no_input,
     )
     .or_preset(false);

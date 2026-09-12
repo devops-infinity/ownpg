@@ -1,6 +1,6 @@
 ---
 source: crates/ownpg/src/cli.rs
-expression: stable
+expression: normalized
 ---
 ===== ownpg =====
 OwnPG serves one PostgreSQL database and one schema to an AI client over
@@ -35,7 +35,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -103,7 +103,7 @@ Options:
           Host name, address, or Unix socket directory [env: OWNPG_HOST]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -219,7 +219,7 @@ Options:
           Host name, address, or Unix socket directory [env: OWNPG_HOST]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -309,7 +309,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -368,7 +368,7 @@ Options:
           Host name, address, or Unix socket directory [env: OWNPG_HOST]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -449,7 +449,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -491,7 +491,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -534,7 +534,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -577,7 +577,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -620,7 +620,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -663,7 +663,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -702,7 +702,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -741,7 +741,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -781,7 +781,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -822,7 +822,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>
@@ -864,7 +864,7 @@ Options:
           [possible values: text, json]
 
       --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
           lands under the log directory (see `config path`)
 
       --config <FILE>

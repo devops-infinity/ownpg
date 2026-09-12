@@ -1154,7 +1154,7 @@ impl Engine {
         outside_transaction: bool,
         timeout: Option<Duration>,
     ) -> Result<ResultSet> {
-        self.run_write_reporting(
+        self.run_write_reporting_pid(
             sql,
             caps,
             principal,
@@ -1166,7 +1166,7 @@ impl Engine {
         .await
     }
 
-    pub async fn run_write_reporting(
+    pub async fn run_write_reporting_pid(
         &self,
         sql: &str,
         caps: Caps,
@@ -1174,7 +1174,7 @@ impl Engine {
         handle: Option<&str>,
         outside_transaction: bool,
         timeout: Option<Duration>,
-        backend: Option<&std::sync::atomic::AtomicI32>,
+        backend_pid: Option<&std::sync::atomic::AtomicI32>,
     ) -> Result<ResultSet> {
         if let Some(id) = handle {
             if outside_transaction {
@@ -1198,7 +1198,7 @@ impl Engine {
                 }
                 return Err(lost_handle(id));
             }
-            report_backend(primary.lane.conn.client(), backend).await;
+            report_backend_pid(primary.lane.conn.client(), backend_pid).await;
             let result = timed(primary.lane.conn.client(), timeout, true, || {
                 guarded_statement(primary.lane.conn.client(), sql, caps)
             })
@@ -1217,7 +1217,7 @@ impl Engine {
         if self.pool.is_some() {
             let lane = self.checkout().await?;
             let _tracked = self.track(lane.conn.session());
-            report_backend(lane.conn.client(), backend).await;
+            report_backend_pid(lane.conn.client(), backend_pid).await;
             return autocommit(
                 lane.conn.client(),
                 self.transaction_prefix(),
@@ -1241,7 +1241,7 @@ impl Engine {
         finish_if_idle(&mut primary.lane).await?;
         if !primary.lane.in_read_transaction {
             let _tracked = self.track(primary.lane.conn.session());
-            report_backend(primary.lane.conn.client(), backend).await;
+            report_backend_pid(primary.lane.conn.client(), backend_pid).await;
             return autocommit(
                 primary.lane.conn.client(),
                 self.transaction_prefix(),
@@ -1268,7 +1268,7 @@ impl Engine {
             });
         }
         let _tracked = self.track(lane.conn.session());
-        report_backend(lane.conn.client(), backend).await;
+        report_backend_pid(lane.conn.client(), backend_pid).await;
         autocommit(
             lane.conn.client(),
             self.transaction_prefix(),
@@ -1554,7 +1554,7 @@ impl Engine {
         Ok(Self::describe_handle(&guard.handle))
     }
 
-    async fn pooled_take(&self, id: &str, principal: &str) -> Result<Arc<Mutex<PooledHandle>>> {
+    async fn pooled_lookup(&self, id: &str, principal: &str) -> Result<Arc<Mutex<PooledHandle>>> {
         let mut handles = self.pooled_handles.lock().await;
         self.pooled_sweep(&mut handles).await;
         match handles.open.get(id) {
@@ -1654,7 +1654,7 @@ impl Engine {
         C: FnOnce(&WriteHandle) -> Result<()>,
         F: FnOnce(&mut WriteHandle),
     {
-        let held = self.pooled_take(id, principal).await?;
+        let held = self.pooled_lookup(id, principal).await?;
         let mut guard = held.lock().await;
         check(&guard.handle)?;
         if guard.lane.conn.client().is_closed() {
@@ -1683,7 +1683,7 @@ impl Engine {
         caps: Caps,
         timeout: Option<Duration>,
     ) -> Result<ResultSet> {
-        let held = self.pooled_take(id, principal).await?;
+        let held = self.pooled_lookup(id, principal).await?;
         let mut guard = held.lock().await;
         if guard.lane.conn.client().is_closed() {
             drop(guard);
@@ -1725,7 +1725,7 @@ impl Engine {
             )
             .await;
         };
-        let held = self.pooled_take(id, principal).await?;
+        let held = self.pooled_lookup(id, principal).await?;
         let mut guard = held.lock().await;
         if guard.lane.conn.client().is_closed() {
             drop(guard);
@@ -1793,20 +1793,20 @@ fn second_handle(open: String) -> Error {
     }
 }
 
-async fn report_backend(
+async fn report_backend_pid(
     client: &tokio_postgres::Client,
-    backend: Option<&std::sync::atomic::AtomicI32>,
+    backend_pid: Option<&std::sync::atomic::AtomicI32>,
 ) {
-    let Some(backend) = backend else {
+    let Some(slot) = backend_pid else {
         return;
     };
-    match backend_pid(client).await {
-        Ok(pid) => backend.store(pid, std::sync::atomic::Ordering::Relaxed),
+    match query_backend_pid(client).await {
+        Ok(pid) => slot.store(pid, std::sync::atomic::Ordering::Relaxed),
         Err(error) => tracing::debug!(%error, "the backend pid could not be read"),
     }
 }
 
-async fn backend_pid(client: &tokio_postgres::Client) -> Result<i32> {
+async fn query_backend_pid(client: &tokio_postgres::Client) -> Result<i32> {
     let rows = query_rows(client, "SELECT pg_catalog.pg_backend_pid()", &[]).await?;
     rows.first()
         .map(|row| row.try_get::<_, i32>(0))

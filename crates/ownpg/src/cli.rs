@@ -73,7 +73,7 @@ pub(crate) struct GlobalArgs {
         global = true,
         value_name = "PATH",
         value_hint = ValueHint::FilePath,
-        help = "Also write logs to this file, rotated daily with the newest seven days kept. A bare name lands under the log directory (see `config path`)"
+        help = "Also write logs to this file, rotated daily with the newest eight files kept. A bare name lands under the log directory (see `config path`)"
     )]
     pub log_file: Option<PathBuf>,
 
@@ -656,9 +656,9 @@ mod tests {
             parsed.command,
             Some(Command::Config(ConfigCommand::SetPassword { profile, dry_run: false })) if profile == "prod"
         ));
-        let rehearsed = parse(&["config", "cache-clear", "--dry-run"]).unwrap();
+        let cache_clear_dry_run = parse(&["config", "cache-clear", "--dry-run"]).unwrap();
         assert!(matches!(
-            rehearsed.command,
+            cache_clear_dry_run.command,
             Some(Command::Config(ConfigCommand::CacheClear { dry_run: true }))
         ));
         let verify = parse(&["audit", "verify", "/tmp/audit.jsonl"]).unwrap();
@@ -670,7 +670,11 @@ mod tests {
 
     #[test]
     fn the_rendered_help_of_every_command_is_pinned() {
-        fn collect(command: &mut clap::Command, prefix: &str, pages: &mut Vec<(String, String)>) {
+        fn collect_pages(
+            command: &mut clap::Command,
+            prefix: &str,
+            pages: &mut Vec<(String, String)>,
+        ) {
             let name = if prefix.is_empty() {
                 command.get_name().to_owned()
             } else {
@@ -679,29 +683,29 @@ mod tests {
             let help = command.render_long_help().to_string();
             pages.push((name.clone(), help));
             for sub in command.get_subcommands_mut() {
-                collect(sub, &name, pages);
+                collect_pages(sub, &name, pages);
             }
         }
         let mut root = Cli::command();
         root.build();
         let mut pages = Vec::new();
-        collect(&mut root, "", &mut pages);
+        collect_pages(&mut root, "", &mut pages);
         assert!(pages.len() > 10, "{}", pages.len());
         let rendered: String = pages
             .iter()
             .map(|(name, help)| format!("===== {name} =====\n{help}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let mut stable = String::with_capacity(rendered.len());
+        let mut normalized = String::with_capacity(rendered.len());
         let mut rest = rendered.as_str();
         while let Some(start) = rest.find("[env: OWNPG_CONFIG=") {
-            stable.push_str(&rest[..start]);
-            stable.push_str("[env: OWNPG_CONFIG]");
+            normalized.push_str(&rest[..start]);
+            normalized.push_str("[env: OWNPG_CONFIG]");
             let after = &rest[start..];
             rest = after.find(']').map_or("", |end| &after[end + 1..]);
         }
-        stable.push_str(rest);
-        insta::assert_snapshot!("command-surface-help", stable);
+        normalized.push_str(rest);
+        insta::assert_snapshot!("command-surface-help", normalized);
     }
 
     #[test]

@@ -19,22 +19,22 @@ use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Default)]
-struct Watching {
-    updated: Arc<std::sync::Mutex<Vec<String>>>,
-    list_changed: Arc<AtomicUsize>,
+struct ResourceWatcher {
+    updated_uris: Arc<std::sync::Mutex<Vec<String>>>,
+    list_changed_count: Arc<AtomicUsize>,
 }
 
-impl ClientHandler for Watching {
+impl ClientHandler for ResourceWatcher {
     async fn on_resource_updated(
         &self,
         params: ResourceUpdatedNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) {
-        self.updated.lock().unwrap().push(params.uri);
+        self.updated_uris.lock().unwrap().push(params.uri);
     }
 
     async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        self.list_changed.fetch_add(1, Ordering::SeqCst);
+        self.list_changed_count.fetch_add(1, Ordering::SeqCst);
     }
 
     fn get_info(&self) -> ClientInfo {
@@ -43,8 +43,8 @@ impl ClientHandler for Watching {
 }
 
 struct Rig {
-    client: RunningService<RoleClient, Watching>,
-    handler: Watching,
+    client: RunningService<RoleClient, ResourceWatcher>,
+    handler: ResourceWatcher,
     server_task: tokio::task::JoinHandle<ownpg_core::Result<ownpg_core::ExitClass>>,
     database: String,
 }
@@ -73,7 +73,7 @@ async fn rig(scratch: &support::Scratch, lifecycle: ClientLifecycleMode) -> Rig 
     let (server_read, server_write) = tokio::io::split(server_side);
     let server_task = tokio::spawn(stdio::serve(server, server_read, server_write));
     let (client_read, client_write) = tokio::io::split(client_side);
-    let handler = Watching::default();
+    let handler = ResourceWatcher::default();
     let client = handler
         .clone()
         .serve_with_lifecycle((client_read, client_write), lifecycle)
@@ -134,7 +134,7 @@ impl Rig {
     }
 }
 
-async fn prepare(scratch: &support::Scratch) {
+async fn seed_schema(scratch: &support::Scratch) {
     let client = scratch.client().await;
     client
         .batch_execute(
@@ -153,7 +153,7 @@ async fn resources_mirror_the_catalog_tools_and_refuse_foreign_uris() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, ClientLifecycleMode::Initialize).await;
 
     let templates = rig.client.list_resource_templates(None).await.unwrap();
@@ -230,7 +230,7 @@ async fn prompts_render_with_arguments_and_complete_names() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, ClientLifecycleMode::Initialize).await;
 
     let listed = rig.client.list_prompts(None).await.unwrap();
@@ -327,7 +327,7 @@ async fn a_ddl_call_announces_the_table_and_schema_to_a_2025_client() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, ClientLifecycleMode::Initialize).await;
     rig.ok(
         "pg_column",
@@ -335,7 +335,7 @@ async fn a_ddl_call_announces_the_table_and_schema_to_a_2025_client() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(rig.handler.updated.lock().unwrap().is_empty());
+    assert!(rig.handler.updated_uris.lock().unwrap().is_empty());
 
     rig.ok(
         "pg_column",
@@ -343,16 +343,16 @@ async fn a_ddl_call_announces_the_table_and_schema_to_a_2025_client() {
     )
     .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while rig.handler.list_changed.load(Ordering::SeqCst) == 0
+    while rig.handler.list_changed_count.load(Ordering::SeqCst) == 0
         && tokio::time::Instant::now() < deadline
     {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
-        *rig.handler.updated.lock().unwrap(),
+        *rig.handler.updated_uris.lock().unwrap(),
         vec![rig.table_uri("orders")]
     );
-    assert_eq!(rig.handler.list_changed.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.handler.list_changed_count.load(Ordering::SeqCst), 1);
     rig.finish().await;
 }
 
@@ -361,7 +361,7 @@ async fn ddl_inside_a_handle_is_announced_at_commit_and_never_after_a_rollback()
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, ClientLifecycleMode::Initialize).await;
     let begun = rig
         .ok("pg_transaction", json!({"operation": "begin"}))
@@ -374,17 +374,17 @@ async fn ddl_inside_a_handle_is_announced_at_commit_and_never_after_a_rollback()
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
-        rig.handler.updated.lock().unwrap().is_empty(),
+        rig.handler.updated_uris.lock().unwrap().is_empty(),
         "nothing is announced before the change is visible"
     );
-    assert_eq!(rig.handler.list_changed.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.handler.list_changed_count.load(Ordering::SeqCst), 0);
     rig.ok(
         "pg_transaction",
         json!({"operation": "rollback", "handle": handle}),
     )
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(rig.handler.updated.lock().unwrap().is_empty());
+    assert!(rig.handler.updated_uris.lock().unwrap().is_empty());
 
     let begun = rig
         .ok("pg_transaction", json!({"operation": "begin"}))
@@ -401,16 +401,16 @@ async fn ddl_inside_a_handle_is_announced_at_commit_and_never_after_a_rollback()
     )
     .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while rig.handler.list_changed.load(Ordering::SeqCst) == 0
+    while rig.handler.list_changed_count.load(Ordering::SeqCst) == 0
         && tokio::time::Instant::now() < deadline
     {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
-        *rig.handler.updated.lock().unwrap(),
+        *rig.handler.updated_uris.lock().unwrap(),
         vec![rig.table_uri("orders")]
     );
-    assert_eq!(rig.handler.list_changed.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.handler.list_changed_count.load(Ordering::SeqCst), 1);
     rig.finish().await;
 }
 
@@ -420,7 +420,7 @@ async fn a_2025_client_subscribes_and_unsubscribes_to_one_table() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(&scratch, ClientLifecycleMode::Initialize).await;
     let subscribe = |uri: String| {
         rmcp::model::ClientRequest::SubscribeRequest(rmcp::model::SubscribeRequest::new(
@@ -453,13 +453,13 @@ async fn a_2025_client_subscribes_and_unsubscribes_to_one_table() {
     )
     .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while rig.handler.list_changed.load(Ordering::SeqCst) == 0
+    while rig.handler.list_changed_count.load(Ordering::SeqCst) == 0
         && tokio::time::Instant::now() < deadline
     {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
-        *rig.handler.updated.lock().unwrap(),
+        *rig.handler.updated_uris.lock().unwrap(),
         vec![rig.table_uri("orders")],
         "the caller hears about its own change once, not twice"
     );
@@ -475,7 +475,7 @@ async fn a_ddl_call_reaches_a_subscription_stream_on_the_current_protocol() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
-    prepare(&scratch).await;
+    seed_schema(&scratch).await;
     let rig = rig(
         &scratch,
         ClientLifecycleMode::Discover {
@@ -483,13 +483,13 @@ async fn a_ddl_call_reaches_a_subscription_stream_on_the_current_protocol() {
         },
     )
     .await;
-    let orders = rig.table_uri("orders");
+    let orders_uri = rig.table_uri("orders");
     let mut subscription = rig
         .client
         .listen(
             SubscriptionFilter::builder()
                 .resources_list_changed()
-                .resource_subscription(orders.clone())
+                .resource_subscription(orders_uri.clone())
                 .build(),
         )
         .await
@@ -500,7 +500,7 @@ async fn a_ddl_call_reaches_a_subscription_stream_on_the_current_protocol() {
     );
     assert_eq!(
         subscription.acknowledged().resource_subscriptions,
-        Some(vec![orders.clone()])
+        Some(vec![orders_uri.clone()])
     );
 
     rig.ok(
@@ -527,9 +527,9 @@ async fn a_ddl_call_reaches_a_subscription_stream_on_the_current_protocol() {
     }
     assert_eq!(
         seen,
-        [format!("updated {orders}"), "list_changed".to_owned()]
+        [format!("updated {orders_uri}"), "list_changed".to_owned()]
     );
-    assert!(rig.handler.updated.lock().unwrap().is_empty());
+    assert!(rig.handler.updated_uris.lock().unwrap().is_empty());
     subscription.cancel().await.unwrap();
     rig.finish().await;
 }

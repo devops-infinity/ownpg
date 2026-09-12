@@ -120,7 +120,7 @@ struct OpenLog {
     path: PathBuf,
     written: u64,
     prev: String,
-    rotated_away: Option<String>,
+    rotated_to: Option<String>,
 }
 
 #[derive(Debug)]
@@ -260,11 +260,11 @@ impl Sink {
             return Ok(());
         };
         if self.max_bytes > 0 && open.written >= self.max_bytes {
-            if open.rotated_away.is_none() {
-                open.rotated_away = Some(rotate(open)?);
+            if open.rotated_to.is_none() {
+                open.rotated_to = Some(rotate(open)?);
                 prune_rotated(&self.base, self.keep_files);
             }
-            match open_file(&self.base, open.rotated_away.as_deref()) {
+            match open_file(&self.base, open.rotated_to.as_deref()) {
                 Ok(fresh) => *open = fresh,
                 Err(error) => {
                     tracing::warn!(%error, "the audit log could not be reopened after rotation; still writing to the rotated file");
@@ -322,13 +322,13 @@ fn open_file(path: &Path, rotated_from: Option<&str>) -> Result<OpenLog> {
         )),
         std::fs::TryLockError::Error(source) => unwritable(source),
     })?;
-    let (written, prev) = read_tail(&mut file).map_err(unwritable)?;
+    let (written, prev) = recover_tail(&mut file).map_err(unwritable)?;
     let mut open = OpenLog {
         file,
         path: path.to_path_buf(),
         written,
         prev,
-        rotated_away: None,
+        rotated_to: None,
     };
     let marker = Marker {
         format_version: FORMAT_VERSION,
@@ -344,7 +344,7 @@ fn open_file(path: &Path, rotated_from: Option<&str>) -> Result<OpenLog> {
     Ok(open)
 }
 
-fn read_tail(file: &mut File) -> std::io::Result<(u64, String)> {
+fn recover_tail(file: &mut File) -> std::io::Result<(u64, String)> {
     let mut written = file.metadata()?.len();
     if written == 0 {
         return Ok((0, String::new()));

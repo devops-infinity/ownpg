@@ -138,8 +138,8 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
         )
         .await
         .unwrap();
-    let output = tempfile::tempdir().unwrap();
-    let rig = rig(&scratch, Some(output.path().to_path_buf())).await;
+    let output_dir = tempfile::tempdir().unwrap();
+    let rig = rig(&scratch, Some(output_dir.path().to_path_buf())).await;
     let names = rig.names().await;
     for expected in [
         "pg_dump",

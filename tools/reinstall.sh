@@ -418,12 +418,12 @@ if [[ $SKIP_GATE -eq 0 ]]; then
 	DENY_CODE=0
 	cargo deny check >/dev/null 2>&1 || DENY_CODE=$?
 	if [[ $DENY_CODE -ne 0 ]]; then
-		DENY_NAMES=""
-		((DENY_CODE & 1)) && DENY_NAMES="$DENY_NAMES advisories"
-		((DENY_CODE & 2)) && DENY_NAMES="$DENY_NAMES bans"
-		((DENY_CODE & 4)) && DENY_NAMES="$DENY_NAMES licenses"
-		((DENY_CODE & 8)) && DENY_NAMES="$DENY_NAMES sources"
-		die "cargo deny found a policy violation in:${DENY_NAMES:- an unrecognized check (exit $DENY_CODE)}; run: cargo deny check"
+		DENY_FAILED_CHECKS=""
+		((DENY_CODE & 1)) && DENY_FAILED_CHECKS="$DENY_FAILED_CHECKS advisories"
+		((DENY_CODE & 2)) && DENY_FAILED_CHECKS="$DENY_FAILED_CHECKS bans"
+		((DENY_CODE & 4)) && DENY_FAILED_CHECKS="$DENY_FAILED_CHECKS licenses"
+		((DENY_CODE & 8)) && DENY_FAILED_CHECKS="$DENY_FAILED_CHECKS sources"
+		die "cargo deny found a policy violation in:${DENY_FAILED_CHECKS:- an unrecognized check (exit $DENY_CODE)}; run: cargo deny check"
 	fi
 	say SUCCESS "dependency policy"
 	cargo machete >/dev/null 2>&1 || die "cargo machete found an unused dependency; run: cargo machete"

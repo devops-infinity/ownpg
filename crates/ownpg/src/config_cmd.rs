@@ -143,23 +143,9 @@ fn preview(process: &Process, profile: &str, action: &str) -> Result<ExitClass> 
     Ok(ExitClass::Success)
 }
 
-pub(crate) fn verify_audit(path: &std::path::Path) -> Result<ExitClass> {
-    match ownpg_core::audit::verify_chain(path) {
-        Ok(lines) => {
-            emit(|out| writeln!(out, "{}: {lines} chained lines verified", path.display()))
-                .map_err(stdout_error)?;
-            Ok(ExitClass::Success)
-        }
-        Err(problem) => Err(Error::AuditTampered {
-            path: path.to_path_buf(),
-            detail: problem,
-        }),
-    }
-}
-
 fn init(process: &Process, force: bool, dry_run: bool) -> Result<ExitClass> {
     let path = &process.paths.config_file;
-    let text = ownpg_core::config::profile::TEMPLATE;
+    let text = ownpg_core::config::profile::PROFILE_TEMPLATE;
     if dry_run {
         emit(|out| out.write_all(text.as_bytes())).map_err(stdout_error)?;
         return Ok(ExitClass::Success);
@@ -190,7 +176,7 @@ fn load_profiles(process: &Process, profile: &str) -> Result<ProfileFile> {
     Ok(file)
 }
 
-fn read_password(global: &GlobalArgs, process: &Process) -> Result<Secret> {
+fn read_secret(global: &GlobalArgs, process: &Process) -> Result<Secret> {
     let no_input = global.no_input
         || process.env.var("OWNPG_NO_INPUT").is_some_and(|value| {
             matches!(
@@ -198,7 +184,7 @@ fn read_password(global: &GlobalArgs, process: &Process) -> Result<Secret> {
                 "1" | "true" | "yes" | "on"
             )
         })
-        || ownpg_core::config::ci_says_no_input(&process.env).unwrap_or(false);
+        || ownpg_core::config::ci_no_input(&process.env).unwrap_or(false);
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
         if no_input {
@@ -211,7 +197,7 @@ fn read_password(global: &GlobalArgs, process: &Process) -> Result<Secret> {
         return rpassword::prompt_password("Password (not echoed): ")
             .map(Secret::new)
             .map_err(|source| Error::InputUnreadable {
-                source_name: "the terminal".to_owned(),
+                stream: "the terminal".to_owned(),
                 source,
             });
     }
@@ -220,17 +206,17 @@ fn read_password(global: &GlobalArgs, process: &Process) -> Result<Secret> {
         .lock()
         .read_to_string(&mut text)
         .map_err(|source| Error::InputUnreadable {
-            source_name: "stdin".to_owned(),
+            stream: "stdin".to_owned(),
             source,
         })?;
-    let trimmed = text.trim_end_matches(['\r', '\n']).len();
-    text.truncate(trimmed);
+    let trimmed_len = text.trim_end_matches(['\r', '\n']).len();
+    text.truncate(trimmed_len);
     Ok(Secret::new(text))
 }
 
 fn set_password(global: &GlobalArgs, process: &Process, profile: &str) -> Result<ExitClass> {
     let mut file = load_profiles(process, profile)?;
-    let password = read_password(global, process)?;
+    let password = read_secret(global, process)?;
     if password.expose().is_empty() {
         return Err(Error::ArgumentInvalid {
             argument: "password".to_owned(),
@@ -291,7 +277,7 @@ fn set_ssh_passphrase(global: &GlobalArgs, process: &Process, profile: &str) -> 
             detail: format!("profile `{profile}` has no [profiles.{profile}.ssh] section"),
         });
     }
-    let passphrase = read_password(global, process)?;
+    let passphrase = read_secret(global, process)?;
     if passphrase.expose().is_empty() {
         return Err(Error::ArgumentInvalid {
             argument: "passphrase".to_owned(),

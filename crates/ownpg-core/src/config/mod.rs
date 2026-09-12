@@ -18,7 +18,7 @@ pub use http::{
     AuthMode, AuthSettings, HttpEntry, HttpFlags, HttpSettings, MCP_PATH, OauthSettings,
 };
 pub use resolve::{
-    FlagLayer, KeychainLookup, Sources, SshTarget, Warning, ci_says_no_input, parse_ssh_target,
+    FlagLayer, KeychainLookup, Sources, SshTarget, Warning, ci_no_input, parse_ssh_target,
     parse_tool_groups, resolve,
 };
 

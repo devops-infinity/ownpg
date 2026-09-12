@@ -1,4 +1,5 @@
 mod app;
+mod audit_cmd;
 mod build_info;
 mod cli;
 mod config_cmd;

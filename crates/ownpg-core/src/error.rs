@@ -124,9 +124,9 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("input could not be read from {source_name}")]
+    #[error("input could not be read from {stream}")]
     InputUnreadable {
-        source_name: String,
+        stream: String,
         #[source]
         source: std::io::Error,
     },
@@ -499,7 +499,7 @@ mod tests {
                 source: io_error(),
             },
             Error::InputUnreadable {
-                source_name: "stdin".to_owned(),
+                stream: "stdin".to_owned(),
                 source: io_error(),
             },
             Error::AuditTampered {

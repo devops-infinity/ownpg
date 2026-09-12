@@ -57,9 +57,9 @@ fn packaged_commit() -> Option<String> {
     let marker = "\"sha1\"";
     let start = text.find(marker)? + marker.len();
     let rest = text.get(start..)?;
-    let quote = rest.find('"')? + 1;
+    let value_start = rest.find('"')? + 1;
     let hash: String = rest
-        .get(quote..)?
+        .get(value_start..)?
         .chars()
         .take_while(char::is_ascii_hexdigit)
         .take(12)
@@ -68,12 +68,12 @@ fn packaged_commit() -> Option<String> {
 }
 
 fn commit_hash() -> String {
-    if let Some(given) = env::var("OWNPG_BUILD_COMMIT")
+    if let Some(env_commit) = env::var("OWNPG_BUILD_COMMIT")
         .ok()
         .map(|value| value.trim().chars().take(12).collect::<String>())
         .filter(|value| !value.is_empty())
     {
-        return given;
+        return env_commit;
     }
     workspace_root()
         .and_then(|root| git_output(&root, &["rev-parse", "--short=12", "HEAD"]))

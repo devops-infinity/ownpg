@@ -127,7 +127,7 @@ pub struct Caps {
 
 impl Caps {
     #[must_use]
-    pub const fn whole_cells(self) -> Self {
+    pub const fn without_cell_cap(self) -> Self {
         Self {
             cell_cap: usize::MAX,
             ..self

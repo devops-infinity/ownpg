@@ -332,7 +332,7 @@ fn output_dir(call: &Call) -> Result<PathBuf> {
             source: error,
         }
     })?;
-    if let Some(mode) = writable_by_others(path)? {
+    if let Some(mode) = others_write_mode(path)? {
         return Err(Error::ConfigInvalid {
             setting: "output_dir".to_owned(),
             value: path.display().to_string(),
@@ -345,7 +345,7 @@ fn output_dir(call: &Call) -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn writable_by_others(path: &Path) -> Result<Option<u32>> {
+fn others_write_mode(path: &Path) -> Result<Option<u32>> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::metadata(path).map_err(|source| Error::ConfigUnreadable {
         path: path.to_path_buf(),
@@ -356,7 +356,7 @@ fn writable_by_others(path: &Path) -> Result<Option<u32>> {
 }
 
 #[cfg(not(unix))]
-fn writable_by_others(_path: &Path) -> Result<Option<u32>> {
+fn others_write_mode(_path: &Path) -> Result<Option<u32>> {
     Ok(None)
 }
 
@@ -616,7 +616,7 @@ fn synthetic_classification(
         relations: Vec::new(),
         functions: Vec::new(),
         fingerprint: sha256_hex(command.as_bytes()).chars().take(16).collect(),
-        statement_digest: sha256_hex(command.as_bytes()),
+        sql_sha256: sha256_hex(command.as_bytes()),
         normalized: command.to_owned(),
         runs_outside_transaction: true,
         explain_analyze: false,

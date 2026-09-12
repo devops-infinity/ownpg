@@ -18,8 +18,8 @@ const TOKEN_READ: &str = "reader-token-0123456789abcdef";
 const TOKEN_WRITE: &str = "writer-token-0123456789abcdef";
 const TOKEN_WRITE_ONLY: &str = "write-only-token-0123456789abcdef";
 
-struct Remote {
-    base: String,
+struct HttpRig {
+    base_url: String,
     client: reqwest::Client,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<ownpg_core::Result<ownpg_core::ExitClass>>,
@@ -29,7 +29,7 @@ async fn remote(
     scratch: &support::Scratch,
     auth: Option<AuthMode>,
     extra: &[(&str, &str)],
-) -> Remote {
+) -> HttpRig {
     let settings = Arc::new(scratch.settings_with(
         FlagLayer {
             schema: Some("app".to_owned()),
@@ -75,7 +75,7 @@ async fn remote(
     let listening = http::Listening::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
-    let base = format!("http://{}", listening.local_addr);
+    let base_url = format!("http://{}", listening.local_addr);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(http::serve(
         listening,
@@ -88,15 +88,15 @@ async fn remote(
         Duration::from_secs(5),
     ));
     let _ = rustls::crypto::ring::default_provider().install_default();
-    Remote {
-        base,
+    HttpRig {
+        base_url,
         client: reqwest::Client::builder().build().unwrap(),
         stop: Some(stop),
         task,
     }
 }
 
-impl Remote {
+impl HttpRig {
     fn call_body(&self, tool: &str, arguments: Value) -> Value {
         json!({
             "jsonrpc": "2.0",
@@ -116,7 +116,7 @@ impl Remote {
     fn post(&self, body: &Value) -> reqwest::RequestBuilder {
         let method = body["method"].as_str().unwrap_or("tools/list").to_owned();
         self.client
-            .post(format!("{}/mcp", self.base))
+            .post(format!("{}/mcp", self.base_url))
             .header("MCP-Protocol-Version", PROTOCOL)
             .header("Mcp-Method", method)
             .header("Accept", "application/json, text/event-stream")
@@ -170,14 +170,14 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
 
     let live = remote
         .client
-        .get(format!("{}/healthz/live", remote.base))
+        .get(format!("{}/healthz/live", remote.base_url))
         .send()
         .await
         .unwrap();
     assert_eq!(live.status(), 200);
     let ready = remote
         .client
-        .get(format!("{}/healthz/ready", remote.base))
+        .get(format!("{}/healthz/ready", remote.base_url))
         .send()
         .await
         .unwrap();
@@ -236,7 +236,7 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
 
     let get = remote
         .client
-        .get(format!("{}/mcp", remote.base))
+        .get(format!("{}/mcp", remote.base_url))
         .header("Accept", "text/event-stream")
         .header("MCP-Protocol-Version", PROTOCOL)
         .send()
@@ -246,7 +246,7 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
     assert_eq!(get.headers().get("allow").unwrap(), "POST");
     let delete = remote
         .client
-        .delete(format!("{}/mcp", remote.base))
+        .delete(format!("{}/mcp", remote.base_url))
         .header("MCP-Protocol-Version", PROTOCOL)
         .send()
         .await
@@ -275,7 +275,7 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
     let huge = "x".repeat(1024 * 1024 + 1);
     let oversized = remote
         .client
-        .post(format!("{}/mcp", remote.base))
+        .post(format!("{}/mcp", remote.base_url))
         .header("MCP-Protocol-Version", PROTOCOL)
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")
@@ -289,7 +289,7 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
         .client
         .get(format!(
             "{}/.well-known/oauth-protected-resource/mcp",
-            remote.base
+            remote.base_url
         ))
         .send()
         .await
@@ -403,7 +403,7 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     });
     let response = remote
         .client
-        .post(format!("{}/mcp", remote.base))
+        .post(format!("{}/mcp", remote.base_url))
         .header("MCP-Protocol-Version", "2025-11-25")
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")
@@ -467,7 +467,7 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     let older_list = json!({"jsonrpc": "2.0", "id": 5, "method": "resources/list", "params": {}});
     let response = remote
         .client
-        .post(format!("{}/mcp", remote.base))
+        .post(format!("{}/mcp", remote.base_url))
         .header("MCP-Protocol-Version", "2025-11-25")
         .header("Accept", "application/json, text/event-stream")
         .header("Content-Type", "application/json")
@@ -531,7 +531,7 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     remote.finish().await;
 }
 
-async fn guess_until_throttled(remote: &Remote, forwarded: &str) -> (u16, u16) {
+async fn guess_until_throttled(remote: &HttpRig, forwarded: &str) -> (u16, u16) {
     let body = remote.call_body("pg_health", json!({}));
     let mut first = None;
     let mut last = 401;
@@ -658,10 +658,10 @@ impl Issuer {
         let encode = |value: &Value| {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
         };
-        let signed = format!("{}.{}", encode(&header), encode(&claims));
-        let signature = self.key.sign(signed.as_bytes());
+        let signing_input = format!("{}.{}", encode(&header), encode(&claims));
+        let signature = self.key.sign(signing_input.as_bytes());
         format!(
-            "{signed}.{}",
+            "{signing_input}.{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.as_ref())
         )
     }
@@ -702,7 +702,7 @@ async fn oauth_tokens_are_checked_against_the_issuer_keys() {
         .client
         .get(format!(
             "{}/.well-known/oauth-protected-resource",
-            remote.base
+            remote.base_url
         ))
         .send()
         .await
@@ -716,7 +716,7 @@ async fn oauth_tokens_are_checked_against_the_issuer_keys() {
 
     let ready = remote
         .client
-        .get(format!("{}/healthz/ready", remote.base))
+        .get(format!("{}/healthz/ready", remote.base_url))
         .send()
         .await
         .unwrap();
@@ -859,7 +859,7 @@ async fn an_unreachable_key_endpoint_fails_closed() {
     .await;
     let ready = remote
         .client
-        .get(format!("{}/healthz/ready", remote.base))
+        .get(format!("{}/healthz/ready", remote.base_url))
         .send()
         .await
         .unwrap();
@@ -868,7 +868,7 @@ async fn an_unreachable_key_endpoint_fails_closed() {
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(json!({"alg": "EdDSA", "kid": "k1"}).to_string());
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        json!({"iss": "https://issuer.test", "aud": format!("{}/mcp", remote.base), "exp": now() + 600})
+        json!({"iss": "https://issuer.test", "aud": format!("{}/mcp", remote.base_url), "exp": now() + 600})
             .to_string(),
     );
     let token = format!("{header}.{payload}.AAAA");
@@ -898,18 +898,18 @@ async fn metrics_are_exported_to_the_configured_collector() {
         .with_env_filter("debug")
         .with_test_writer()
         .try_init();
-    let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter = Arc::clone(&received);
-    let sizes = Arc::clone(&bytes);
+    let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let byte_total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let request_count_in_handler = Arc::clone(&request_count);
+    let byte_total_in_handler = Arc::clone(&byte_total);
     let app = axum::Router::new().route(
         "/v1/metrics",
         axum::routing::post(move |body: axum::body::Bytes| {
-            let counter = Arc::clone(&counter);
-            let sizes = Arc::clone(&sizes);
+            let request_count = Arc::clone(&request_count_in_handler);
+            let byte_total = Arc::clone(&byte_total_in_handler);
             async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                sizes.fetch_add(body.len(), std::sync::atomic::Ordering::SeqCst);
+                request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                byte_total.fetch_add(body.len(), std::sync::atomic::Ordering::SeqCst);
                 axum::http::StatusCode::OK
             }
         }),
@@ -932,9 +932,9 @@ async fn metrics_are_exported_to_the_configured_collector() {
     assert_eq!(status, 200);
     remote.finish().await;
     assert!(
-        received.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        request_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
         "no metrics payload reached the collector"
     );
-    assert!(bytes.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    assert!(byte_total.load(std::sync::atomic::Ordering::SeqCst) > 0);
     collector.abort();
 }

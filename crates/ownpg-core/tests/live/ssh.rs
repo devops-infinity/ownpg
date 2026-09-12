@@ -78,7 +78,7 @@ struct RunningBastion {
 
 async fn start_bastion(client_key: PublicKey) -> RunningBastion {
     let host_key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
-    let public = host_key.public_key().clone();
+    let host_public_key = host_key.public_key().clone();
     let config = Arc::new(server::Config {
         keys: vec![host_key],
         auth_rejection_time: std::time::Duration::from_millis(10),
@@ -105,7 +105,7 @@ async fn start_bastion(client_key: PublicKey) -> RunningBastion {
     });
     RunningBastion {
         port,
-        host_key: public,
+        host_key: host_public_key,
         _task: task,
     }
 }
@@ -135,7 +135,7 @@ fn write_named_client_key(dir: &std::path::Path, name: &str) -> ClientKey {
     }
 }
 
-fn settings_for(
+fn tunnel_settings(
     scratch: &support::Scratch,
     ssh: SshEntry,
     trust_new_host: Option<bool>,
@@ -184,7 +184,7 @@ async fn a_tunnel_through_an_in_process_bastion_reaches_postgresql() {
     let bastion = start_bastion(client_key.public.clone()).await;
     let known_hosts = dir.path().join("known_hosts");
     learn_known_hosts_path("127.0.0.1", bastion.port, &bastion.host_key, &known_hosts).unwrap();
-    let settings = settings_for(
+    let settings = tunnel_settings(
         &scratch,
         SshEntry {
             host: "127.0.0.1".to_owned(),
@@ -236,7 +236,7 @@ async fn an_unknown_host_key_is_refused_with_its_fingerprint_unless_trusted() {
         known_hosts: Some(known_hosts.clone()),
         ..SshEntry::default()
     };
-    let strict = Connector::new(Arc::new(settings_for(&scratch, entry.clone(), None)));
+    let strict = Connector::new(Arc::new(tunnel_settings(&scratch, entry.clone(), None)));
     let error = strict
         .connect()
         .await
@@ -245,7 +245,7 @@ async fn an_unknown_host_key_is_refused_with_its_fingerprint_unless_trusted() {
     assert!(error.to_string().contains("SHA256:"), "{error}");
     assert!(!known_hosts.exists());
 
-    let trusting = Connector::new(Arc::new(settings_for(&scratch, entry, Some(true))));
+    let trusting = Connector::new(Arc::new(tunnel_settings(&scratch, entry, Some(true))));
     let session = trusting
         .connect()
         .await
@@ -258,7 +258,7 @@ async fn an_unknown_host_key_is_refused_with_its_fingerprint_unless_trusted() {
     );
     drop(session);
 
-    let again = Connector::new(Arc::new(settings_for(
+    let again = Connector::new(Arc::new(tunnel_settings(
         &scratch,
         SshEntry {
             host: "127.0.0.1".to_owned(),
@@ -289,7 +289,7 @@ async fn a_jump_host_chain_reaches_the_bastion_and_then_postgresql() {
     let known_hosts = dir.path().join("known_hosts");
     learn_known_hosts_path("127.0.0.1", first.port, &first.host_key, &known_hosts).unwrap();
     learn_known_hosts_path("127.0.0.1", second.port, &second.host_key, &known_hosts).unwrap();
-    let settings = settings_for(
+    let settings = tunnel_settings(
         &scratch,
         SshEntry {
             host: "127.0.0.1".to_owned(),
@@ -337,7 +337,7 @@ async fn a_wrong_key_is_refused_with_every_method_named() {
     let bastion = start_bastion(accepted.public.clone()).await;
     let known_hosts = dir.path().join("known_hosts");
     learn_known_hosts_path("127.0.0.1", bastion.port, &bastion.host_key, &known_hosts).unwrap();
-    let settings = settings_for(
+    let settings = tunnel_settings(
         &scratch,
         SshEntry {
             host: "127.0.0.1".to_owned(),
@@ -391,7 +391,7 @@ async fn an_ssh_agent_holding_the_key_authenticates_the_tunnel() {
     let socket = start_agent(dir.path(), &key).await;
     let known_hosts = dir.path().join("known_hosts");
     learn_known_hosts_path("127.0.0.1", bastion.port, &bastion.host_key, &known_hosts).unwrap();
-    let settings = settings_for(
+    let settings = tunnel_settings(
         &scratch,
         SshEntry {
             host: "127.0.0.1".to_owned(),
@@ -457,7 +457,7 @@ async fn an_ssh_config_alias_supplies_the_host_port_user_and_key() {
         ),
     )
     .unwrap();
-    let settings = settings_for(
+    let settings = tunnel_settings(
         &scratch,
         SshEntry {
             host: "bastion-alias".to_owned(),
@@ -500,7 +500,7 @@ async fn a_pooled_engine_opens_one_tunnel_per_pooled_connection() {
     let bastion = start_bastion(client_key.public.clone()).await;
     let known_hosts = dir.path().join("known_hosts");
     learn_known_hosts_path("127.0.0.1", bastion.port, &bastion.host_key, &known_hosts).unwrap();
-    let settings = settings_for(
+    let settings = tunnel_settings(
         &scratch,
         SshEntry {
             host: "127.0.0.1".to_owned(),
@@ -524,14 +524,18 @@ async fn a_pooled_engine_opens_one_tunnel_per_pooled_connection() {
     };
     let alice = engine.begin_transaction("alice").await.unwrap();
     let bob = engine.begin_transaction("bob").await.unwrap();
-    let pids = engine
+    let distinct_pids = engine
         .run_read(
             "SELECT count(DISTINCT pid) FROM pg_stat_activity WHERE application_name LIKE 'ownpg/%' AND datname = current_database()",
             caps,
         )
         .await
         .unwrap();
-    let count: i64 = pids.rows[0][0].as_deref().unwrap().parse().unwrap();
+    let count: i64 = distinct_pids.rows[0][0]
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(
         count >= 3,
         "{count} tunneled connections for two handles and a read"

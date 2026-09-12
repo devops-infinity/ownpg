@@ -166,18 +166,18 @@ async fn run_maintenance(call: &Call, job: Job) -> Outcome {
     let caps = call.caps(0);
     let statement = sql.clone();
     let outside = classification.runs_outside_transaction;
-    let backend = Arc::new(AtomicI32::new(0));
-    let reported = Arc::clone(&backend);
+    let backend_pid = Arc::new(AtomicI32::new(0));
+    let pid_report = Arc::clone(&backend_pid);
     let work = async move {
         engine
-            .run_write_reporting(
+            .run_write_reporting_pid(
                 &statement,
                 caps,
                 &principal,
                 None,
                 outside,
                 Some(timeout),
-                Some(&reported),
+                Some(&pid_report),
             )
             .await
     };
@@ -192,7 +192,7 @@ async fn run_maintenance(call: &Call, job: Job) -> Outcome {
                     outcome = &mut work => break outcome,
                     () = poll => {
                         ticks += 1.0;
-                        let pid = backend.load(Ordering::Relaxed);
+                        let pid = backend_pid.load(Ordering::Relaxed);
                         let rows = if pid == 0 {
                             Vec::new()
                         } else {

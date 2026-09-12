@@ -17,11 +17,11 @@ use rmcp::{ClientHandler, ClientLifecycleMode, ClientServiceExt, RoleClient};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Default)]
-struct Counting {
+struct ProgressCounter {
     progress: Arc<AtomicUsize>,
 }
 
-impl ClientHandler for Counting {
+impl ClientHandler for ProgressCounter {
     async fn on_progress(
         &self,
         notification: ProgressNotificationParam,
@@ -37,7 +37,7 @@ impl ClientHandler for Counting {
 }
 
 struct Rig {
-    client: RunningService<RoleClient, Counting>,
+    client: RunningService<RoleClient, ProgressCounter>,
     server_task: tokio::task::JoinHandle<ownpg_core::Result<ownpg_core::ExitClass>>,
     progress: Arc<AtomicUsize>,
 }
@@ -79,7 +79,7 @@ async fn rig(scratch: &support::Scratch, mode: Mode, groups: Vec<ToolGroup>) -> 
     let (server_read, server_write) = tokio::io::split(server_side);
     let server_task = tokio::spawn(stdio::serve(server, server_read, server_write));
     let (client_read, client_write) = tokio::io::split(client_side);
-    let handler = Counting::default();
+    let handler = ProgressCounter::default();
     let progress = Arc::clone(&handler.progress);
     let client = handler
         .serve_with_lifecycle((client_read, client_write), ClientLifecycleMode::Initialize)
@@ -245,14 +245,14 @@ async fn maintenance_tools_vacuum_analyze_reindex_and_refresh_with_progress() {
         "{body}"
     );
 
-    let cancel_self = rig
+    let cancel_dry_run = rig
         .ok(
             "pg_backend",
             json!({"operation": "cancel", "pid": 1, "dry_run": true}),
         )
         .await;
     assert_eq!(
-        cancel_self["sql"],
+        cancel_dry_run["sql"],
         "SELECT pg_catalog.pg_cancel_backend(1) AS signalled"
     );
     let terminate = rig

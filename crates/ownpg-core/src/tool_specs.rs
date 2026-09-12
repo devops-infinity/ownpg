@@ -46,7 +46,7 @@ pub fn version_triple(text: &str) -> Option<(u64, u64, u64)> {
 
 impl Deprecation {
     #[must_use]
-    pub fn honors_the_window(&self, current: &str) -> bool {
+    pub fn within_window(&self, current: &str) -> bool {
         let (Some((major, minor, _)), Some((removed_major, removed_minor, _))) =
             (version_triple(current), version_triple(self.removed_in))
         else {
@@ -471,24 +471,24 @@ mod tests {
             replacement: "pg_run_query",
             removed_in: "0.1.5",
         };
-        assert!(!soon.honors_the_window("0.1.0"));
+        assert!(!soon.within_window("0.1.0"));
         let next_minor = Deprecation {
             replacement: "pg_run_query",
             removed_in: "0.2.0",
         };
-        assert!(next_minor.honors_the_window("0.1.7"));
+        assert!(next_minor.within_window("0.1.7"));
         let next_major = Deprecation {
             replacement: "pg_run_query",
             removed_in: "2.0.0",
         };
-        assert!(next_major.honors_the_window("1.9.0"));
-        assert!(!next_major.honors_the_window("2.0.0"));
+        assert!(next_major.within_window("1.9.0"));
+        assert!(!next_major.within_window("2.0.0"));
         assert!(version_triple("1.2.3-rc.1").is_some());
         assert!(version_triple("1.2").is_none());
         for tool in TOOLS.iter() {
             if let Some(deprecation) = tool.deprecated {
                 assert!(
-                    deprecation.honors_the_window(crate::VERSION),
+                    deprecation.within_window(crate::VERSION),
                     "{} is removed in {}, too soon after {}",
                     tool.name,
                     deprecation.removed_in,

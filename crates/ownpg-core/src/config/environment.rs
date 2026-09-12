@@ -8,8 +8,15 @@ pub struct Environment {
     os_user: Option<String>,
 }
 
-const SECRET_NAME_ENDINGS: &[&str] =
-    &["PASSWORD", "PASSPHRASE", "TOKEN", "TOKENS", "SECRET", "KEY"];
+const SECRET_NAME_ENDINGS: &[&str] = &[
+    "PASSWORD",
+    "PASSPHRASE",
+    "TOKEN",
+    "TOKENS",
+    "SECRET",
+    "KEY",
+    "DSN",
+];
 
 impl std::fmt::Debug for Environment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -108,10 +115,12 @@ mod tests {
         let env = Environment::default()
             .with_var("PGPASSWORD", "hunter2")
             .with_var("OWNPG_BEARER_TOKENS", "abc")
+            .with_var("OWNPG_DSN", "postgresql://app:inline-secret@db.example/app")
             .with_var("PGHOST", "db.example");
         let rendered = format!("{env:?}");
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert!(!rendered.contains("abc"), "{rendered}");
+        assert!(!rendered.contains("inline-secret"), "{rendered}");
         assert!(rendered.contains("db.example"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
     }

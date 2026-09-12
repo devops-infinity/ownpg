@@ -38,7 +38,7 @@ impl Home {
         }
     }
 
-    fn variables(&self) -> Vec<(&'static str, std::path::PathBuf)> {
+    fn env_vars(&self) -> Vec<(&'static str, std::path::PathBuf)> {
         let root = self.dir.path();
         vec![
             ("HOME", root.to_path_buf()),
@@ -53,13 +53,13 @@ impl Home {
     }
 
     fn apply(&self, command: &mut Command) {
-        for (name, value) in self.variables() {
+        for (name, value) in self.env_vars() {
             command.env(name, value);
         }
     }
 
     fn apply_std(&self, command: &mut std::process::Command) {
-        for (name, value) in self.variables() {
+        for (name, value) in self.env_vars() {
             command.env(name, value);
         }
     }
@@ -215,9 +215,10 @@ fn config_path_and_init_write_under_the_config_directory() {
         "the config path must sit under the isolated home on every platform: {profiles_line}"
     );
 
-    let mut json = ownpg();
-    home.apply(&mut json);
-    json.args(["config", "path", "--format", "json"])
+    let mut json_path = ownpg();
+    home.apply(&mut json_path);
+    json_path
+        .args(["config", "path", "--format", "json"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"format_version\": 1"))
@@ -653,25 +654,28 @@ fn the_platform_keychain_holds_the_password_and_the_ssh_passphrase() {
 #[test]
 fn audit_verify_checks_a_written_log_and_names_the_bad_line() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let log = dir.path().join("audit.jsonl");
-    std::fs::write(&log, "{\"v\":1,\"marker\":\"chain-start\",\"prev\":\"\"}\n")
-        .expect("the log is writable");
+    let log_path = dir.path().join("audit.jsonl");
+    std::fs::write(
+        &log_path,
+        "{\"v\":1,\"marker\":\"chain-start\",\"prev\":\"\"}\n",
+    )
+    .expect("the log_path is writable");
     ownpg()
         .arg("audit")
         .arg("verify")
-        .arg(&log)
+        .arg(&log_path)
         .assert()
         .success()
         .stdout(predicate::str::contains("0 chained lines verified"));
     std::fs::write(
-        &log,
+        &log_path,
         "{\"v\":1,\"marker\":\"chain-start\",\"prev\":\"\"}\n{\"tool\":\"x\",\"prev\":\"nope\"}\n",
     )
-    .expect("the log is writable");
+    .expect("the log_path is writable");
     ownpg()
         .arg("audit")
         .arg("verify")
-        .arg(&log)
+        .arg(&log_path)
         .assert()
         .code(1)
         .stderr(predicate::str::contains("line 2"));

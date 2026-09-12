@@ -122,7 +122,7 @@ pub(crate) fn render(command: &clap::Command, output: &mut dyn Write) -> std::io
     render_exit_status(output)?;
     render_environment(output)?;
     page.render_version_section(output)?;
-    render_reporting(output)
+    render_bug_reporting(output)
 }
 
 fn render_exit_status(output: &mut dyn Write) -> std::io::Result<()> {
@@ -150,7 +150,7 @@ fn render_environment(output: &mut dyn Write) -> std::io::Result<()> {
     roff.to_writer(output)
 }
 
-fn render_reporting(output: &mut dyn Write) -> std::io::Result<()> {
+fn render_bug_reporting(output: &mut dyn Write) -> std::io::Result<()> {
     let mut roff = Roff::default();
     roff.control("SH", ["REPORTING BUGS"]);
     roff.text([roman(format!(

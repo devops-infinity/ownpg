@@ -194,7 +194,7 @@ impl ProfileFile {
     }
 }
 
-pub const TEMPLATE: &str = r#"# OwnPG profile file. Every key is optional unless the tool says otherwise.
+pub const PROFILE_TEMPLATE: &str = r#"# OwnPG profile file. Every key is optional unless the tool says otherwise.
 # Flags win over environment variables, which win over this file.
 format = 1
 
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn the_template_loads_and_names_every_key_with_its_uncommented_form_parsing_too() {
-        let parsed: ProfileFile = toml::from_str(TEMPLATE).unwrap();
+        let parsed: ProfileFile = toml::from_str(PROFILE_TEMPLATE).unwrap();
         assert_eq!(parsed, ProfileFile::example());
         let schema = serde_json::to_value(schemars::schema_for!(ProfileFile)).unwrap();
         for pointer in [
@@ -434,14 +434,14 @@ mod tests {
                 let plain = format!("{key} = ");
                 let table = format!("# [profiles.local.{key}]");
                 assert!(
-                    TEMPLATE.contains(&commented)
-                        || TEMPLATE.contains(&plain)
-                        || TEMPLATE.contains(&table),
+                    PROFILE_TEMPLATE.contains(&commented)
+                        || PROFILE_TEMPLATE.contains(&plain)
+                        || PROFILE_TEMPLATE.contains(&table),
                     "the profile template does not show `{key}`"
                 );
             }
         }
-        let uncommented: String = TEMPLATE
+        let uncommented: String = PROFILE_TEMPLATE
             .lines()
             .map(|line| {
                 line.strip_prefix("# ")
@@ -463,30 +463,30 @@ mod tests {
             include_str!("http.rs"),
             include_str!("libpq.rs"),
         ];
-        let mut read = std::collections::BTreeSet::new();
+        let mut read_variables = std::collections::BTreeSet::new();
         for source in sources {
             for (index, _) in source.match_indices("\"OWNPG_") {
                 let rest = &source[index + 1..];
                 let end = rest.find('"').unwrap_or(rest.len());
-                read.insert(rest[..end].to_owned());
+                read_variables.insert(rest[..end].to_owned());
             }
             for (index, _) in source.match_indices("(\"PG") {
                 let rest = &source[index + 2..];
                 let end = rest.find('"').unwrap_or(rest.len());
-                read.insert(rest[..end].to_owned());
+                read_variables.insert(rest[..end].to_owned());
             }
         }
-        let template_only = ["OWNPG_PROFILE", "OWNPG_BEARER_TOKENS"];
-        for variable in &read {
-            if template_only.contains(&variable.as_str()) {
+        let exempt = ["OWNPG_PROFILE", "OWNPG_BEARER_TOKENS"];
+        for variable in &read_variables {
+            if exempt.contains(&variable.as_str()) {
                 continue;
             }
             assert!(
-                TEMPLATE.contains(variable.as_str()),
+                PROFILE_TEMPLATE.contains(variable.as_str()),
                 "the profile template does not mention {variable}"
             );
         }
-        assert!(read.len() > 40, "{read:?}");
+        assert!(read_variables.len() > 40, "{read_variables:?}");
     }
 
     #[test]
