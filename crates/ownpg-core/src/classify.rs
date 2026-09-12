@@ -164,6 +164,7 @@ pub struct Classification {
     pub relations: Vec<RelationName>,
     pub functions: Vec<String>,
     pub fingerprint: String,
+    pub statement_digest: String,
     pub normalized: String,
     pub runs_outside_transaction: bool,
     pub explain_analyze: bool,
@@ -210,6 +211,7 @@ pub fn classify(sql: &str) -> Result<Classification> {
     let fingerprint = pg_query::fingerprint(sql)
         .map(|value| value.hex)
         .unwrap_or_default();
+    let statement_digest = crate::audit::sha256_hex(sql.trim().as_bytes());
     let normalized = pg_query::normalize(sql).unwrap_or_default();
     let top = tree
         .pointer("/stmts/0/stmt/node")
@@ -222,6 +224,9 @@ pub fn classify(sql: &str) -> Result<Classification> {
 
     let mut found = Findings::default();
     walk(&tree, &mut found);
+    found
+        .relations
+        .retain(|relation| relation.schema.is_some() || !found.cte_names.contains(&relation.name));
 
     let mut classification = Classification {
         class: StatementClass::Read,
@@ -231,6 +236,7 @@ pub fn classify(sql: &str) -> Result<Classification> {
         relations: found.relations,
         functions: found.functions.clone(),
         fingerprint,
+        statement_digest,
         normalized,
         runs_outside_transaction: false,
         explain_analyze: false,
@@ -322,7 +328,7 @@ pub fn check(classification: &Classification, mode: Mode, scope: &SchemaScope<'_
                 }
             }
             None => {
-                if scope.require_qualified_names {
+                if scope.require_qualified_names && !relation.name.starts_with("pg_") {
                     return Err(refuse(format!(
                         "`{}` is not schema-qualified, and a pooled connection has no search_path",
                         relation.name
@@ -345,6 +351,7 @@ struct Findings {
     statement_kinds: Vec<String>,
     functions: Vec<String>,
     relations: Vec<RelationName>,
+    cte_names: Vec<String>,
     copies: Vec<CopyShape>,
     destructive_reason: Option<String>,
     returning: bool,
@@ -533,6 +540,11 @@ fn walk(value: &Value, found: &mut Findings) {
                     "FuncCall" => {
                         if let Some(name) = dotted_name(child.get("funcname")) {
                             found.functions.push(name);
+                        }
+                    }
+                    "CommonTableExpr" => {
+                        if let Some(name) = child.get("ctename").and_then(Value::as_str) {
+                            found.cte_names.push(name.to_owned());
                         }
                     }
                     "CopyStmt" => found.copies.push(CopyShape {

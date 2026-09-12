@@ -148,6 +148,7 @@ where
                 }
             }
             reason = &mut signal => {
+                tracing::info!("stopping; a second signal exits at once");
                 cancel.cancel();
                 let started = Instant::now();
                 let second = std::pin::pin!(wait_for_signal());
@@ -165,9 +166,12 @@ where
             }
         }
     };
-    let deadline = tokio::time::timeout(super::SHUTDOWN_DEADLINE, server.shutdown());
+    let deadline = tokio::time::timeout(
+        super::SHUTDOWN_DEADLINE + super::SHUTDOWN_HEADROOM,
+        server.shutdown(),
+    );
     if deadline.await.is_err() {
-        tracing::warn!("shutdown passed the one second deadline");
+        tracing::warn!("shutdown passed its deadline");
     }
     Ok(exit_for(stop))
 }

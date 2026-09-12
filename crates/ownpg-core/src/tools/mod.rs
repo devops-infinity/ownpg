@@ -102,6 +102,7 @@ impl Context {
         Caps {
             row_cap: requested as usize,
             byte_cap: limits.byte_cap.value as usize,
+            cell_cap: crate::shape::CELL_CAP_BYTES,
         }
     }
 }
@@ -113,7 +114,9 @@ pub struct AuditFacts {
     pub statement_hash: Option<String>,
     pub statement: Option<String>,
     pub handle_id: Option<String>,
+    pub cursor_id: Option<String>,
     pub row_count: Option<u64>,
+    pub rows_affected: Option<u64>,
     pub truncated: bool,
     pub decision: Option<Decision>,
     pub relations: Vec<String>,
@@ -123,8 +126,11 @@ impl AuditFacts {
     #[must_use]
     pub fn with_result(mut self, result: &ResultSet) -> Self {
         self.row_count = Some(result.row_count as u64);
+        self.rows_affected = result.rows_affected;
         self.truncated = result.truncated;
-        self.handle_id.clone_from(&result.cursor);
+        if result.cursor.is_some() {
+            self.cursor_id.clone_from(&result.cursor);
+        }
         self
     }
 }
@@ -136,15 +142,29 @@ pub struct ToolOutput {
     pub facts: AuditFacts,
 }
 
+fn sanitize_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.chars().any(crate::shape::is_invisible) {
+                *text = crate::shape::sanitize(text);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sanitize_strings),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(sanitize_strings),
+        _ => {}
+    }
+}
+
 impl ToolOutput {
     pub fn structured<T: Serialize>(value: &T, text: String) -> Result<Self, ToolFailure> {
-        let structured = serde_json::to_value(value).map_err(|error| {
+        let mut structured = serde_json::to_value(value).map_err(|error| {
             ToolFailure::from(Error::ProtocolFailed {
                 detail: format!("the result could not be serialized: {error}"),
             })
         })?;
+        sanitize_strings(&mut structured);
         Ok(Self {
-            text,
+            text: crate::shape::sanitize(&text),
             structured,
             facts: AuditFacts::default(),
         })
@@ -375,6 +395,7 @@ pub fn text_rows(
     let caps = Caps {
         row_cap: rows.len().max(1),
         byte_cap: usize::MAX,
+        cell_cap: crate::shape::CELL_CAP_BYTES,
     };
     let mut collector = crate::shape::Collector::new(
         columns

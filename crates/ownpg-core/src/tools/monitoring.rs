@@ -298,7 +298,7 @@ pub(crate) fn bloat_sql(schema: &str) -> String {
                           23 + CASE WHEN MAX(COALESCE(s.null_frac, 0)) > 0 THEN (7 + count(s.attname)) / 8 ELSE 0::int END \
                              + CASE WHEN bool_or(att.attname = 'oid' AND att.attnum < 0) THEN 4 ELSE 0 END AS tpl_hdr_size, \
                           sum((1 - COALESCE(s.null_frac, 0)) * COALESCE(s.avg_width, 0)) AS tpl_data_size, \
-                          bool_or(att.atttypid = 'pg_catalog.name'::regtype) OR sum(CASE WHEN att.attnum > 0 THEN 1 ELSE 0 END) <> count(s.attname) AS is_na \
+                          bool_or(att.atttypid = 'pg_catalog.name'::regtype) OR sum(CASE WHEN att.attnum > 0 THEN 1 ELSE 0 END) <> count(s.attname) OR bool_or(tbl.reltuples < 0) AS is_na \
                    FROM pg_catalog.pg_attribute AS att \
                    JOIN pg_catalog.pg_class AS tbl ON att.attrelid = tbl.oid \
                    JOIN pg_catalog.pg_namespace AS ns ON ns.oid = tbl.relnamespace \
@@ -328,7 +328,7 @@ pub(crate) fn bloat_sql(schema: &str) -> String {
                           24 AS pagehdr, 16 AS pageopqdata, \
                           CASE WHEN max(coalesce(s.null_frac, 0)) = 0 THEN 8 ELSE 8 + ((32 + 8 - 1) / 8) END AS index_tuple_hdr_bm, \
                           sum((1.0 - coalesce(s.null_frac, 0.0)) * coalesce(s.avg_width, 1024)) AS nulldatawidth, \
-                          max(CASE WHEN i.atttypid = 'pg_catalog.name'::regtype THEN 1 ELSE 0 END) > 0 AS is_na \
+                          max(CASE WHEN i.atttypid = 'pg_catalog.name'::regtype THEN 1 ELSE 0 END) > 0 OR bool_or(i.reltuples < 0) AS is_na \
                    FROM ( \
                      SELECT ct.relname AS tblname, ct.relnamespace, ic.idxname, ic.attpos, ic.indkey, ic.indkey[ic.attpos] AS keyno, ic.reltuples, ic.relpages, ic.tbloid, ic.idxoid, ic.fillfactor, \
                             coalesce(a1.attnum, a2.attnum) AS attnum, coalesce(a1.attname, a2.attname) AS attname, coalesce(a1.atttypid, a2.atttypid) AS atttypid, \

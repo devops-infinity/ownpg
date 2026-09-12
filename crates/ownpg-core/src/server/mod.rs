@@ -32,6 +32,7 @@ use crate::tools::{self, Call, Context, Outcome, Reply, Route};
 
 pub const LIST_TTL_MS: u64 = 60_000;
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(1);
+pub const SHUTDOWN_HEADROOM: Duration = Duration::from_secs(2);
 pub const SUPPORTED_VERSIONS: &[ProtocolVersion] =
     &[ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28];
 pub const WEBSITE_URL: &str = "https://github.com/devops-infinity/ownpg-releases";
@@ -99,7 +100,17 @@ pub struct Server {
     info: InitializeResult,
     sinks: std::sync::Mutex<Vec<SubscriptionSink>>,
     older_subscriptions: std::sync::Mutex<Vec<(Peer<RoleServer>, String)>>,
+    parked_invalidations: std::sync::Mutex<std::collections::VecDeque<(String, Vec<String>)>>,
+    sweeper: tokio::task::JoinHandle<()>,
     metrics: Option<metrics::Metrics>,
+}
+
+const PARKED_INVALIDATION_CAP: usize = 64;
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.sweeper.abort();
+    }
 }
 
 impl std::fmt::Debug for Server {
@@ -153,6 +164,25 @@ impl Server {
             (Some(endpoint), Transport::Http) => Some(metrics::Metrics::start(&endpoint.value)?),
             _ => None,
         };
+        let sweeper = {
+            let engine = Arc::clone(&context.engine);
+            let every = engine.sweep_interval();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(every);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    match engine.sweep().await {
+                        Ok(0) => {}
+                        Ok(swept) => {
+                            tracing::debug!(swept, "expired cursors and handles were released")
+                        }
+                        Err(error) => tracing::debug!(%error, "the sweep did not complete"),
+                    }
+                }
+            })
+        };
         Ok(Self {
             context,
             routes,
@@ -163,6 +193,8 @@ impl Server {
             info,
             sinks: std::sync::Mutex::new(Vec::new()),
             older_subscriptions: std::sync::Mutex::new(Vec::new()),
+            parked_invalidations: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            sweeper,
             metrics,
         })
     }
@@ -228,7 +260,6 @@ impl Server {
         Err(ErrorData::invalid_request(error.to_string(), None))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn record_request(
         &self,
         request: &str,
@@ -256,8 +287,10 @@ impl Server {
             decision,
             rule: rule.clone(),
             handle_id: None,
+            cursor_id: None,
             duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             row_count: None,
+            rows_affected: None,
             truncated: false,
             outcome,
             superuser: self.superuser,
@@ -319,14 +352,59 @@ impl Server {
         };
         self.record(name, &outcome, request_id, started.elapsed(), &principal);
         self.refresh_handle_gauge().await;
-        if route.spec.group == Some(ToolGroup::Ddl)
-            && let Ok(Reply::Output(output)) = &outcome
+        if let Ok(Reply::Output(output)) = &outcome
             && output.facts.decision != Some(Decision::DryRun)
         {
-            self.invalidate_resources(&output.facts.relations, older_peer)
-                .await;
+            match route.spec.group {
+                Some(ToolGroup::Ddl) => match &output.facts.handle_id {
+                    Some(handle) => self.park_invalidation(handle, &output.facts.relations),
+                    None => {
+                        self.invalidate_resources(&output.facts.relations, older_peer)
+                            .await;
+                    }
+                },
+                Some(ToolGroup::Transactions) => {
+                    let operation = output.facts.operation.as_deref();
+                    if matches!(operation, Some("commit" | "rollback"))
+                        && let Some(handle) = &output.facts.handle_id
+                    {
+                        let parked = self.take_parked_invalidation(handle);
+                        if operation == Some("commit") && !parked.is_empty() {
+                            self.invalidate_resources(&parked, older_peer).await;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         Some(outcome)
+    }
+
+    fn park_invalidation(&self, handle: &str, relations: &[String]) {
+        let Ok(mut parked) = self.parked_invalidations.lock() else {
+            return;
+        };
+        match parked.iter_mut().find(|(id, _)| id == handle) {
+            Some((_, held)) => held.extend(relations.iter().cloned()),
+            None => {
+                while parked.len() >= PARKED_INVALIDATION_CAP {
+                    parked.pop_front();
+                }
+                parked.push_back((handle.to_owned(), relations.to_vec()));
+            }
+        }
+    }
+
+    fn take_parked_invalidation(&self, handle: &str) -> Vec<String> {
+        let Ok(mut parked) = self.parked_invalidations.lock() else {
+            return Vec::new();
+        };
+        parked
+            .iter()
+            .position(|(id, _)| id == handle)
+            .and_then(|position| parked.remove(position))
+            .map(|(_, relations)| relations)
+            .unwrap_or_default()
     }
 
     async fn invalidate_resources(
@@ -335,11 +413,15 @@ impl Server {
         older_peer: Option<Peer<RoleServer>>,
     ) {
         let scoped = self.context.settings().schema.value.clone();
-        let mut uris = Vec::new();
+        let mut uris = vec![self.schema_resource_uri()];
         for relation in relations {
-            let (schema, name) = tools::catalog::split_name(relation, &scoped);
+            let (schema, name) = relation
+                .split_once('.')
+                .map_or((scoped.as_str(), relation.as_str()), |(schema, name)| {
+                    (schema, name)
+                });
             if schema == scoped {
-                uris.push(self.table_resource_uri(&name));
+                uris.push(self.table_resource_uri(name));
             }
         }
         let sinks: Vec<SubscriptionSink> = self
@@ -347,18 +429,52 @@ impl Server {
             .lock()
             .map(|sinks| sinks.clone())
             .unwrap_or_default();
+        let mut dead = Vec::new();
         for sink in &sinks {
-            for uri in &uris {
-                if let Err(error) = sink.notify_resource_updated(uri.clone()).await {
-                    tracing::debug!(%error, uri, "a resource update was not delivered");
+            let accepted = sink.accepted();
+            let wanted: Vec<&String> = uris
+                .iter()
+                .filter(|uri| {
+                    accepted
+                        .resource_subscriptions
+                        .as_ref()
+                        .is_some_and(|subscribed| subscribed.contains(uri))
+                })
+                .collect();
+            let mut closed = false;
+            for uri in wanted {
+                match sink.notify_resource_updated(uri.clone()).await {
+                    Ok(()) => {}
+                    Err(rmcp::service::SubscriptionSendError::SubscriptionClosed) => {
+                        closed = true;
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, uri, "a resource update was not delivered");
+                    }
                 }
             }
-            if let Err(error) = sink.notify_resource_list_changed().await {
-                tracing::debug!(%error, "a resource list change was not delivered");
+            if !closed && accepted.resources_list_changed == Some(true) {
+                match sink.notify_resource_list_changed().await {
+                    Ok(())
+                    | Err(rmcp::service::SubscriptionSendError::NotificationNotAccepted(_)) => {}
+                    Err(rmcp::service::SubscriptionSendError::SubscriptionClosed) => closed = true,
+                    Err(error) => {
+                        tracing::debug!(%error, "a resource list change was not delivered");
+                    }
+                }
+            }
+            if closed {
+                dead.push(sink.id().clone());
             }
         }
+        if !dead.is_empty()
+            && let Ok(mut held) = self.sinks.lock()
+        {
+            held.retain(|sink| !dead.contains(sink.id()));
+        }
         if let Some(peer) = &older_peer {
-            for uri in &uris {
+            for uri in uris.iter().skip(1) {
                 notify_older_peer(peer, uri).await;
             }
             if let Err(error) = peer.notify_resource_list_changed().await {
@@ -438,8 +554,10 @@ impl Server {
             decision,
             rule: rule.clone(),
             handle_id: facts.handle_id.clone(),
+            cursor_id: facts.cursor_id.clone(),
             duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             row_count: facts.row_count,
+            rows_affected: facts.rows_affected,
             truncated: facts.truncated,
             outcome: result,
             superuser: self.superuser,
@@ -462,6 +580,7 @@ impl Server {
     }
 
     pub async fn shutdown(&self) {
+        self.sweeper.abort();
         let engine = Arc::clone(&self.context.engine);
         let release = async {
             if let Err(error) = engine.cancel_running_statements().await {
@@ -753,7 +872,6 @@ impl ServerHandler for Server {
         Some(requested.clone())
     }
 
-    #[allow(deprecated)]
     async fn subscribe(
         &self,
         request: SubscribeRequestParams,
@@ -796,7 +914,6 @@ impl ServerHandler for Server {
         Ok(())
     }
 
-    #[allow(deprecated)]
     async fn unsubscribe(
         &self,
         request: UnsubscribeRequestParams,
@@ -882,6 +999,14 @@ async fn notify_older_peer(peer: &Peer<RoleServer>, uri: &str) {
 
 pub fn audit_sink(settings: &crate::config::Settings) -> Result<Sink> {
     Sink::open(
+        &settings.audit,
+        &settings.paths.data_dir,
+        settings.profile.as_deref(),
+    )
+}
+
+pub fn audit_probe(settings: &crate::config::Settings) -> Result<Option<std::path::PathBuf>> {
+    Sink::probe(
         &settings.audit,
         &settings.paths.data_dir,
         settings.profile.as_deref(),

@@ -32,6 +32,31 @@ pub struct Deprecation {
     pub removed_in: &'static str,
 }
 
+pub const DEPRECATION_WINDOW_MINORS: u64 = 1;
+
+#[must_use]
+pub fn version_triple(text: &str) -> Option<(u64, u64, u64)> {
+    let core = text.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+    let major = parts.next()??;
+    let minor = parts.next()??;
+    let patch = parts.next()??;
+    parts.next().is_none().then_some((major, minor, patch))
+}
+
+impl Deprecation {
+    #[must_use]
+    pub fn honors_the_window(&self, current: &str) -> bool {
+        let (Some((major, minor, _)), Some((removed_major, removed_minor, _))) =
+            (version_triple(current), version_triple(self.removed_in))
+        else {
+            return false;
+        };
+        removed_major > major
+            || (removed_major == major && removed_minor >= minor + DEPRECATION_WINDOW_MINORS)
+    }
+}
+
 impl ToolSpec {
     #[must_use]
     pub fn description(&self, description: &'static str) -> std::borrow::Cow<'static, str> {
@@ -438,6 +463,80 @@ mod tests {
             "Count rows in a table."
         );
         assert!(TOOLS.iter().all(|tool| tool.deprecated.is_none()));
+    }
+
+    #[test]
+    fn a_deprecation_removes_the_tool_no_sooner_than_the_window_allows() {
+        let soon = Deprecation {
+            replacement: "pg_run_query",
+            removed_in: "0.1.5",
+        };
+        assert!(!soon.honors_the_window("0.1.0"));
+        let next_minor = Deprecation {
+            replacement: "pg_run_query",
+            removed_in: "0.2.0",
+        };
+        assert!(next_minor.honors_the_window("0.1.7"));
+        let next_major = Deprecation {
+            replacement: "pg_run_query",
+            removed_in: "2.0.0",
+        };
+        assert!(next_major.honors_the_window("1.9.0"));
+        assert!(!next_major.honors_the_window("2.0.0"));
+        assert!(version_triple("1.2.3-rc.1").is_some());
+        assert!(version_triple("1.2").is_none());
+        for tool in TOOLS.iter() {
+            if let Some(deprecation) = tool.deprecated {
+                assert!(
+                    deprecation.honors_the_window(crate::VERSION),
+                    "{} is removed in {}, too soon after {}",
+                    tool.name,
+                    deprecation.removed_in,
+                    crate::VERSION
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_mcpb_manifest_lists_the_default_tools_and_prompts_by_name() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../mcpb/manifest.json"
+        )))
+        .expect("the MCPB manifest parses");
+        let listed: Vec<(String, String)> = manifest["tools"]
+            .as_array()
+            .expect("tools is an array")
+            .iter()
+            .map(|tool| {
+                (
+                    tool["name"].as_str().unwrap_or_default().to_owned(),
+                    tool["description"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, String)> = TOOLS
+            .iter()
+            .filter(|tool| tool.group.is_none())
+            .map(|tool| (tool.name.to_owned(), tool.title.to_owned()))
+            .collect();
+        assert_eq!(listed, expected);
+        let prompts: Vec<&str> = manifest["prompts"]
+            .as_array()
+            .expect("prompts is an array")
+            .iter()
+            .filter_map(|prompt| prompt["name"].as_str())
+            .collect();
+        assert_eq!(
+            prompts,
+            [
+                crate::server::prompts::DIAGNOSE_SLOW_QUERY,
+                crate::server::prompts::REVIEW_INDEXES,
+                crate::server::prompts::PLAN_COLUMN_CHANGE,
+            ]
+        );
+        assert_eq!(manifest["version"], crate::VERSION);
     }
 
     #[test]

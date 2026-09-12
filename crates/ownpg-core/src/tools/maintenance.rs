@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
@@ -164,24 +166,38 @@ async fn run_maintenance(call: &Call, job: Job) -> Outcome {
     let caps = call.caps(0);
     let statement = sql.clone();
     let outside = classification.runs_outside_transaction;
+    let backend = Arc::new(AtomicI32::new(0));
+    let reported = Arc::clone(&backend);
     let work = async move {
         engine
-            .run_write_with(&statement, caps, &principal, None, outside, Some(timeout))
+            .run_write_reporting(
+                &statement,
+                caps,
+                &principal,
+                None,
+                outside,
+                Some(timeout),
+                Some(&reported),
+            )
             .await
     };
     let result = match (call.progress.clone(), progress_sql) {
         (Some(progress), Some(progress_sql)) => {
-            let pid = call.engine().primary_backend_pid().await?;
             progress.report(0.0, None, "starting".to_owned()).await;
             let mut work = std::pin::pin!(work);
             let mut ticks = 0f64;
-            loop {
+            let outcome = loop {
                 let poll = tokio::time::sleep(Duration::from_secs(1));
                 tokio::select! {
                     outcome = &mut work => break outcome,
                     () = poll => {
                         ticks += 1.0;
-                        let rows = call.engine().catalog_rows_off_primary(progress_sql, &[&pid]).await.unwrap_or_default();
+                        let pid = backend.load(Ordering::Relaxed);
+                        let rows = if pid == 0 {
+                            Vec::new()
+                        } else {
+                            call.engine().progress_rows(progress_sql, &[&pid]).await.unwrap_or_default()
+                        };
                         let message = rows.first().map_or_else(
                             || "running".to_owned(),
                             |row| row.try_get::<_, String>(0).unwrap_or_else(|_| "running".to_owned()),
@@ -196,7 +212,9 @@ async fn run_maintenance(call: &Call, job: Job) -> Outcome {
                         }
                     }
                 }
-            }
+            };
+            call.engine().drop_progress_lane().await;
+            outcome
         }
         _ => work.await,
     };

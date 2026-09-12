@@ -363,6 +363,64 @@ async fn a_ddl_call_announces_the_table_and_schema_to_a_2025_client() {
     rig.finish().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ddl_inside_a_handle_is_announced_at_commit_and_never_after_a_rollback() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    prepare(&scratch).await;
+    let rig = rig(&scratch, ClientLifecycleMode::Initialize).await;
+    let begun = rig
+        .ok("pg_transaction", json!({"operation": "begin"}))
+        .await;
+    let handle = begun["handle"]["id"].as_str().unwrap().to_owned();
+    rig.ok(
+        "pg_column",
+        json!({"operation": "add", "table": "orders", "column": "note", "data_type": "text", "transaction": handle}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        rig.handler.updated.lock().unwrap().is_empty(),
+        "nothing is announced before the change is visible"
+    );
+    assert_eq!(rig.handler.list_changed.load(Ordering::SeqCst), 0);
+    rig.ok(
+        "pg_transaction",
+        json!({"operation": "rollback", "handle": handle}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(rig.handler.updated.lock().unwrap().is_empty());
+
+    let begun = rig
+        .ok("pg_transaction", json!({"operation": "begin"}))
+        .await;
+    let handle = begun["handle"]["id"].as_str().unwrap().to_owned();
+    rig.ok(
+        "pg_column",
+        json!({"operation": "add", "table": "orders", "column": "note", "data_type": "text", "transaction": handle}),
+    )
+    .await;
+    rig.ok(
+        "pg_transaction",
+        json!({"operation": "commit", "handle": handle}),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while rig.handler.list_changed.load(Ordering::SeqCst) == 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        *rig.handler.updated.lock().unwrap(),
+        vec![rig.table_uri("orders")]
+    );
+    assert_eq!(rig.handler.list_changed.load(Ordering::SeqCst), 1);
+    rig.finish().await;
+}
+
 #[allow(deprecated)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_2025_client_subscribes_and_unsubscribes_to_one_table() {

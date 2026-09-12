@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::time::Duration;
+use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use rmcp::model::{
     BooleanSchema, ElicitRequest, ElicitRequestParams, ElicitationAction, ElicitationSchema,
@@ -18,13 +18,15 @@ pub const REQUEST_KEY: &str = "confirm";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pending {
     pub tool: String,
-    pub statement_hash: String,
+    pub statement_digest: String,
     pub principal: String,
+    pub nonce: u64,
 }
 
 #[derive(Debug)]
 pub struct Gate {
     codec: RequestStateCodec,
+    consumed: std::sync::Mutex<VecDeque<(u64, Instant)>>,
 }
 
 impl Default for Gate {
@@ -50,7 +52,28 @@ impl Gate {
     pub fn with_key(key: &[u8]) -> Self {
         Self {
             codec: RequestStateCodec::new_unchecked(key.to_vec()),
+            consumed: std::sync::Mutex::new(VecDeque::new()),
         }
+    }
+
+    fn consume(&self, nonce: u64) -> Result<(), Error> {
+        let mut consumed = self.consumed.lock().map_err(|_| Error::ProtocolFailed {
+            detail: "the confirmation ledger is poisoned".to_owned(),
+        })?;
+        let now = Instant::now();
+        while consumed
+            .front()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) > CONFIRMATION_TTL)
+        {
+            consumed.pop_front();
+        }
+        if consumed.iter().any(|(used, _)| *used == nonce) {
+            return Err(Error::ConfirmationRequired {
+                operation: "this confirmation was already used once; confirm again".to_owned(),
+            });
+        }
+        consumed.push_back((nonce, now));
+        Ok(())
     }
 
     pub fn from_key_file(path: &std::path::Path) -> Result<Self, Error> {
@@ -102,7 +125,7 @@ impl Gate {
         if let Some(sealed) = call.request_state.as_deref() {
             let pending = self.open(sealed)?;
             if pending.tool != tool
-                || pending.statement_hash != classification.fingerprint
+                || pending.statement_digest != classification.statement_digest
                 || pending.principal != call.principal
             {
                 return Err(Error::ConfirmationRequired {
@@ -112,7 +135,10 @@ impl Gate {
                 .into());
             }
             return match answer(call.input_responses.as_ref()) {
-                Answer::Accepted => Ok(Verdict::Proceed(Decision::ConfirmedElicitation)),
+                Answer::Accepted => {
+                    self.consume(pending.nonce)?;
+                    Ok(Verdict::Proceed(Decision::ConfirmedElicitation))
+                }
                 Answer::Declined => Err(ToolFailure::from(Error::StatementRefused {
                     rule: format!("declined at the confirmation prompt: {rule}"),
                     mode: call.settings().mode.value.to_string(),
@@ -130,8 +156,9 @@ impl Gate {
         if call.can_elicit {
             let sealed = self.seal(&Pending {
                 tool: tool.to_owned(),
-                statement_hash: classification.fingerprint.clone(),
+                statement_digest: classification.statement_digest.clone(),
                 principal: call.principal.clone(),
+                nonce: rand::random(),
             })?;
             let message = format!(
                 "This {} statement is destructive: {rule}. Statement: {}. Run it?",
@@ -206,9 +233,7 @@ fn answer(responses: Option<&rmcp::model::InputResponses>) -> Answer {
 
 fn short_statement(statement: &str) -> String {
     crate::audit::short_statement(statement).unwrap_or_else(|| {
-        let mut text: String = statement.chars().take(197).collect();
-        text.push_str("...");
-        text
+        crate::shape::cut_graphemes(statement, crate::audit::SHORT_STATEMENT_CAP)
     })
 }
 
@@ -226,14 +251,24 @@ mod tests {
         let gate = Gate::new();
         let pending = Pending {
             tool: "pg_delete".to_owned(),
-            statement_hash: "abc".to_owned(),
+            statement_digest: "abc".to_owned(),
             principal: "tester".to_owned(),
+            nonce: 7,
         };
         let sealed = gate.seal(&pending).unwrap();
         assert_eq!(gate.open(&sealed).unwrap(), pending);
         let other = Gate::new();
         assert!(other.open(&sealed).is_err());
         assert!(gate.open("not-a-token").is_err());
+    }
+
+    #[test]
+    fn a_confirmation_nonce_is_accepted_once() {
+        let gate = Gate::new();
+        gate.consume(42).unwrap();
+        let again = gate.consume(42).unwrap_err();
+        assert_eq!(again.id().as_str(), "confirmation.required");
+        gate.consume(43).unwrap();
     }
 
     #[test]

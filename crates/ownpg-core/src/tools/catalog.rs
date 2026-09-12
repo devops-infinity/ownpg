@@ -87,12 +87,13 @@ pub fn check_scope(schema: &str, scoped: &str) -> Result<()> {
 }
 
 pub async fn resolve_relation(engine: &Engine, name: &str) -> Result<ResolvedRelation> {
+    let (schema, relname) = split_name(name, &engine.settings().schema.value);
     let rows = engine
         .catalog_rows(
             "SELECT n.nspname::text, c.relname::text, c.relkind::text, c.oid::int8 \
              FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.oid = pg_catalog.to_regclass($1::text)",
-            &[&name],
+             WHERE n.nspname = $1 AND c.relname = $2",
+            &[&schema, &relname],
         )
         .await?;
     let row = rows.first().ok_or_else(|| Error::ArgumentInvalid {
@@ -195,7 +196,8 @@ pub struct TableDescription {
     pub persistence: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
-    pub estimated_rows: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_rows: Option<i64>,
     pub total_size_bytes: i64,
     pub table_size_bytes: i64,
     pub row_security: bool,
@@ -405,7 +407,7 @@ pub async fn describe_relation(
             other => other.to_owned(),
         },
         comment,
-        estimated_rows: reltuples.max(0.0).round() as i64,
+        estimated_rows: (reltuples >= 0.0).then(|| reltuples.round() as i64),
         total_size_bytes: total_size,
         table_size_bytes: table_size,
         row_security,
@@ -791,16 +793,6 @@ fn split_qualified(name: &str) -> Option<(&str, &str)> {
     None
 }
 
-#[must_use]
-pub fn quote_literal(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
-}
-
-#[must_use]
-pub fn quote_identifier(text: &str) -> String {
-    format!("\"{}\"", text.replace('"', "\"\""))
-}
-
 impl ObjectType {
     #[must_use]
     pub fn parse(kind: &str) -> Option<Self> {
@@ -832,12 +824,6 @@ mod tests {
             split_name("\"a\"\"b\"", "app"),
             ("app".to_owned(), "a\"b".to_owned())
         );
-    }
-
-    #[test]
-    fn literals_and_identifiers_are_quoted_by_doubling() {
-        assert_eq!(quote_literal("it's"), "'it''s'");
-        assert_eq!(quote_identifier("we\"ird"), "\"we\"\"ird\"");
     }
 
     #[test]

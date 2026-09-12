@@ -64,7 +64,6 @@ tower.workspace = true
 [dev-dependencies]
 ssh-key.workspace = true
 rmcp = { workspace = true, features = ["client"] }
-tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 insta.workspace = true
 http-body-util.workspace = true

@@ -233,7 +233,11 @@ impl Server {
                 describe(
                     call,
                     DescribeArgs {
-                        name: table.clone(),
+                        name: format!(
+                            "{}.{}",
+                            crate::render::quote_ident(&settings.schema.value),
+                            crate::render::quote_ident(table)
+                        ),
                         target: DescribeTarget::Relation,
                     },
                 )
@@ -296,8 +300,7 @@ pub fn comment_description(comment: &str) -> Option<String> {
         return None;
     }
     if text.chars().count() > COMMENT_CAP {
-        text = text.chars().take(COMMENT_CAP).collect();
-        text.push_str("...");
+        text = crate::shape::cut_graphemes(&text, COMMENT_CAP + 3);
     }
     Some(format!("{COMMENT_PREFIX}{text}"))
 }

@@ -29,7 +29,7 @@ impl Limiter {
             Ok(()) => Ok(()),
             Err(not_until) => {
                 let wait = not_until.wait_time_from(self.limiter.clock().now());
-                Err(wait.max(Duration::from_secs(1)))
+                Err(wait)
             }
         }
     }
@@ -58,7 +58,7 @@ mod tests {
             assert!(limiter.check("a").is_ok());
         }
         let wait = limiter.check("a").unwrap_err();
-        assert!(wait >= Duration::from_secs(1));
+        assert!(wait > Duration::ZERO && wait <= Duration::from_secs(1));
         assert!(limiter.check("b").is_ok());
     }
 }

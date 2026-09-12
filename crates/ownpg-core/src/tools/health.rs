@@ -259,7 +259,7 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
     let rows = engine
         .catalog_rows(
             &format!(
-                "SELECT COALESCE(sum(wasted_bytes), 0)::int8, COALESCE(sum(real_bytes), 0)::int8, COALESCE(bool_or(is_na), false) FROM ({}) AS bloat",
+                "SELECT COALESCE(sum(wasted_bytes) FILTER (WHERE NOT is_na), 0)::int8, COALESCE(sum(real_bytes) FILTER (WHERE NOT is_na), 0)::int8, COALESCE(bool_or(is_na), false) FROM ({}) AS bloat",
                 monitoring::bloat_sql(&scoped)
             ),
             &[],
@@ -288,7 +288,7 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
             detail: format!(
                 "estimated wasted space across tables and B-tree indexes in schema {scoped} from pg_class and pg_stats{}; pg_bloat lists each relation",
                 if uncertain {
-                    " (some relations could not be estimated)"
+                    " (some relations could not be estimated and are left out of the totals)"
                 } else {
                     ""
                 }

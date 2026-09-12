@@ -118,7 +118,7 @@ SELECT n.nspname::text AS schema, c.relname::text AS name, c.oid::int8 AS oid, \
 CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized_view' WHEN 'S' THEN 'sequence' WHEN 'i' THEN 'index' WHEN 'I' THEN 'index' ELSE 'table' END AS kind, \
 pg_catalog.pg_get_userbyid(c.relowner)::text AS owner, pg_catalog.obj_description(c.oid, 'pg_class') AS comment, \
 pg_catalog.pg_total_relation_size(c.oid) AS size_bytes, \
-CASE WHEN c.relkind IN ('r', 'p', 'f', 'm') THEN GREATEST(c.reltuples, 0)::int8 END AS estimated_rows, \
+CASE WHEN c.relkind IN ('r', 'p', 'f', 'm') AND c.reltuples >= 0 THEN c.reltuples::int8 END AS estimated_rows, \
 CASE c.relkind WHEN 'p' THEN 'partitioned' WHEN 'f' THEN 'foreign' WHEN 'I' THEN 'partitioned index' \
 WHEN 'r' THEN CASE c.relpersistence WHEN 'u' THEN 'unlogged' WHEN 't' THEN 'temporary' ELSE 'permanent' END END AS detail \
 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
@@ -144,9 +144,12 @@ SELECT n.nspname::text, n.nspname::text, n.oid::int8, 'schema', pg_catalog.pg_ge
 pg_catalog.obj_description(n.oid, 'pg_namespace'), NULL::int8, NULL::int8, CASE WHEN n.nspname = $1 THEN 'scoped' END \
 FROM pg_catalog.pg_namespace n WHERE n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema' \
 ) \
-SELECT schema, name, kind, oid, owner, comment, size_bytes, estimated_rows, detail, count(*) OVER () AS total \
-FROM objects \
-WHERE kind = ANY($2::text[]) AND name LIKE $3 AND (schema, name, oid) > ($4::text, $5::text, $6::int8) \
+, matched AS ( \
+SELECT * FROM objects WHERE kind = ANY($2::text[]) AND name LIKE $3 \
+) \
+SELECT schema, name, kind, oid, owner, comment, size_bytes, estimated_rows, detail, (SELECT count(*) FROM matched) AS total \
+FROM matched \
+WHERE (schema, name, oid) > ($4::text, $5::text, $6::int8) \
 ORDER BY schema, name, oid LIMIT $7::int8";
 
 pub fn list_objects(call: Call, args: ListObjectsArgs) -> BoxFuture<'static, Outcome> {
@@ -275,7 +278,7 @@ pub fn list_objects(call: Call, args: ListObjectsArgs) -> BoxFuture<'static, Out
             operation: Some("list".to_owned()),
             row_count: Some(objects.len() as u64),
             truncated,
-            handle_id: cursor.clone(),
+            cursor_id: cursor.clone(),
             ..AuditFacts::default()
         };
         let list = ObjectList {
@@ -475,12 +478,15 @@ fn render_description(description: &ObjectDescription) -> String {
     out.push('\n');
     if let Some(relation) = &description.relation {
         out.push_str(&format!(
-            "{} {}.{} ({}, about {} rows, {} bytes total)\n",
+            "{} {}.{} ({}, {}, {} bytes total)\n",
             relation.kind.as_str(),
             relation.schema,
             relation.name,
             relation.persistence,
-            relation.estimated_rows,
+            relation.estimated_rows.map_or_else(
+                || "row count not yet analyzed".to_owned(),
+                |rows| format!("about {rows} rows")
+            ),
             relation.total_size_bytes
         ));
         if let Some(comment) = &relation.comment {

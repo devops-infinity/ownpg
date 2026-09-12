@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use self::auth::{Authenticator, Rejection};
 use self::limit::Limiter;
+use super::stdio::StopReason;
 use super::{Principal, Server};
 use crate::config::{AuthMode, MCP_PATH, Settings};
 use crate::error::{Error, ExitClass, Result};
@@ -111,8 +112,17 @@ impl Gatekeeper {
 
 pub const RATE_LIMITED_CODE: i32 = -32000;
 
+fn retry_after_seconds(wait: Duration) -> u64 {
+    let whole = wait.as_secs();
+    if wait.subsec_nanos() > 0 {
+        whole.saturating_add(1)
+    } else {
+        whole.max(1)
+    }
+}
+
 fn too_many_requests(wait: Duration) -> Response {
-    let seconds = wait.as_secs().max(1);
+    let seconds = retry_after_seconds(wait);
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         axum::Json(serde_json::json!({
@@ -126,7 +136,7 @@ fn too_many_requests(wait: Duration) -> Response {
         })),
     )
         .into_response();
-    if let Ok(value) = HeaderValue::from_str(&wait.as_secs().max(1).to_string()) {
+    if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
     }
     response
@@ -363,7 +373,7 @@ pub fn gatekeeper(
     })
 }
 
-pub async fn shutdown_signal() {
+pub async fn shutdown_signal() -> StopReason {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             tracing::warn!(%error, "the interrupt signal could not be watched");
@@ -385,8 +395,8 @@ pub async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
+        () = ctrl_c => StopReason::Interrupt,
+        () = terminate => StopReason::Terminate,
     }
 }
 
@@ -419,7 +429,7 @@ pub async fn serve(
     listening: Listening,
     router: Router,
     gatekeeper: Arc<Gatekeeper>,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    shutdown: impl std::future::Future<Output = StopReason> + Send + 'static,
     deadline: Duration,
 ) -> Result<ExitClass> {
     let stop = CancellationToken::new();
@@ -449,17 +459,17 @@ pub async fn serve(
     tracing::info!(address = %listening.local_addr, "listening for Streamable HTTP");
     let mut shutdown = std::pin::pin!(shutdown);
     let listener = listening.listener;
-    loop {
+    let reason = loop {
         let permit = tokio::select! {
             permit = permits.clone().acquire_owned() => match permit {
                 Ok(permit) => permit,
-                Err(_) => break,
+                Err(_) => break StopReason::Terminate,
             },
-            () = &mut shutdown => break,
+            reason = &mut shutdown => break reason,
         };
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
-            () = &mut shutdown => break,
+            reason = &mut shutdown => break reason,
         };
         let (socket, peer) = match accepted {
             Ok(accepted) => accepted,
@@ -487,15 +497,20 @@ pub async fn serve(
                 tracing::debug!(%error, "a connection ended with an error");
             }
         });
-    }
-    tracing::info!("shutting down; draining in-flight calls");
+    };
+    tracing::info!("stopping; draining in-flight calls (a second signal exits at once)");
     stop.cancel();
     sweeper.abort();
     drop(listener);
-    if tokio::time::timeout(deadline, graceful.shutdown())
-        .await
-        .is_err()
-    {
+    let drained = tokio::select! {
+        drained = tokio::time::timeout(deadline, graceful.shutdown()) => drained.is_ok(),
+        _ = shutdown_signal() => {
+            tracing::warn!("a second signal arrived; exiting at once");
+            gatekeeper.cancel.cancel();
+            return Ok(super::stdio::exit_for(reason));
+        }
+    };
+    if !drained {
         tracing::warn!(
             "in-flight calls did not finish within {} ms; closing them",
             deadline.as_millis()
@@ -503,12 +518,20 @@ pub async fn serve(
     }
     gatekeeper.cancel.cancel();
     gatekeeper.server.shutdown().await;
-    Ok(ExitClass::Success)
+    Ok(super::stdio::exit_for(reason))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_retry_delay_rounds_up_to_whole_seconds() {
+        assert_eq!(retry_after_seconds(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_seconds(Duration::from_millis(1_900)), 2);
+        assert_eq!(retry_after_seconds(Duration::from_secs(3)), 3);
+        assert_eq!(retry_after_seconds(Duration::ZERO), 1);
+    }
 
     fn headers(forwarded: &[&str]) -> axum::http::HeaderMap {
         let mut map = axum::http::HeaderMap::new();

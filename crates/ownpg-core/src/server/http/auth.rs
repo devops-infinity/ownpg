@@ -258,9 +258,9 @@ pub struct Claims {
     iss: Option<String>,
     #[serde(default)]
     aud: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "numeric_date")]
     exp: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "numeric_date")]
     nbf: Option<u64>,
     #[serde(default)]
     sub: Option<String>,
@@ -270,6 +270,27 @@ pub struct Claims {
     scope: Option<String>,
     #[serde(default)]
     scp: Option<serde_json::Value>,
+}
+
+fn numeric_date<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => number
+            .as_u64()
+            .or_else(|| {
+                number
+                    .as_f64()
+                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                    .map(|seconds| seconds.floor() as u64)
+            })
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("a NumericDate must be a non-negative number")),
+        Some(_) => Err(serde::de::Error::custom("a NumericDate must be a number")),
+    }
 }
 
 impl Claims {
@@ -633,6 +654,17 @@ mod tests {
             scope: Some("ownpg:read ownpg:write".to_owned()),
             scp: Some(serde_json::json!(["ownpg:ddl", "ownpg:read"])),
         }
+    }
+
+    #[test]
+    fn numeric_dates_accept_integers_and_fractions_and_refuse_text() {
+        let parsed: Claims =
+            serde_json::from_value(serde_json::json!({"exp": 1700000000.75, "nbf": 1699999999}))
+                .unwrap();
+        assert_eq!(parsed.exp, Some(1_700_000_000));
+        assert_eq!(parsed.nbf, Some(1_699_999_999));
+        assert!(serde_json::from_value::<Claims>(serde_json::json!({"exp": "soon"})).is_err());
+        assert!(serde_json::from_value::<Claims>(serde_json::json!({"exp": -5})).is_err());
     }
 
     #[test]

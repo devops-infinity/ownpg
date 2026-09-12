@@ -91,6 +91,7 @@ async fn remote(
         gatekeeper,
         async move {
             let _ = stopped.await;
+            ownpg_core::server::stdio::StopReason::Terminate
         },
         Duration::from_secs(5),
     ));

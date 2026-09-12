@@ -14,8 +14,12 @@ pub struct Column {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Truncation {
-    RowCap,
-    ByteCap,
+    #[serde(rename = "row_cap")]
+    Rows,
+    #[serde(rename = "byte_cap")]
+    Bytes,
+    #[serde(rename = "cell_cap")]
+    Cells,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
@@ -31,9 +35,8 @@ pub struct ResultSet {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimate: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub command_tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub rows_affected: Option<u64>,
+    pub cells_cut: usize,
     pub notice: &'static str,
 }
 
@@ -48,8 +51,8 @@ impl ResultSet {
             truncated_by: None,
             cursor: None,
             estimate: None,
-            command_tag: None,
             rows_affected: None,
+            cells_cut: 0,
             notice: UNTRUSTED_NOTICE,
         }
     }
@@ -93,12 +96,16 @@ impl ResultSet {
         if let Some(affected) = self.rows_affected {
             footer.push_str(&format!(", rows affected: {affected}"));
         }
-        if let Some(tag) = &self.command_tag {
-            footer.push_str(&format!(", command: {tag}"));
+        if self.cells_cut > 0 {
+            footer.push_str(&format!(
+                ", cells cut at {CELL_CAP_BYTES} bytes: {}",
+                self.cells_cut
+            ));
         }
         if self.truncated {
             footer.push_str(match self.truncated_by {
-                Some(Truncation::ByteCap) => " (truncated by the byte cap)",
+                Some(Truncation::Bytes) => " (truncated by the byte cap)",
+                Some(Truncation::Cells) => " (truncated by the cell cap)",
                 _ => " (truncated by the row cap)",
             });
         }
@@ -115,6 +122,17 @@ impl ResultSet {
 pub struct Caps {
     pub row_cap: usize,
     pub byte_cap: usize,
+    pub cell_cap: usize,
+}
+
+impl Caps {
+    #[must_use]
+    pub const fn whole_cells(self) -> Self {
+        Self {
+            cell_cap: usize::MAX,
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -123,6 +141,7 @@ pub struct Collector {
     pub rows: Vec<Vec<Option<String>>>,
     bytes: usize,
     pub truncated_by: Option<Truncation>,
+    pub cells_cut: usize,
 }
 
 impl Collector {
@@ -133,40 +152,56 @@ impl Collector {
             rows: Vec::new(),
             bytes: 0,
             truncated_by: None,
+            cells_cut: 0,
         }
     }
 
     pub fn push(&mut self, caps: Caps, row: Vec<Option<String>>) -> bool {
+        self.offer(caps, row).is_none()
+    }
+
+    pub fn offer(&mut self, caps: Caps, row: Vec<Option<String>>) -> Option<Vec<Option<String>>> {
         if self.truncated_by.is_some() {
-            return false;
+            return Some(row);
         }
         if self.rows.len() >= caps.row_cap {
-            self.truncated_by = Some(Truncation::RowCap);
-            return false;
+            self.truncated_by = Some(Truncation::Rows);
+            return Some(row);
         }
+        let mut cut = 0;
         let cleaned: Vec<Option<String>> = row
-            .into_iter()
-            .map(|value| value.map(|text| cut_cell(&sanitize(&text), CELL_CAP_BYTES)))
+            .iter()
+            .map(|value| {
+                value.as_deref().map(|text| {
+                    let clean = sanitize(text);
+                    if clean.len() > caps.cell_cap {
+                        cut += 1;
+                    }
+                    cut_cell(&clean, caps.cell_cap)
+                })
+            })
             .collect();
         let size: usize = cleaned
             .iter()
             .map(|value| value.as_ref().map_or(4, String::len) + 2)
             .sum();
         if self.bytes + size > caps.byte_cap && !self.rows.is_empty() {
-            self.truncated_by = Some(Truncation::ByteCap);
-            return false;
+            self.truncated_by = Some(Truncation::Bytes);
+            return Some(row);
         }
         self.bytes += size;
+        self.cells_cut += cut;
         self.rows.push(cleaned);
-        true
+        None
     }
 
     #[must_use]
     pub fn finish(self, cursor: Option<String>, estimate: Option<i64>) -> ResultSet {
-        let truncated = self.truncated_by.is_some() || cursor.is_some();
+        let truncated = self.truncated_by.is_some() || cursor.is_some() || self.cells_cut > 0;
         let truncated_by = self
             .truncated_by
-            .or(cursor.as_ref().map(|_| Truncation::RowCap));
+            .or(cursor.as_ref().map(|_| Truncation::Rows))
+            .or((self.cells_cut > 0).then_some(Truncation::Cells));
         ResultSet {
             row_count: self.rows.len(),
             columns: self.columns,
@@ -175,8 +210,8 @@ impl Collector {
             truncated_by,
             cursor,
             estimate,
-            command_tag: None,
             rows_affected: None,
+            cells_cut: self.cells_cut,
             notice: UNTRUSTED_NOTICE,
         }
     }
@@ -187,7 +222,8 @@ pub fn sanitize(text: &str) -> String {
     text.chars().filter(|c| !is_invisible(*c)).collect()
 }
 
-fn is_invisible(c: char) -> bool {
+#[must_use]
+pub fn is_invisible(c: char) -> bool {
     let code = c as u32;
     matches!(c, '\u{0}'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}' | '\u{7f}')
         || (0x80..=0x9f).contains(&code)
@@ -195,6 +231,25 @@ fn is_invisible(c: char) -> bool {
             code,
             0x00ad | 0x061c | 0x180e | 0x200b..=0x200f | 0x2028..=0x202e | 0x2060..=0x206f | 0xfeff | 0xfe00..=0xfe0f | 0xe0100..=0xe01ef
         )
+}
+
+#[must_use]
+pub fn cut_graphemes(text: &str, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut taken = 0usize;
+    for grapheme in text.graphemes(true) {
+        let width = grapheme.chars().count();
+        if taken + width > cap.saturating_sub(3) {
+            break;
+        }
+        out.push_str(grapheme);
+        taken += width;
+    }
+    out.push_str("...");
+    out
 }
 
 #[must_use]
@@ -250,6 +305,7 @@ mod tests {
         let caps = Caps {
             row_cap: 2,
             byte_cap: 1_000,
+            cell_cap: CELL_CAP_BYTES,
         };
         let mut collector = Collector::new(vec![column("a")]);
         assert!(collector.push(caps, vec![Some("1".to_owned())]));
@@ -258,18 +314,19 @@ mod tests {
         let result = collector.finish(None, None);
         assert_eq!(result.row_count, 2);
         assert!(result.truncated);
-        assert_eq!(result.truncated_by, Some(Truncation::RowCap));
+        assert_eq!(result.truncated_by, Some(Truncation::Rows));
 
         let tight = Caps {
             row_cap: 10,
             byte_cap: 12,
+            cell_cap: CELL_CAP_BYTES,
         };
         let mut collector = Collector::new(vec![column("a")]);
         assert!(collector.push(tight, vec![Some("12345".to_owned())]));
         assert!(!collector.push(tight, vec![Some("67890".to_owned())]));
         let result = collector.finish(None, None);
         assert_eq!(result.row_count, 1);
-        assert_eq!(result.truncated_by, Some(Truncation::ByteCap));
+        assert_eq!(result.truncated_by, Some(Truncation::Bytes));
     }
 
     #[test]
@@ -277,6 +334,7 @@ mod tests {
         let tight = Caps {
             row_cap: 10,
             byte_cap: 1,
+            cell_cap: CELL_CAP_BYTES,
         };
         let mut collector = Collector::new(vec![column("a")]);
         assert!(collector.push(tight, vec![Some("a long value".to_owned())]));
@@ -289,6 +347,7 @@ mod tests {
         let caps = Caps {
             row_cap: 10,
             byte_cap: 1_000,
+            cell_cap: CELL_CAP_BYTES,
         };
         collector.push(caps, vec![Some("1".to_owned()), None]);
         let result = collector.finish(Some("abc".to_owned()), Some(500));

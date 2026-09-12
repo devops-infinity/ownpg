@@ -42,6 +42,7 @@ async fn a_large_select_is_paged_through_a_cursor_in_order() {
     let caps = Caps {
         row_cap: 100,
         byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let first = engine
         .run_read_paged("SELECT id, name FROM big ORDER BY id", true, caps, "tester")
@@ -49,7 +50,7 @@ async fn a_large_select_is_paged_through_a_cursor_in_order() {
         .unwrap();
     assert_eq!(first.row_count, 100);
     assert!(first.truncated);
-    assert_eq!(first.truncated_by, Some(Truncation::RowCap));
+    assert_eq!(first.truncated_by, Some(Truncation::Rows));
     assert_eq!(first.columns[0].type_name, "int4");
     assert_eq!(first.columns[1].type_name, "text");
     assert_eq!(first.rows[0][0].as_deref(), Some("1"));
@@ -82,6 +83,7 @@ async fn a_small_select_leaves_no_cursor_and_the_transaction_ends() {
     let caps = Caps {
         row_cap: 100,
         byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let result = engine
         .run_read_paged("SELECT count(*) FROM big", true, caps, "tester")
@@ -107,6 +109,7 @@ async fn a_write_that_slips_past_the_classifier_is_stopped_by_the_read_only_tran
     let caps = Caps {
         row_cap: 10,
         byte_cap: 10_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let error = engine.run_read("DELETE FROM big", caps).await.unwrap_err();
     assert_eq!(error.id(), ErrorId::SqlFailed);
@@ -127,6 +130,7 @@ async fn a_lost_connection_is_reconnected_once_and_cursors_are_gone() {
     let caps = Caps {
         row_cap: 100,
         byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let first = engine
         .run_read_paged("SELECT id FROM big ORDER BY id", true, caps, "tester")
@@ -180,6 +184,7 @@ async fn expired_cursors_are_swept_and_the_transaction_ends() {
     let caps = Caps {
         row_cap: 100,
         byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let first = engine
         .run_read_paged("SELECT id FROM big ORDER BY id", true, caps, "tester")
@@ -205,6 +210,7 @@ async fn a_cursor_answers_only_the_principal_that_opened_it() {
     let caps = Caps {
         row_cap: 100,
         byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let first = engine
         .run_read_paged("SELECT id FROM big ORDER BY id", true, caps, "alice")
@@ -253,6 +259,7 @@ async fn pooled_mode_pins_every_setting_per_transaction_with_set_local() {
     let caps = Caps {
         row_cap: 10,
         byte_cap: 100_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let path = engine.run_read("SHOW search_path", caps).await.unwrap();
     assert_eq!(path.rows[0][0].as_deref(), Some(r#""""#));
@@ -321,6 +328,7 @@ async fn pooled_handles_give_each_principal_its_own_connection() {
     let caps = Caps {
         row_cap: 10,
         byte_cap: 100_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let alice = engine.begin_transaction("alice").await.unwrap();
     let bob = engine.begin_transaction("bob").await.unwrap();
@@ -367,7 +375,7 @@ async fn pooled_handles_give_each_principal_its_own_connection() {
     let rolled = engine.rollback(&bob.id, "bob").await.unwrap();
     assert_eq!(rolled.state.as_str(), "rolled_back");
     assert_eq!(engine.open_transaction_count().await, 0);
-    let status = engine.transaction_status(&alice.id).await.unwrap();
+    let status = engine.transaction_status(&alice.id, "alice").await.unwrap();
     assert_eq!(status.state.as_str(), "committed");
     let seen = engine
         .run_read("SELECT count(*) FROM big", caps)
@@ -386,6 +394,7 @@ async fn the_second_local_connection_closes_with_the_handle() {
     let caps = Caps {
         row_cap: 10,
         byte_cap: 100_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let watcher = scratch.client().await;
     let count = || async {
@@ -418,4 +427,224 @@ async fn the_second_local_connection_closes_with_the_handle() {
         1,
         "the second connection closes with the handle"
     );
+}
+
+#[tokio::test]
+async fn pooled_mode_runs_vacuum_outside_the_transaction_wrapper() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app; CREATE TABLE app.big (id int primary key, name text)")
+        .await
+        .unwrap();
+    let settings = scratch.settings_with(
+        FlagLayer {
+            schema: Some("app".to_owned()),
+            ..FlagLayer::default()
+        },
+        &[("OWNPG_POOLED", "true")],
+    );
+    let engine = Engine::start(Arc::new(settings), Hints::default())
+        .await
+        .unwrap();
+    let caps = Caps {
+        row_cap: 10,
+        byte_cap: 100_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    engine
+        .run_write("VACUUM app.big", caps, "tester", None, true)
+        .await
+        .expect("VACUUM runs bare in pooled mode");
+    let wrapped = engine
+        .run_write("VACUUM app.big", caps, "tester", None, false)
+        .await
+        .unwrap_err();
+    assert_eq!(wrapped.id(), ErrorId::SqlFailed, "{wrapped}");
+}
+
+#[tokio::test]
+async fn a_failed_copy_inside_a_handle_leaves_the_handle_usable_and_committable() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let engine = engine_with_rows(&scratch, 3).await;
+    let caps = Caps {
+        row_cap: 10,
+        byte_cap: 100_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    let handle = engine.begin_transaction("tester").await.unwrap();
+    let failed = engine
+        .copy_in(
+            "COPY app.big (id, name) FROM STDIN",
+            b"not-a-number\tx\n",
+            "tester",
+            Some(&handle.id),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failed.id(), ErrorId::SqlFailed, "{failed}");
+    let inserted = engine
+        .run_write(
+            "INSERT INTO app.big (id, name) VALUES (10, 'ten') RETURNING id",
+            caps,
+            "tester",
+            Some(&handle.id),
+            false,
+        )
+        .await
+        .expect("the handle is still usable after the failed COPY");
+    assert_eq!(inserted.rows[0][0].as_deref(), Some("10"));
+    let committed = engine.commit(&handle.id, "tester").await.unwrap();
+    assert_eq!(committed.state.as_str(), "committed");
+    let seen = engine
+        .run_read("SELECT count(*) FROM big", caps)
+        .await
+        .unwrap();
+    assert_eq!(seen.rows[0][0].as_deref(), Some("4"));
+}
+
+#[tokio::test]
+async fn a_handle_refuses_to_open_over_live_cursors_and_close_releases_them() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let engine = engine_with_rows(&scratch, 30).await;
+    let caps = Caps {
+        row_cap: 5,
+        byte_cap: 100_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    let page = engine
+        .run_read_paged("SELECT id FROM big ORDER BY id", true, caps, "tester")
+        .await
+        .unwrap();
+    let cursor = page.cursor.clone().expect("a cursor for the paged read");
+    let refused = engine.begin_transaction("tester").await.unwrap_err();
+    assert_eq!(refused.id(), ErrorId::HandleState, "{refused}");
+    assert!(refused.to_string().contains(&cursor), "{refused}");
+    let stranger = engine
+        .close_cursor(&cursor, "someone-else")
+        .await
+        .unwrap_err();
+    assert_eq!(stranger.id(), ErrorId::HandleState);
+    engine.close_cursor(&cursor, "tester").await.unwrap();
+    let gone = engine.fetch(&cursor, caps, "tester").await.unwrap_err();
+    assert_eq!(gone.id(), ErrorId::HandleState);
+    let handle = engine.begin_transaction("tester").await.unwrap();
+    engine.rollback(&handle.id, "tester").await.unwrap();
+}
+
+#[tokio::test]
+async fn the_cursor_cap_is_refused_rather_than_silently_downgraded() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let engine = engine_with_rows(&scratch, 30).await;
+    let caps = Caps {
+        row_cap: 5,
+        byte_cap: 100_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    let mut cursors = Vec::new();
+    for _ in 0..8 {
+        let page = engine
+            .run_read_paged("SELECT id FROM big ORDER BY id", true, caps, "tester")
+            .await
+            .unwrap();
+        cursors.push(page.cursor.expect("a cursor"));
+    }
+    let refused = engine
+        .run_read_paged("SELECT id FROM big ORDER BY id", true, caps, "tester")
+        .await
+        .unwrap_err();
+    assert_eq!(refused.id(), ErrorId::HandleState, "{refused}");
+    assert!(refused.to_string().contains("cap"), "{refused}");
+    let plain = engine
+        .run_read("SELECT count(*) FROM big", caps)
+        .await
+        .expect("reads without a cursor still run");
+    assert_eq!(plain.rows[0][0].as_deref(), Some("30"));
+    for cursor in cursors {
+        engine.close_cursor(&cursor, "tester").await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_status_of_a_handle_is_only_shown_to_its_owner() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let engine = engine_with_rows(&scratch, 1).await;
+    let handle = engine.begin_transaction("alice").await.unwrap();
+    let peek = engine
+        .transaction_status(&handle.id, "bob")
+        .await
+        .unwrap_err();
+    assert_eq!(peek.id(), ErrorId::HandleState);
+    assert!(peek.to_string().contains("another principal"), "{peek}");
+    let own = engine
+        .transaction_status(&handle.id, "alice")
+        .await
+        .unwrap();
+    assert_eq!(own.principal, "alice");
+    engine.rollback(&handle.id, "alice").await.unwrap();
+    let closed = engine.transaction_status(&handle.id, "bob").await.unwrap();
+    assert_eq!(closed.state.as_str(), "rolled_back");
+    assert!(closed.principal.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_pooled_cursors_are_released_by_the_sweep() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app; CREATE TABLE app.big (id int primary key); INSERT INTO app.big SELECT g FROM generate_series(1, 40) g")
+        .await
+        .unwrap();
+    let settings = scratch.settings_with(
+        FlagLayer {
+            schema: Some("app".to_owned()),
+            ..FlagLayer::default()
+        },
+        &[
+            ("OWNPG_CURSOR_EXPIRY", "1"),
+            ("OWNPG_HANDLE_EXPIRY", "1"),
+            ("OWNPG_POOL_SIZE", "2"),
+            ("OWNPG_CONNECT_TIMEOUT", "2"),
+        ],
+    );
+    let engine = Engine::start_pooled(Arc::new(settings), Hints::default())
+        .await
+        .unwrap();
+    let caps = Caps {
+        row_cap: 5,
+        byte_cap: 100_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    for principal in ["a", "b"] {
+        engine
+            .run_read_paged("SELECT id FROM app.big ORDER BY id", true, caps, principal)
+            .await
+            .unwrap();
+    }
+    let third = engine
+        .run_read_paged("SELECT id FROM app.big ORDER BY id", true, caps, "c")
+        .await
+        .expect("a pinned lane with room is reused instead of exhausting the pool");
+    assert!(third.cursor.is_some());
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    let swept = engine.sweep().await.unwrap();
+    assert!(swept >= 3, "{swept}");
+    assert!(engine.open_cursors().await.is_empty());
+    let handle = engine.begin_transaction("a").await.unwrap();
+    engine.rollback(&handle.id, "a").await.unwrap();
+    engine.release_everything().await.unwrap();
 }

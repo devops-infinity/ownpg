@@ -656,7 +656,10 @@ expression: tools
             },
             "estimated_rows": {
               "format": "int64",
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "indexes": {
               "items": {
@@ -729,7 +732,6 @@ expression: tools
             "name",
             "kind",
             "persistence",
-            "estimated_rows",
             "total_size_bytes",
             "table_size_bytes",
             "row_security",
@@ -1293,24 +1295,24 @@ expression: tools
         "Truncation": {
           "enum": [
             "row_cap",
-            "byte_cap"
+            "byte_cap",
+            "cell_cap"
           ],
           "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cells_cut": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "columns": {
           "items": {
             "$ref": "#/$defs/Column"
           },
           "type": "array"
-        },
-        "command_tag": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "cursor": {
           "type": [
@@ -1372,6 +1374,7 @@ expression: tools
         "rows",
         "row_count",
         "truncated",
+        "cells_cut",
         "notice"
       ],
       "type": "object"
@@ -1461,24 +1464,24 @@ expression: tools
         "Truncation": {
           "enum": [
             "row_cap",
-            "byte_cap"
+            "byte_cap",
+            "cell_cap"
           ],
           "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cells_cut": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "columns": {
           "items": {
             "$ref": "#/$defs/Column"
           },
           "type": "array"
-        },
-        "command_tag": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "cursor": {
           "type": [
@@ -1540,6 +1543,7 @@ expression: tools
         "rows",
         "row_count",
         "truncated",
+        "cells_cut",
         "notice"
       ],
       "type": "object"
@@ -1618,24 +1622,24 @@ expression: tools
         "Truncation": {
           "enum": [
             "row_cap",
-            "byte_cap"
+            "byte_cap",
+            "cell_cap"
           ],
           "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cells_cut": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "columns": {
           "items": {
             "$ref": "#/$defs/Column"
           },
           "type": "array"
-        },
-        "command_tag": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "cursor": {
           "type": [
@@ -1697,6 +1701,7 @@ expression: tools
         "rows",
         "row_count",
         "truncated",
+        "cells_cut",
         "notice"
       ],
       "type": "object"
@@ -1795,24 +1800,24 @@ expression: tools
         "Truncation": {
           "enum": [
             "row_cap",
-            "byte_cap"
+            "byte_cap",
+            "cell_cap"
           ],
           "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cells_cut": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "columns": {
           "items": {
             "$ref": "#/$defs/Column"
           },
           "type": "array"
-        },
-        "command_tag": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "cursor": {
           "type": [
@@ -1874,6 +1879,7 @@ expression: tools
         "rows",
         "row_count",
         "truncated",
+        "cells_cut",
         "notice"
       ],
       "type": "object"
@@ -1939,24 +1945,24 @@ expression: tools
         "Truncation": {
           "enum": [
             "row_cap",
-            "byte_cap"
+            "byte_cap",
+            "cell_cap"
           ],
           "type": "string"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
+        "cells_cut": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "columns": {
           "items": {
             "$ref": "#/$defs/Column"
           },
           "type": "array"
-        },
-        "command_tag": {
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "cursor": {
           "type": [
@@ -2018,6 +2024,7 @@ expression: tools
         "rows",
         "row_count",
         "truncated",
+        "cells_cut",
         "notice"
       ],
       "type": "object"

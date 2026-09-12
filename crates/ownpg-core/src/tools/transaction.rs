@@ -2,7 +2,7 @@ use futures_util::future::BoxFuture;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{AuditFacts, Call, Outcome, Route, ToolOutput, route};
+use super::{AuditFacts, Call, Outcome, Route, ToolFailure, ToolOutput, route};
 use crate::engine::HandleInfo;
 use crate::error::Error;
 use crate::render::validate_ident;
@@ -19,6 +19,20 @@ pub enum Operation {
     Savepoint,
     RollbackTo,
     Status,
+}
+
+impl Operation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Commit => "commit",
+            Self::Rollback => "rollback",
+            Self::Savepoint => "savepoint",
+            Self::RollbackTo => "rollback_to",
+            Self::Status => "status",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -54,24 +68,34 @@ pub fn transaction(call: Call, args: TransactionArgs) -> BoxFuture<'static, Outc
             }
             .into());
         }
-        let handle = match args.operation {
-            Operation::Begin => engine.begin_transaction(principal).await?,
-            Operation::Commit => engine.commit(&args.handle, principal).await?,
-            Operation::Rollback => engine.rollback(&args.handle, principal).await?,
-            Operation::Savepoint => {
-                validate_ident("savepoint", &args.savepoint)?;
-                engine
-                    .savepoint(&args.handle, principal, &args.savepoint)
-                    .await?
-            }
-            Operation::RollbackTo => {
-                validate_ident("savepoint", &args.savepoint)?;
-                engine
-                    .rollback_to(&args.handle, principal, &args.savepoint)
-                    .await?
-            }
-            Operation::Status => engine.transaction_status(&args.handle).await?,
+        let facts = AuditFacts {
+            operation: Some(args.operation.as_str().to_owned()),
+            handle_id: (!args.handle.is_empty()).then(|| args.handle.clone()),
+            ..AuditFacts::default()
         };
+        let outcome = match args.operation {
+            Operation::Begin => engine.begin_transaction(principal).await,
+            Operation::Commit => engine.commit(&args.handle, principal).await,
+            Operation::Rollback => engine.rollback(&args.handle, principal).await,
+            Operation::Savepoint => match validate_ident("savepoint", &args.savepoint) {
+                Ok(()) => {
+                    engine
+                        .savepoint(&args.handle, principal, &args.savepoint)
+                        .await
+                }
+                Err(error) => Err(error),
+            },
+            Operation::RollbackTo => match validate_ident("savepoint", &args.savepoint) {
+                Ok(()) => {
+                    engine
+                        .rollback_to(&args.handle, principal, &args.savepoint)
+                        .await
+                }
+                Err(error) => Err(error),
+            },
+            Operation::Status => engine.transaction_status(&args.handle, principal).await,
+        };
+        let handle = outcome.map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
         let text = format!(
             "transaction {} is {}{}{}\n",
             handle.id,
@@ -88,9 +112,8 @@ pub fn transaction(call: Call, args: TransactionArgs) -> BoxFuture<'static, Outc
             }
         );
         let facts = AuditFacts {
-            operation: Some(format!("{:?}", args.operation).to_lowercase()),
             handle_id: Some(handle.id.clone()),
-            ..AuditFacts::default()
+            ..facts
         };
         let result = TransactionResult {
             operation: args.operation,
