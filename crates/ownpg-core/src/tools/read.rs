@@ -63,6 +63,14 @@ pub fn facts_for(classification: &Classification) -> AuditFacts {
         statement_class: Some(classification.class.as_str().to_owned()),
         statement_hash: Some(classification.fingerprint.clone()),
         statement: short_statement(&classification.normalized),
+        relations: classification
+            .relations
+            .iter()
+            .map(|relation| match &relation.schema {
+                Some(schema) => format!("{schema}.{}", relation.name),
+                None => relation.name.clone(),
+            })
+            .collect(),
         ..AuditFacts::default()
     }
 }

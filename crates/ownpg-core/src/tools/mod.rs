@@ -114,6 +114,7 @@ pub struct AuditFacts {
     pub row_count: Option<u64>,
     pub truncated: bool,
     pub decision: Option<Decision>,
+    pub relations: Vec<String>,
 }
 
 impl AuditFacts {
