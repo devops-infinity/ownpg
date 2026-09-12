@@ -47,6 +47,7 @@ rmcp = { version = "3.3.0", default-features = false, features = ["server", "mac
 schemars = "1.2.2"
 tokio-util = { version = "0.7.19", default-features = false }
 pin-project-lite = "0.2.17"
+bytes = "1.12.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "json", "std"] }
 tracing-appender = "0.2.5"
 rpassword = "7.5.4"

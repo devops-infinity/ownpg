@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::catalog;
-use super::{AuditFacts, Context, Outcome, Route, ToolOutput, route};
+use super::{AuditFacts, Call, Outcome, Route, ToolOutput, route};
 use crate::config::describe::{SettingLine, describe};
 use crate::engine::Engine;
 use crate::error::{Error, Result};
@@ -254,8 +254,9 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
     })
 }
 
-pub fn health(context: Context, _args: NoArgs) -> BoxFuture<'static, Outcome> {
+pub fn health(call: Call, _args: NoArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
+        let context = call.context.clone();
         let report = health_report(&context.engine).await?;
         let mut text = format!(
             "{}\nhealth of {} on PostgreSQL {}: {}\n",
@@ -273,13 +274,13 @@ pub fn health(context: Context, _args: NoArgs) -> BoxFuture<'static, Outcome> {
                 check.detail
             ));
         }
-        Ok(
-            ToolOutput::structured(&report, text)?.with_facts(AuditFacts {
+        Ok(ToolOutput::structured(&report, text)?
+            .with_facts(AuditFacts {
                 operation: Some("health".to_owned()),
                 row_count: Some(report.checks.len() as u64),
                 ..AuditFacts::default()
-            }),
-        )
+            })
+            .into())
     })
 }
 
@@ -402,16 +403,17 @@ pub async fn doctor_report(
     })
 }
 
-pub fn doctor(context: Context, _args: NoArgs) -> BoxFuture<'static, Outcome> {
+pub fn doctor(call: Call, _args: NoArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
+        let context = call.context.clone();
         let report = doctor_report(&context.engine, context.audit_path.as_deref()).await?;
         let text = render_doctor(&report);
-        Ok(
-            ToolOutput::structured(&report, text)?.with_facts(AuditFacts {
+        Ok(ToolOutput::structured(&report, text)?
+            .with_facts(AuditFacts {
                 operation: Some("doctor".to_owned()),
                 ..AuditFacts::default()
-            }),
-        )
+            })
+            .into())
     })
 }
 

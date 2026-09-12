@@ -52,6 +52,8 @@ impl ToolSpec {
     }
 }
 
+const WRITE_MODES: &[Mode] = &[Mode::WriteOnly, Mode::ReadWrite];
+
 const fn read_tool(name: &'static str, title: &'static str, modes: &'static [Mode]) -> ToolSpec {
     ToolSpec {
         name,
@@ -62,6 +64,25 @@ const fn read_tool(name: &'static str, title: &'static str, modes: &'static [Mod
         read_only: true,
         destructive: false,
         idempotent: true,
+    }
+}
+
+const fn write_tool(
+    name: &'static str,
+    title: &'static str,
+    group: ToolGroup,
+    destructive: bool,
+    idempotent: bool,
+) -> ToolSpec {
+    ToolSpec {
+        name,
+        title,
+        group: Some(group),
+        modes: WRITE_MODES,
+        scope: scope_for(Some(group)),
+        read_only: false,
+        destructive,
+        idempotent,
     }
 }
 
@@ -82,6 +103,41 @@ pub const PG_DOCTOR: ToolSpec = read_tool(
     ALL_MODES,
 );
 
+pub const PG_INSERT: ToolSpec =
+    write_tool("pg_insert", "Insert rows", ToolGroup::Write, false, false);
+pub const PG_UPDATE: ToolSpec =
+    write_tool("pg_update", "Update rows", ToolGroup::Write, true, false);
+pub const PG_DELETE: ToolSpec =
+    write_tool("pg_delete", "Delete rows", ToolGroup::Write, true, true);
+pub const PG_MERGE: ToolSpec = write_tool(
+    "pg_merge",
+    "Upsert rows with MERGE",
+    ToolGroup::Write,
+    true,
+    false,
+);
+pub const PG_RUN_WRITE: ToolSpec = write_tool(
+    "pg_run_write",
+    "Run one write statement",
+    ToolGroup::Write,
+    true,
+    false,
+);
+pub const PG_COPY: ToolSpec = write_tool(
+    "pg_copy",
+    "Load or return rows in bulk",
+    ToolGroup::Write,
+    false,
+    false,
+);
+pub const PG_TRANSACTION: ToolSpec = write_tool(
+    "pg_transaction",
+    "Open, commit, or roll back a transaction",
+    ToolGroup::Transactions,
+    true,
+    false,
+);
+
 pub const TOOLS: &[ToolSpec] = &[
     PG_LIST_OBJECTS,
     PG_DESCRIBE,
@@ -90,6 +146,13 @@ pub const TOOLS: &[ToolSpec] = &[
     PG_EXPLAIN,
     PG_HEALTH,
     PG_DOCTOR,
+    PG_INSERT,
+    PG_UPDATE,
+    PG_DELETE,
+    PG_MERGE,
+    PG_RUN_WRITE,
+    PG_COPY,
+    PG_TRANSACTION,
 ];
 
 #[must_use]

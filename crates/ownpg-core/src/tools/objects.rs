@@ -6,7 +6,7 @@ use super::catalog::{
     self, ExtensionDescription, ObjectType, PrivilegeRow, RoleDescription, RoutineDescription,
     SequenceDescription, TableDescription, TypeDescription,
 };
-use super::{AuditFacts, Context, LIST_CAP, Outcome, Route, ToolOutput, route, text_rows};
+use super::{AuditFacts, Call, Context, LIST_CAP, Outcome, Route, ToolOutput, route, text_rows};
 use crate::error::Error;
 use crate::groups;
 use crate::shape::UNTRUSTED_NOTICE;
@@ -146,8 +146,9 @@ FROM objects \
 WHERE kind = ANY($2::text[]) AND name LIKE $3 AND (schema, name, oid) > ($4::text, $5::text, $6::int8) \
 ORDER BY schema, name, oid LIMIT $7::int8";
 
-pub fn list_objects(context: Context, args: ListObjectsArgs) -> BoxFuture<'static, Outcome> {
+pub fn list_objects(call: Call, args: ListObjectsArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
+        let context = call.context.clone();
         let scoped = context.settings().schema.value.clone();
         let kinds: Vec<String> = if args.object_types.is_empty() {
             ObjectType::ALL
@@ -264,7 +265,9 @@ pub fn list_objects(context: Context, args: ListObjectsArgs) -> BoxFuture<'stati
             order: "schema, name, oid",
             notice: UNTRUSTED_NOTICE,
         };
-        Ok(ToolOutput::structured(&list, text)?.with_facts(facts))
+        Ok(ToolOutput::structured(&list, text)?
+            .with_facts(facts)
+            .into())
     })
 }
 
@@ -331,8 +334,9 @@ impl Description {
     }
 }
 
-pub fn describe(context: Context, args: DescribeArgs) -> BoxFuture<'static, Outcome> {
+pub fn describe(call: Call, args: DescribeArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
+        let context = call.context.clone();
         let engine = &context.engine;
         let name = args.name.trim();
         if name.is_empty() {
@@ -378,7 +382,9 @@ pub fn describe(context: Context, args: DescribeArgs) -> BoxFuture<'static, Outc
             operation: Some(description.kind.clone()),
             ..AuditFacts::default()
         };
-        Ok(ToolOutput::structured(&description, text)?.with_facts(facts))
+        Ok(ToolOutput::structured(&description, text)?
+            .with_facts(facts)
+            .into())
     })
 }
 

@@ -1,13 +1,20 @@
 pub mod catalog;
+pub mod confirm;
+pub mod ddl;
 pub mod health;
 pub mod objects;
 pub mod read;
+pub mod roles;
+pub mod transaction;
+pub mod write;
 
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use rmcp::handler::server::tool::{schema_for_input, schema_for_output};
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool};
+use rmcp::model::{
+    CallToolResult, ContentBlock, InputRequiredResult, InputResponses, JsonObject, Tool,
+};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -26,6 +33,34 @@ pub struct Context {
     pub engine: Arc<Engine>,
     pub transport: Transport,
     pub audit_path: Option<std::path::PathBuf>,
+    pub gate: Arc<confirm::Gate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Call {
+    pub context: Context,
+    pub arguments: JsonObject,
+    pub principal: String,
+    pub request_state: Option<String>,
+    pub input_responses: Option<InputResponses>,
+    pub elicitation: bool,
+}
+
+impl Call {
+    #[must_use]
+    pub fn engine(&self) -> &Arc<Engine> {
+        &self.context.engine
+    }
+
+    #[must_use]
+    pub fn settings(&self) -> &Arc<Settings> {
+        self.context.settings()
+    }
+
+    #[must_use]
+    pub fn caps(&self, row_cap: u32) -> Caps {
+        self.context.caps(row_cap)
+    }
 }
 
 impl Context {
@@ -58,6 +93,7 @@ pub struct AuditFacts {
     pub handle_id: Option<String>,
     pub row_count: Option<u64>,
     pub truncated: bool,
+    pub decision: Option<Decision>,
 }
 
 impl AuditFacts {
@@ -208,9 +244,21 @@ impl From<Error> for ToolFailure {
     }
 }
 
-pub type Outcome = Result<ToolOutput, ToolFailure>;
+#[derive(Debug)]
+pub enum Reply {
+    Output(ToolOutput),
+    InputRequired(InputRequiredResult),
+}
 
-pub type Handler = Arc<dyn Fn(Context, JsonObject) -> BoxFuture<'static, Outcome> + Send + Sync>;
+impl From<ToolOutput> for Reply {
+    fn from(output: ToolOutput) -> Self {
+        Self::Output(output)
+    }
+}
+
+pub type Outcome = Result<Reply, ToolFailure>;
+
+pub type Handler = Arc<dyn Fn(Call) -> BoxFuture<'static, Outcome> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Route {
@@ -235,7 +283,7 @@ pub fn route<P, O, F>(
 where
     P: DeserializeOwned + JsonSchema + Send + 'static,
     O: JsonSchema + 'static,
-    F: Fn(Context, P) -> BoxFuture<'static, Outcome> + Send + Sync + 'static,
+    F: Fn(Call, P) -> BoxFuture<'static, Outcome> + Send + Sync + 'static,
 {
     let input_schema = schema_for_input::<P>().map_err(|reason| Error::ProtocolFailed {
         detail: format!("the input schema of {} is invalid: {reason}", spec.name),
@@ -245,17 +293,19 @@ where
         .with_raw_output_schema(schema_for_output::<O>())
         .with_annotations(spec.annotations());
     let handler = Arc::new(handler);
-    let call: Handler = Arc::new(move |context: Context, arguments: JsonObject| {
+    let call: Handler = Arc::new(move |call: Call| {
         let handler = Arc::clone(&handler);
         Box::pin(async move {
-            let parsed: P =
-                serde_json::from_value(serde_json::Value::Object(arguments)).map_err(|error| {
-                    ToolFailure::from(Error::ArgumentInvalid {
-                        argument: "arguments".to_owned(),
-                        detail: error.to_string(),
-                    })
-                })?;
-            handler(context, parsed).await
+            let parsed: P = serde_json::from_value(serde_json::Value::Object(
+                call.arguments.clone(),
+            ))
+            .map_err(|error| {
+                ToolFailure::from(Error::ArgumentInvalid {
+                    argument: "arguments".to_owned(),
+                    detail: error.to_string(),
+                })
+            })?;
+            handler(call, parsed).await
         })
     });
     Ok(Route {
@@ -269,6 +319,10 @@ pub fn all_routes() -> Result<Vec<Route>, Error> {
     let mut routes = objects::routes()?;
     routes.extend(read::routes()?);
     routes.extend(health::routes()?);
+    routes.extend(write::routes()?);
+    routes.extend(transaction::routes()?);
+    routes.extend(ddl::routes()?);
+    routes.extend(roles::routes()?);
     Ok(routes)
 }
 

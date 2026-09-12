@@ -17,7 +17,7 @@ use crate::audit::{Decision, Entry, PrincipalKind, Sink, Transport};
 use crate::engine::Engine;
 use crate::error::Result;
 use crate::groups;
-use crate::tools::{self, Context, Outcome, Route};
+use crate::tools::{self, Call, Context, Outcome, Reply, Route};
 
 pub const LIST_TTL_MS: u64 = 60_000;
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(1);
@@ -45,6 +45,13 @@ impl Principal {
             },
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RoundTrip {
+    pub request_state: Option<String>,
+    pub input_responses: Option<rmcp::model::InputResponses>,
+    pub elicitation: bool,
 }
 
 pub struct Server {
@@ -95,6 +102,7 @@ impl Server {
             engine,
             transport,
             audit_path: audit.path().map(std::path::Path::to_path_buf),
+            gate: Arc::new(tools::confirm::Gate::new()),
         };
         let info = build_info(&settings, &routes);
         Ok(Self {
@@ -131,10 +139,19 @@ impl Server {
         arguments: rmcp::model::JsonObject,
         request_id: String,
         cancel: tokio_util::sync::CancellationToken,
+        round_trip: RoundTrip,
     ) -> Option<Outcome> {
         let route = self.route(name)?;
         let started = Instant::now();
-        let mut work = std::pin::pin!((route.handler)(self.context.clone(), arguments));
+        let call = Call {
+            context: self.context.clone(),
+            arguments,
+            principal: self.principal.name.clone(),
+            request_state: round_trip.request_state,
+            input_responses: round_trip.input_responses,
+            elicitation: round_trip.elicitation,
+        };
+        let mut work = std::pin::pin!((route.handler)(call));
         let outcome = tokio::select! {
             outcome = &mut work => outcome,
             () = cancel.cancelled() => {
@@ -151,10 +168,25 @@ impl Server {
     fn record(&self, tool: &str, outcome: &Outcome, request_id: String, duration: Duration) {
         let settings = self.context.settings();
         let (facts, decision, rule, result) = match outcome {
-            Ok(output) => (&output.facts, Decision::Allowed, None, None),
+            Ok(Reply::Output(output)) => (
+                &output.facts,
+                output.facts.decision.unwrap_or(Decision::Allowed),
+                None,
+                None,
+            ),
+            Ok(Reply::InputRequired(_)) => {
+                tracing::debug!(
+                    tool,
+                    "confirmation requested; no audit line until the answer"
+                );
+                return;
+            }
             Err(failure) => (
                 failure.facts(),
-                failure.decision(),
+                failure
+                    .facts()
+                    .decision
+                    .unwrap_or_else(|| failure.decision()),
                 failure.rule(),
                 Some(failure.outcome()),
             ),
@@ -277,21 +309,33 @@ impl ServerHandler for Server {
         let span = tracing::info_span!("tool", tool = %name, request_id = %request_id);
         let _guard = span.enter();
         let arguments = request.arguments.unwrap_or_default();
+        let elicitation = context
+            .protocol_version()
+            .is_some_and(|version| version.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
+            && context
+                .client_capabilities()
+                .is_some_and(|capabilities| capabilities.elicitation.is_some());
+        let round_trip = RoundTrip {
+            request_state: request.request_state,
+            input_responses: request.input_responses,
+            elicitation,
+        };
         let outcome = self
-            .call(&name, arguments, request_id, context.ct.clone())
+            .call(&name, arguments, request_id, context.ct.clone(), round_trip)
             .await
             .ok_or_else(|| ErrorData::invalid_params(format!("tool not found: {name}"), None))?;
-        let result = match outcome {
-            Ok(output) => output.into_call_result(),
+        let response = match outcome {
+            Ok(Reply::Output(output)) => CallToolResponse::Complete(output.into_call_result()),
+            Ok(Reply::InputRequired(result)) => CallToolResponse::InputRequired(result),
             Err(failure) => {
                 tracing::info!(
                     code = failure.error().id().as_str(),
                     "tool call ended in an error result"
                 );
-                failure.into_call_result()
+                CallToolResponse::Complete(failure.into_call_result())
             }
         };
-        Ok(result.into())
+        Ok(response)
     }
 
     async fn on_cancelled(

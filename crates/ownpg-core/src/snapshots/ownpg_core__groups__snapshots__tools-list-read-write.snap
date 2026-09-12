@@ -1499,5 +1499,1085 @@ expression: tools
       "idempotentHint": true,
       "openWorldHint": false
     }
+  },
+  {
+    "name": "pg_insert",
+    "title": "Insert rows",
+    "description": "Insert one or more rows into a table of the scoped schema. Rows are JSON objects keyed by column name; values are converted to the column types by PostgreSQL. One statement inserts every row with the union of the columns the rows name: a column a row leaves out becomes NULL, and only a column no row names takes its default. on_conflict can ignore duplicates or update the listed columns. returning lists the columns to return (\"*\" for all). dry_run shows the statement without running it; transaction runs it inside an open handle.",
+    "inputSchema": {
+      "$defs": {
+        "OnConflict": {
+          "enum": [
+            "error",
+            "do_nothing",
+            "update"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "conflict_columns": {
+          "default": [],
+          "description": "Conflict target columns for do_nothing and update.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "dry_run": {
+          "default": false,
+          "description": "Show the statement without running it.",
+          "type": "boolean"
+        },
+        "on_conflict": {
+          "$ref": "#/$defs/OnConflict",
+          "default": "error",
+          "description": "error (default), do_nothing, or update."
+        },
+        "returning": {
+          "default": [],
+          "description": "Columns to return, or [\"*\"] for every column. Empty returns nothing.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rows": {
+          "description": "Rows to insert, each a JSON object keyed by column name.",
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "table": {
+          "description": "Table name, optionally schema-qualified.",
+          "type": "string"
+        },
+        "transaction": {
+          "default": "",
+          "description": "Run inside this transaction handle.",
+          "type": "string"
+        },
+        "update_columns": {
+          "default": [],
+          "description": "Columns to overwrite on conflict when on_conflict is update. Default: every inserted column except the conflict columns.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "table",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Column": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "type"
+          ],
+          "type": "object"
+        },
+        "Truncation": {
+          "enum": [
+            "row_cap",
+            "byte_cap"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/Column"
+          },
+          "type": "array"
+        },
+        "command_tag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "estimate": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "notice": {
+          "type": "string"
+        },
+        "row_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "items": {
+            "items": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "rows_affected": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "truncated_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Truncation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "columns",
+        "rows",
+        "row_count",
+        "truncated",
+        "notice"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Insert rows",
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "pg_update",
+    "title": "Update rows",
+    "description": "Update rows of a table in the scoped schema. set is a JSON object of column values; filter is a SQL boolean expression placed after WHERE. An update without a filter, or with a filter that is always true, touches every row and needs confirm: true (or the confirmation prompt when the client supports it). returning lists columns to return; on PostgreSQL 18, returning_old_new adds the old and new row images.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "confirm": {
+          "default": false,
+          "description": "Run a statement that touches every row.",
+          "type": "boolean"
+        },
+        "dry_run": {
+          "default": false,
+          "description": "Show the statement without running it.",
+          "type": "boolean"
+        },
+        "filter": {
+          "default": "",
+          "description": "SQL boolean expression placed after WHERE. Empty means every row and needs confirmation.",
+          "type": "string"
+        },
+        "returning": {
+          "default": [],
+          "description": "Columns to return, or [\"*\"] for every column.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "returning_old_new": {
+          "default": false,
+          "description": "PostgreSQL 18 and later: also return the old and new row images as JSON.",
+          "type": "boolean"
+        },
+        "set": {
+          "additionalProperties": true,
+          "description": "Column values to set, as a JSON object.",
+          "type": "object"
+        },
+        "table": {
+          "description": "Table name, optionally schema-qualified.",
+          "type": "string"
+        },
+        "transaction": {
+          "default": "",
+          "description": "Run inside this transaction handle.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "table",
+        "set"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Column": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "type"
+          ],
+          "type": "object"
+        },
+        "Truncation": {
+          "enum": [
+            "row_cap",
+            "byte_cap"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/Column"
+          },
+          "type": "array"
+        },
+        "command_tag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "estimate": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "notice": {
+          "type": "string"
+        },
+        "row_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "items": {
+            "items": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "rows_affected": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "truncated_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Truncation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "columns",
+        "rows",
+        "row_count",
+        "truncated",
+        "notice"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Update rows",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "pg_delete",
+    "title": "Delete rows",
+    "description": "Delete rows from a table in the scoped schema. filter is a SQL boolean expression placed after WHERE. A delete without a filter, or with a filter that is always true, removes every row and needs confirm: true (or the confirmation prompt). returning lists columns to return from the deleted rows.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "confirm": {
+          "default": false,
+          "description": "Run a statement that removes every row.",
+          "type": "boolean"
+        },
+        "dry_run": {
+          "default": false,
+          "description": "Show the statement without running it.",
+          "type": "boolean"
+        },
+        "filter": {
+          "default": "",
+          "description": "SQL boolean expression placed after WHERE. Empty means every row and needs confirmation.",
+          "type": "string"
+        },
+        "returning": {
+          "default": [],
+          "description": "Columns to return from the deleted rows, or [\"*\"].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "table": {
+          "description": "Table name, optionally schema-qualified.",
+          "type": "string"
+        },
+        "transaction": {
+          "default": "",
+          "description": "Run inside this transaction handle.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "table"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Column": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "type"
+          ],
+          "type": "object"
+        },
+        "Truncation": {
+          "enum": [
+            "row_cap",
+            "byte_cap"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/Column"
+          },
+          "type": "array"
+        },
+        "command_tag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "estimate": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "notice": {
+          "type": "string"
+        },
+        "row_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "items": {
+            "items": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "rows_affected": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "truncated_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Truncation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "columns",
+        "rows",
+        "row_count",
+        "truncated",
+        "notice"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Delete rows",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "pg_merge",
+    "title": "Upsert rows with MERGE",
+    "description": "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. Matched rows have update_columns set from the source (default: every column except match_on); unmatched rows are inserted when insert is true. returning (PostgreSQL 17 and later) lists columns to return.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "default": false,
+          "description": "Show the statement without running it.",
+          "type": "boolean"
+        },
+        "insert": {
+          "default": true,
+          "description": "Insert rows that match nothing (default true).",
+          "type": "boolean"
+        },
+        "match_on": {
+          "description": "Columns that identify a matching row.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "returning": {
+          "default": [],
+          "description": "PostgreSQL 17 and later: columns to return, or [\"*\"].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rows": {
+          "description": "Source rows, each a JSON object keyed by column name.",
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "table": {
+          "description": "Target table, optionally schema-qualified.",
+          "type": "string"
+        },
+        "transaction": {
+          "default": "",
+          "description": "Run inside this transaction handle.",
+          "type": "string"
+        },
+        "update_columns": {
+          "default": [],
+          "description": "Columns to set on matched rows. Default: every source column except match_on.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "table",
+        "rows",
+        "match_on"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Column": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "type"
+          ],
+          "type": "object"
+        },
+        "Truncation": {
+          "enum": [
+            "row_cap",
+            "byte_cap"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/Column"
+          },
+          "type": "array"
+        },
+        "command_tag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "estimate": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "notice": {
+          "type": "string"
+        },
+        "row_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "items": {
+            "items": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "rows_affected": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "truncated_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Truncation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "columns",
+        "rows",
+        "row_count",
+        "truncated",
+        "notice"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Upsert rows with MERGE",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "pg_run_write",
+    "title": "Run one write statement",
+    "description": "Run one write statement written in SQL: INSERT, UPDATE, DELETE, MERGE, COPY ... FROM STDIN is refused here (use pg_copy), DO, or CALL. Exactly one statement per call. The statement is parsed and classified first: reads are refused (use pg_run_query), schema changes are refused (use the DDL tools), and destructive shapes (a DELETE or UPDATE without a narrowing WHERE) need confirm: true or the confirmation prompt. dry_run returns the classification without running anything.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "confirm": {
+          "default": false,
+          "description": "Run a statement the classifier marks destructive.",
+          "type": "boolean"
+        },
+        "dry_run": {
+          "default": false,
+          "description": "Classify the statement without running it.",
+          "type": "boolean"
+        },
+        "sql": {
+          "description": "The single write statement to run.",
+          "type": "string"
+        },
+        "transaction": {
+          "default": "",
+          "description": "Run inside this transaction handle.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sql"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "Column": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "type"
+          ],
+          "type": "object"
+        },
+        "Truncation": {
+          "enum": [
+            "row_cap",
+            "byte_cap"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/Column"
+          },
+          "type": "array"
+        },
+        "command_tag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "estimate": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "notice": {
+          "type": "string"
+        },
+        "row_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "items": {
+            "items": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "rows_affected": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "truncated_by": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Truncation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "columns",
+        "rows",
+        "row_count",
+        "truncated",
+        "notice"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Run one write statement",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "pg_copy",
+    "title": "Load or return rows in bulk",
+    "description": "Move rows in bulk. direction in loads data into a table from the data argument through COPY FROM STDIN; direction out returns the rows of a table or a read query through COPY TO STDOUT, cut at the byte cap. Formats are text and csv; binary is refused. COPY never touches a file or a program on the database host.",
+    "inputSchema": {
+      "$defs": {
+        "CopyDirection": {
+          "enum": [
+            "in",
+            "out"
+          ],
+          "type": "string"
+        },
+        "CopyFormat": {
+          "enum": [
+            "text",
+            "csv"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "default": [],
+          "description": "Columns to load or return. Empty means every column.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "data": {
+          "default": "",
+          "description": "For in: the rows in text or csv form.",
+          "type": "string"
+        },
+        "delimiter": {
+          "default": "",
+          "description": "Field delimiter; the default is a tab for text and a comma for csv.",
+          "type": "string"
+        },
+        "direction": {
+          "$ref": "#/$defs/CopyDirection",
+          "description": "in loads rows into a table; out returns rows."
+        },
+        "dry_run": {
+          "default": false,
+          "description": "Show the statement without running it.",
+          "type": "boolean"
+        },
+        "format": {
+          "$ref": "#/$defs/CopyFormat",
+          "default": "text",
+          "description": "text (default) or csv."
+        },
+        "header": {
+          "default": false,
+          "description": "csv only: the first line is a header.",
+          "type": "boolean"
+        },
+        "null_string": {
+          "default": "",
+          "description": "The string that stands for NULL; the default is \\N for text and an empty field for csv.",
+          "type": "string"
+        },
+        "query": {
+          "default": "",
+          "description": "For out: a read statement whose rows are returned instead of a table.",
+          "type": "string"
+        },
+        "table": {
+          "default": "",
+          "description": "Table name for in, and for out when query is empty.",
+          "type": "string"
+        },
+        "transaction": {
+          "default": "",
+          "description": "Run inside this transaction handle (in only).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "direction"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "bytes": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "data": {
+          "type": "string"
+        },
+        "notice": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "data",
+        "bytes",
+        "truncated",
+        "notice"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Load or return rows in bulk",
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "pg_transaction",
+    "title": "Open, commit, or roll back a transaction",
+    "description": "Open and control an explicit transaction. begin returns a handle; pass that handle as the transaction argument of the write and DDL tools so their statements run inside it, then commit or rollback. savepoint and rollback_to take a savepoint name. status reports a handle's state: open, expired, committed, rolled_back, or lost. One handle can be open at a time; it expires after the configured idle time and is rolled back, and a dropped connection marks it lost. Reads keep working over a second connection while a handle is open.",
+    "inputSchema": {
+      "$defs": {
+        "Operation": {
+          "enum": [
+            "begin",
+            "commit",
+            "rollback",
+            "savepoint",
+            "rollback_to",
+            "status"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "handle": {
+          "default": "",
+          "description": "The handle returned by begin. Required for every operation but begin.",
+          "type": "string"
+        },
+        "operation": {
+          "$ref": "#/$defs/Operation",
+          "description": "What to do."
+        },
+        "savepoint": {
+          "default": "",
+          "description": "Savepoint name for savepoint and rollback_to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "HandleInfo": {
+          "properties": {
+            "expires_in_seconds": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "id": {
+              "type": "string"
+            },
+            "principal": {
+              "type": "string"
+            },
+            "savepoints": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "state": {
+              "$ref": "#/$defs/HandleState"
+            },
+            "statements": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "state",
+            "principal",
+            "savepoints",
+            "statements",
+            "expires_in_seconds"
+          ],
+          "type": "object"
+        },
+        "HandleState": {
+          "enum": [
+            "open",
+            "expired",
+            "committed",
+            "rolled_back",
+            "lost"
+          ],
+          "type": "string"
+        },
+        "Operation": {
+          "enum": [
+            "begin",
+            "commit",
+            "rollback",
+            "savepoint",
+            "rollback_to",
+            "status"
+          ],
+          "type": "string"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "handle": {
+          "$ref": "#/$defs/HandleInfo"
+        },
+        "operation": {
+          "$ref": "#/$defs/Operation"
+        }
+      },
+      "required": [
+        "operation",
+        "handle"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "title": "Open, commit, or roll back a transaction",
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
   }
 ]

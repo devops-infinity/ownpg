@@ -154,7 +154,19 @@ async fn write_only_mode_hides_the_read_tools() {
     let names: Vec<&str> = listed.tools.iter().map(|tool| tool.name.as_ref()).collect();
     assert_eq!(
         names,
-        ["pg_list_objects", "pg_describe", "pg_health", "pg_doctor"]
+        [
+            "pg_list_objects",
+            "pg_describe",
+            "pg_health",
+            "pg_doctor",
+            "pg_insert",
+            "pg_update",
+            "pg_delete",
+            "pg_merge",
+            "pg_run_write",
+            "pg_copy",
+            "pg_transaction"
+        ]
     );
     let missing = rig
         .client

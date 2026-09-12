@@ -43,6 +43,7 @@ rmcp.workspace = true
 schemars.workspace = true
 tokio-util.workspace = true
 pin-project-lite.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 ssh-key.workspace = true

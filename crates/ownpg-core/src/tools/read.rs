@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::catalog::{self, quote_identifier};
-use super::{AuditFacts, Context, Outcome, Route, ToolFailure, ToolOutput, route};
+use super::{AuditFacts, Call, Context, Outcome, Route, ToolFailure, ToolOutput, route};
 use crate::audit::short_statement;
 use crate::classify::{self, Classification, Scope, StatementClass};
 use crate::config::Mode;
@@ -35,7 +35,7 @@ pub struct RunQueryArgs {
     pub row_cap: u32,
 }
 
-pub async fn classify_checked(context: &Context, sql: &str) -> Result<Classification, ToolFailure> {
+pub async fn classify_checked(call: &Call, sql: &str) -> Result<Classification, ToolFailure> {
     let owned = sql.to_owned();
     let classification = tokio::task::spawn_blocking(move || classify::classify(&owned))
         .await
@@ -45,8 +45,8 @@ pub async fn classify_checked(context: &Context, sql: &str) -> Result<Classifica
             })
         })??;
     let facts = facts_for(&classification);
-    let settings = context.settings();
-    let pooled = context.engine.info().await.pooled;
+    let settings = call.settings();
+    let pooled = call.engine().info().await.pooled;
     let scope = Scope {
         schema: &settings.schema.value,
         require_qualified_names: pooled,
@@ -89,8 +89,9 @@ fn refuse_non_read(classification: &Classification, mode: Mode) -> Result<(), To
     .with_facts(facts_for(classification)))
 }
 
-pub fn run_query(context: Context, args: RunQueryArgs) -> BoxFuture<'static, Outcome> {
+pub fn run_query(call: Call, args: RunQueryArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
+        let context = call.context.clone();
         let caps = context.caps(args.row_cap);
         if !args.cursor.is_empty() {
             if !args.sql.trim().is_empty() {
@@ -119,7 +120,7 @@ pub fn run_query(context: Context, args: RunQueryArgs) -> BoxFuture<'static, Out
             }
             .into());
         }
-        let classification = classify_checked(&context, &args.sql).await?;
+        let classification = classify_checked(&call, &args.sql).await?;
         refuse_non_read(&classification, context.settings().mode.value)?;
         let facts = facts_for(&classification);
         let is_select = classification.kind == "SelectStmt";
@@ -135,7 +136,9 @@ pub fn run_query(context: Context, args: RunQueryArgs) -> BoxFuture<'static, Out
 fn finish(result: ResultSet, facts: AuditFacts) -> Outcome {
     let facts = facts.with_result(&result);
     let text = result.render_text();
-    Ok(ToolOutput::structured(&result, text)?.with_facts(facts))
+    Ok(ToolOutput::structured(&result, text)?
+        .with_facts(facts)
+        .into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -164,8 +167,9 @@ pub struct CountResult {
     pub notice: &'static str,
 }
 
-pub fn count(context: Context, args: CountArgs) -> BoxFuture<'static, Outcome> {
+pub fn count(call: Call, args: CountArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
+        let context = call.context.clone();
         let relation = catalog::resolve_relation(&context.engine, args.table.trim()).await?;
         let qualified = format!(
             "{}.{}",
@@ -184,7 +188,7 @@ pub fn count(context: Context, args: CountArgs) -> BoxFuture<'static, Outcome> {
         };
         let (count, method, facts) = if args.exact {
             let sql = format!("SELECT count(*) FROM {qualified}{where_clause}");
-            let classification = classify_checked(&context, &sql).await?;
+            let classification = classify_checked(&call, &sql).await?;
             let facts = facts_for(&classification);
             let result = context
                 .engine
@@ -217,7 +221,7 @@ pub fn count(context: Context, args: CountArgs) -> BoxFuture<'static, Outcome> {
             }
         } else {
             let sql = format!("SELECT 1 FROM {qualified}{where_clause}");
-            let classification = classify_checked(&context, &sql).await?;
+            let classification = classify_checked(&call, &sql).await?;
             let facts = facts_for(&classification);
             let estimate = explain_estimate(&context, &sql)
                 .await
@@ -240,12 +244,12 @@ pub fn count(context: Context, args: CountArgs) -> BoxFuture<'static, Outcome> {
             "{}\n{} rows in {} ({})\n",
             UNTRUSTED_NOTICE, result.count, result.table, result.method
         );
-        Ok(
-            ToolOutput::structured(&result, text)?.with_facts(AuditFacts {
+        Ok(ToolOutput::structured(&result, text)?
+            .with_facts(AuditFacts {
                 row_count: Some(1),
                 ..facts
-            }),
-        )
+            })
+            .into())
     })
 }
 
@@ -381,8 +385,9 @@ fn explain_options(args: &ExplainArgs, server_version_num: i32) -> Result<String
     Ok(options.join(", "))
 }
 
-pub fn explain(context: Context, args: ExplainArgs) -> BoxFuture<'static, Outcome> {
+pub fn explain(call: Call, args: ExplainArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
+        let context = call.context.clone();
         if args.sql.trim().is_empty() {
             return Err(Error::ArgumentInvalid {
                 argument: "sql".to_owned(),
@@ -397,7 +402,7 @@ pub fn explain(context: Context, args: ExplainArgs) -> BoxFuture<'static, Outcom
         } else {
             format!("EXPLAIN ({options}) {}", args.sql.trim())
         };
-        let classification = classify_checked(&context, &statement).await?;
+        let classification = classify_checked(&call, &statement).await?;
         let facts = facts_for(&classification);
         let caps = context.caps(1_000);
         let writes = classification.class != StatementClass::Read;
@@ -437,12 +442,12 @@ pub fn explain(context: Context, args: ExplainArgs) -> BoxFuture<'static, Outcom
             plan_json,
             notice: UNTRUSTED_NOTICE,
         };
-        Ok(
-            ToolOutput::structured(&explained, text)?.with_facts(AuditFacts {
+        Ok(ToolOutput::structured(&explained, text)?
+            .with_facts(AuditFacts {
                 row_count: Some(result.row_count as u64),
                 ..facts
-            }),
-        )
+            })
+            .into())
     })
 }
 
