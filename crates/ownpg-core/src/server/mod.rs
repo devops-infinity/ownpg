@@ -15,7 +15,8 @@ use rmcp::model::{
     ErrorData, GetPromptRequestParams, GetPromptResponse, Implementation, InitializeResult,
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-    ServerCapabilities, ServerInfo, SubscriptionFilter, Tool,
+    ServerCapabilities, ServerInfo, SubscribeRequestParams, SubscriptionFilter, Tool,
+    UnsubscribeRequestParams,
 };
 use rmcp::service::{
     NotificationContext, Peer, RequestContext, SubscriptionContext, SubscriptionSink,
@@ -97,6 +98,7 @@ pub struct Server {
     superuser: bool,
     info: InitializeResult,
     sinks: std::sync::Mutex<Vec<SubscriptionSink>>,
+    older_subscriptions: std::sync::Mutex<Vec<(Peer<RoleServer>, String)>>,
     metrics: Option<metrics::Metrics>,
 }
 
@@ -160,6 +162,7 @@ impl Server {
             superuser,
             info,
             sinks: std::sync::Mutex::new(Vec::new()),
+            older_subscriptions: std::sync::Mutex::new(Vec::new()),
             metrics,
         })
     }
@@ -354,20 +357,31 @@ impl Server {
                 tracing::debug!(%error, "a resource list change was not delivered");
             }
         }
-        if let Some(peer) = older_peer {
+        if let Some(peer) = &older_peer {
             for uri in &uris {
-                if let Err(error) = peer
-                    .notify_resource_updated(rmcp::model::ResourceUpdatedNotificationParam::new(
-                        uri.clone(),
-                    ))
-                    .await
-                {
-                    tracing::debug!(%error, uri, "a resource update was not delivered");
-                }
+                notify_older_peer(peer, uri).await;
             }
             if let Err(error) = peer.notify_resource_list_changed().await {
                 tracing::debug!(%error, "a resource list change was not delivered");
             }
+        }
+        let subscribed: Vec<(Peer<RoleServer>, String)> = match self.older_subscriptions.lock() {
+            Ok(mut held) => {
+                held.retain(|(peer, _)| !peer.is_transport_closed());
+                held.iter()
+                    .filter(|(peer, uri)| {
+                        uris.contains(uri)
+                            && !older_peer
+                                .as_ref()
+                                .is_some_and(|caller| same_peer(caller, peer))
+                    })
+                    .cloned()
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        for (peer, uri) in &subscribed {
+            notify_older_peer(peer, uri).await;
         }
     }
 
@@ -739,6 +753,80 @@ impl ServerHandler for Server {
         Some(requested.clone())
     }
 
+    #[allow(deprecated)]
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), ErrorData> {
+        let started = Instant::now();
+        let request_id = request_id_from(&context);
+        let principal = self.principal_for(&context);
+        self.require_scope(
+            &principal,
+            groups::SCOPE_READ,
+            "resources/subscribe",
+            &request_id,
+            started,
+        )?;
+        let settings = self.context.settings();
+        resources::parse_uri(
+            &request.uri,
+            &settings.database.value,
+            &settings.schema.value,
+        )?;
+        if let Ok(mut held) = self.older_subscriptions.lock() {
+            held.retain(|(peer, _)| !peer.is_transport_closed());
+            let known = held
+                .iter()
+                .any(|(peer, uri)| *uri == request.uri && same_peer(peer, &context.peer));
+            if !known {
+                held.push((context.peer.clone(), request.uri.clone()));
+            }
+        }
+        self.record_plain(
+            "resources/subscribe",
+            request_id,
+            started.elapsed(),
+            &principal,
+            Decision::Allowed,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
+    #[allow(deprecated)]
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), ErrorData> {
+        let started = Instant::now();
+        let request_id = request_id_from(&context);
+        let principal = self.principal_for(&context);
+        self.require_scope(
+            &principal,
+            groups::SCOPE_READ,
+            "resources/unsubscribe",
+            &request_id,
+            started,
+        )?;
+        if let Ok(mut held) = self.older_subscriptions.lock() {
+            held.retain(|(peer, uri)| !(*uri == request.uri && same_peer(peer, &context.peer)));
+        }
+        self.record_plain(
+            "resources/unsubscribe",
+            request_id,
+            started.elapsed(),
+            &principal,
+            Decision::Allowed,
+            None,
+            None,
+        );
+        Ok(())
+    }
+
     async fn listen(&self, context: SubscriptionContext) -> std::result::Result<(), ErrorData> {
         let started = Instant::now();
         let request_id = request_id_from(context.request_context());
@@ -771,6 +859,24 @@ impl ServerHandler for Server {
 
     async fn on_initialized(&self, _context: NotificationContext<RoleServer>) {
         tracing::info!("client initialized");
+    }
+}
+
+fn same_peer(left: &Peer<RoleServer>, right: &Peer<RoleServer>) -> bool {
+    match (left.peer_info(), right.peer_info()) {
+        (Some(left), Some(right)) => Arc::ptr_eq(&left, &right),
+        _ => false,
+    }
+}
+
+async fn notify_older_peer(peer: &Peer<RoleServer>, uri: &str) {
+    if let Err(error) = peer
+        .notify_resource_updated(rmcp::model::ResourceUpdatedNotificationParam::new(
+            uri.to_owned(),
+        ))
+        .await
+    {
+        tracing::debug!(%error, uri, "a resource update was not delivered");
     }
 }
 

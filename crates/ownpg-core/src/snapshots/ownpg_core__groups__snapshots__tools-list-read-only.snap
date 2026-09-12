@@ -1217,7 +1217,16 @@ expression: tools
         "notice": {
           "type": "string"
         },
-        "plan_json": true,
+        "plan_json": {
+          "description": "The plan exactly as EXPLAIN (FORMAT JSON) returns it: one object per top-level plan.",
+          "items": {
+            "type": "object"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "plan_text": {
           "type": [
             "string",

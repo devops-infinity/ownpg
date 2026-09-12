@@ -74,7 +74,7 @@ pub fn parse_uri(uri: &str, database: &str, schema: &str) -> Result<Target, Erro
     let not_found = |detail: &str| {
         ErrorData::resource_not_found(
             format!("{uri} is not a resource of this server: {detail}"),
-            None,
+            Some(serde_json::json!({"uri": uri})),
         )
     };
     let rest = uri

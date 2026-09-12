@@ -363,6 +363,62 @@ async fn a_ddl_call_announces_the_table_and_schema_to_a_2025_client() {
     rig.finish().await;
 }
 
+#[allow(deprecated)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_2025_client_subscribes_and_unsubscribes_to_one_table() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    prepare(&scratch).await;
+    let rig = rig(&scratch, ClientLifecycleMode::Initialize).await;
+    let subscribe = |uri: String| {
+        rmcp::model::ClientRequest::SubscribeRequest(rmcp::model::SubscribeRequest::new(
+            rmcp::model::SubscribeRequestParams::new(uri),
+        ))
+    };
+    let unsubscribe = |uri: String| {
+        rmcp::model::ClientRequest::UnsubscribeRequest(rmcp::model::UnsubscribeRequest::new(
+            rmcp::model::UnsubscribeRequestParams::new(uri),
+        ))
+    };
+    let foreign = rig
+        .client
+        .send_request(subscribe(format!(
+            "postgres://{}/other/secrets",
+            rig.database
+        )))
+        .await;
+    assert!(
+        foreign.is_err(),
+        "a uri outside the scoped schema is refused"
+    );
+    rig.client
+        .send_request(subscribe(rig.table_uri("orders")))
+        .await
+        .expect("the subscription is accepted");
+    rig.tool(
+        "pg_column",
+        json!({"operation": "add", "table": "orders", "column": "note", "data_type": "text"}),
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while rig.handler.list_changed.load(Ordering::SeqCst) == 0
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        *rig.handler.updated.lock().unwrap(),
+        vec![rig.table_uri("orders")],
+        "the caller hears about its own change once, not twice"
+    );
+    rig.client
+        .send_request(unsubscribe(rig.table_uri("orders")))
+        .await
+        .expect("the unsubscribe is accepted");
+    rig.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ddl_call_reaches_a_subscription_stream_on_the_current_protocol() {
     let Some(scratch) = support::scratch().await else {

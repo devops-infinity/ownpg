@@ -315,19 +315,27 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
 
     let mut last = 200;
     let mut retry_after = None;
+    let mut throttled = Value::Null;
     for _ in 0..70 {
-        let (status, _, headers) = remote.tool("pg_health", None).await;
+        let (status, body, headers) = remote.tool("pg_health", None).await;
         last = status;
         if status == 429 {
             retry_after = headers
                 .get("retry-after")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok());
+            throttled = body;
             break;
         }
     }
     assert_eq!(last, 429);
     assert!(retry_after.is_some_and(|seconds| seconds >= 1));
+    assert_eq!(throttled["jsonrpc"], "2.0", "{throttled}");
+    assert_eq!(throttled["error"]["code"], http::RATE_LIMITED_CODE);
+    assert_eq!(
+        throttled["error"]["data"]["retry_after_seconds"].as_u64(),
+        retry_after
+    );
     remote.finish().await;
 }
 

@@ -52,6 +52,8 @@ Usage: tools/release.sh --patch | --minor | --major [options]
   --yes            skip the typed confirmation, for unattended runs
   --yank X.Y.Z     yank that version from both crates, binary first
   --unyank X.Y.Z   put a yanked version back, library first
+  --branch NAME    release from this branch instead of main, for a hotfix cut
+                   from a release tag (the branch must exist on the remote)
   -h, --help       show this
 
 Release order: ownpg-core is published before ownpg, because the binary
@@ -67,6 +69,11 @@ Environment:
   OWNPG_MINISIGN_KEY        the minisign secret key (default ~/.minisign/minisign.key)
   OWNPG_CODESIGN_IDENTITY   Developer ID Application identity for the macOS binaries
   OWNPG_NOTARY_PROFILE      notarytool keychain profile; unset skips signing with a warning
+  OWNPG_WINDOWS_SIGN_CERT   PKCS#12 certificate for the Windows binaries, signed with osslsigncode
+  OWNPG_WINDOWS_SIGN_PASS   the password of that certificate; unset skips signing with a warning
+  OWNPG_HOMEBREW_TAP        the tap repository (default devops-infinity/homebrew-tap)
+  OWNPG_SKIP_TAP            set to 1 to leave the formula in target/distrib instead of pushing it
+  OWNPG_SKIP_NPM            set to 1 to leave the npm package in target/distrib instead of publishing it
 USAGE
 }
 
@@ -612,6 +619,7 @@ build_dist_artifacts() {
 		fi
 	fi
 	sign_macos_binaries "${built[@]}"
+	sign_windows_binaries "${built[@]}"
 	build_mcpb_bundles "${built[@]}"
 	run "dist build --artifacts=global" dist build --tag="v$VERSION" --artifacts=global --no-local-paths
 	cp -- "$ATTRIBUTION" target/distrib/ || die "could not place $ATTRIBUTION next to the archives"
@@ -643,6 +651,69 @@ sign_macos_binaries() {
 		tar -czf "$archive" -C "$stage" "$BIN_CRATE-$target" || die "could not repack $archive after signing"
 		say SUCCESS "signed and notarized $target"
 	done
+}
+
+sign_windows_binaries() {
+	local cert="${OWNPG_WINDOWS_SIGN_CERT:-}" pass="${OWNPG_WINDOWS_SIGN_PASS:-}"
+	if [[ -z "$cert" || -z "$pass" ]]; then
+		say WARNING "OWNPG_WINDOWS_SIGN_CERT or OWNPG_WINDOWS_SIGN_PASS is unset; the Windows binaries ship unsigned and SmartScreen will warn on first run"
+		return 0
+	fi
+	[[ -f "$cert" ]] || die "OWNPG_WINDOWS_SIGN_CERT points at $cert, which does not exist"
+	require_tools osslsigncode
+	local target archive stage exe
+	for target in "$@"; do
+		[[ "$target" == *-pc-windows-msvc ]] || continue
+		archive="target/distrib/$BIN_CRATE-$target.zip"
+		[[ -f "$archive" ]] || die "$archive is missing; dist did not produce the Windows archive for $target"
+		stage="$WORK/sign-$target"
+		rm -rf -- "$stage"
+		mkdir -p -- "$stage"
+		unzip -q "$archive" -d "$stage" || die "could not unpack $archive"
+		exe="$(find "$stage" -type f -name "$BIN_CRATE.exe" | head -n 1)"
+		[[ -n "$exe" ]] || die "$archive holds no $BIN_CRATE.exe"
+		run "osslsigncode ($target)" osslsigncode sign -pkcs12 "$cert" -pass "$pass" -n "OwnPG" -i "$RELEASE_URL_BASE" -t http://timestamp.digicert.com -in "$exe" -out "$exe.signed"
+		mv -f -- "$exe.signed" "$exe" || die "could not replace $exe with the signed binary"
+		run "osslsigncode verify ($target)" osslsigncode verify -in "$exe"
+		rm -f -- "$archive"
+		(cd "$stage" && zip -q -r "$REPO/$archive" .) || die "could not repack $archive after signing"
+		say SUCCESS "signed $target"
+	done
+}
+
+publish_homebrew_formula() {
+	local tap="${OWNPG_HOMEBREW_TAP:-devops-infinity/homebrew-tap}" formula="target/distrib/$BIN_CRATE.rb" clone
+	if [[ "${OWNPG_SKIP_TAP:-0}" == "1" ]]; then
+		say INFO "OWNPG_SKIP_TAP=1; the formula stays at $formula"
+		return 0
+	fi
+	[[ -f "$formula" ]] || die "$formula is missing; dist did not write the Homebrew formula"
+	clone="$WORK/homebrew-tap"
+	rm -rf -- "$clone"
+	run "gh repo clone $tap" gh repo clone "$tap" "$clone" -- --quiet --depth 1
+	mkdir -p -- "$clone/Formula"
+	cp -- "$formula" "$clone/Formula/$BIN_CRATE.rb" || die "could not copy the formula into the tap"
+	if git -C "$clone" diff --quiet -- "Formula/$BIN_CRATE.rb" && [[ -z "$(git -C "$clone" status --porcelain -- "Formula/$BIN_CRATE.rb")" ]]; then
+		say INFO "the tap already carries this formula"
+		return 0
+	fi
+	git -C "$clone" add -- "Formula/$BIN_CRATE.rb" || die "could not stage the formula"
+	git -C "$clone" -c user.name="$(git config user.name)" -c user.email="$(git config user.email)" commit --quiet -m "$BIN_CRATE $VERSION" || die "could not commit the formula"
+	run "git push ($tap)" git -C "$clone" push --quiet origin HEAD
+	say SUCCESS "formula pushed to $tap"
+}
+
+publish_npm_package() {
+	local package="target/distrib/$BIN_CRATE-npm-package.tar.gz"
+	if [[ "${OWNPG_SKIP_NPM:-0}" == "1" ]]; then
+		say INFO "OWNPG_SKIP_NPM=1; the npm package stays at $package"
+		return 0
+	fi
+	[[ -f "$package" ]] || die "$package is missing; dist did not write the npm package"
+	require_tools npm
+	npm whoami >/dev/null 2>&1 || die "npm is not logged in: run 'npm login' first"
+	run "npm publish" npm publish "$package" --access public
+	say SUCCESS "npm package published"
 }
 
 mcpb_platform() {
@@ -817,6 +888,15 @@ wait_for_crate() {
 	die "$name $VERSION did not appear after $((PROPAGATE_TRIES * PROPAGATE_WAIT))s; publish $BIN_CRATE by hand once it does"
 }
 
+check_semver() {
+	fetch_crate "$LIB_CRATE"
+	if [[ "$CRATE_CODE" != "200" ]]; then
+		say INFO "cargo semver-checks skipped: $LIB_CRATE is not on crates.io yet"
+		return 0
+	fi
+	run "cargo semver-checks" cargo semver-checks check-release -p "$LIB_CRATE" --color never
+}
+
 yank_mode() {
 	local undo="$1"
 	local action="yank"
@@ -886,6 +966,11 @@ while [[ $# -gt 0 ]]; do
 		VERSION="$2"
 		shift 2
 		;;
+	--branch)
+		[[ $# -ge 2 ]] || die "--branch needs a branch name"
+		BRANCH="$2"
+		shift 2
+		;;
 	-h | --help)
 		usage
 		exit 0
@@ -930,7 +1015,7 @@ unyank)
 esac
 
 step "pre-flight"
-require_tools git cargo curl jq awk shasum unzip tar cargo-nextest cargo-audit cargo-deny cargo-machete cargo-about cargo-auditable cargo-cyclonedx dist gh minisign mcpb
+require_tools git cargo curl jq awk shasum unzip tar cargo-nextest cargo-audit cargo-deny cargo-machete cargo-about cargo-auditable cargo-cyclonedx cargo-semver-checks dist gh minisign mcpb
 [[ -z "$(git status --porcelain)" ]] || die "the working tree is not clean; commit or stash first"
 say SUCCESS "working tree is clean"
 current_branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -973,6 +1058,7 @@ run "cargo doc" env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-featu
 run "cargo audit" cargo audit --deny warnings
 check_deny
 run "cargo machete" cargo machete
+check_semver
 write_attribution
 
 step "packaging proof"
@@ -1034,6 +1120,7 @@ say INFO "  prebuilt binaries for whichever of the eight targets this machine ca
 say INFO "  a commit on $BRANCH carrying the bump and the changelog"
 say INFO "  tag v$VERSION ($(tag_flag)) pushed to $REMOTE"
 say INFO "  a GitHub release v$VERSION carrying the built binaries, here and on $PUBLIC_RELEASE_REPO"
+say INFO "  the Homebrew formula pushed to ${OWNPG_HOMEBREW_TAP:-devops-infinity/homebrew-tap} and the npm package published, unless OWNPG_SKIP_TAP or OWNPG_SKIP_NPM is 1"
 say WARNING "a published crates.io version can never be replaced, only yanked"
 confirm "$VERSION"
 
@@ -1081,5 +1168,10 @@ publish_github_release ""
 publish_github_release "$PUBLIC_RELEASE_REPO"
 PUSHED=0
 
+step "Homebrew tap"
+publish_homebrew_formula
+
+step "npm package"
+publish_npm_package
+
 say SUCCESS "released $VERSION"
-say INFO "the Homebrew formula is at target/distrib/ownpg.rb and the npm package at target/distrib/ownpg-npm-package.tar.gz; push the formula to devops-infinity/homebrew-tap and run npm publish on the package to finish those two channels"

@@ -109,12 +109,20 @@ impl Gatekeeper {
     }
 }
 
+pub const RATE_LIMITED_CODE: i32 = -32000;
+
 fn too_many(wait: Duration) -> Response {
+    let seconds = wait.as_secs().max(1);
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         axum::Json(serde_json::json!({
-            "error": "rate_limited",
-            "error_description": format!("the limit of calls per minute was reached; retry after {} seconds", wait.as_secs()),
+            "jsonrpc": "2.0",
+            "id": serde_json::Value::Null,
+            "error": {
+                "code": RATE_LIMITED_CODE,
+                "message": format!("rate_limited: the limit of calls per minute was reached; retry after {seconds} seconds"),
+                "data": {"retry_after_seconds": seconds},
+            },
         })),
     )
         .into_response();

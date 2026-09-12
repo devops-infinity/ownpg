@@ -340,9 +340,18 @@ pub struct ExplainResult {
     pub rolled_back: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "plan_json_schema")]
     pub plan_json: Option<serde_json::Value>,
     pub notice: &'static str,
+}
+
+fn plan_json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["array", "null"],
+        "items": {"type": "object"},
+        "description": "The plan exactly as EXPLAIN (FORMAT JSON) returns it: one object per top-level plan."
+    })
 }
 
 fn explain_options(args: &ExplainArgs, server_version_num: i32) -> Result<String, Error> {
