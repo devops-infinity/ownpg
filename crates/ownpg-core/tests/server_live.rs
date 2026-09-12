@@ -548,7 +548,13 @@ async fn health_and_doctor_report_without_secrets() {
             .ends_with(".jsonl")
     );
     assert_eq!(structured["features"]["pg_stat_io"], true);
-    assert!(!structured.to_string().to_lowercase().contains("password"));
+    let password = structured["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["name"] == "password")
+        .expect("the password line");
+    assert!(["set", "unset"].contains(&password["value"].as_str().unwrap()));
     rig.finish().await;
 }
 

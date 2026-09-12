@@ -1,3 +1,4 @@
+pub mod describe;
 pub mod environment;
 pub mod libpq;
 pub mod presets;
@@ -151,6 +152,12 @@ impl ChannelBinding {
     }
 }
 
+impl fmt::Display for ChannelBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SshTransport {
@@ -173,6 +180,12 @@ impl SshTransport {
             "system" | "openssh" => Some(Self::System),
             _ => None,
         }
+    }
+}
+
+impl fmt::Display for SshTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

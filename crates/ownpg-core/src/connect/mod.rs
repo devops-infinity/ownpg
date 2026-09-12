@@ -523,7 +523,7 @@ impl Connector {
         };
         let row = client
             .query_one(
-                "SELECT current_setting('server_version_num')::int4, version(), current_user::text, current_database()::text",
+                "SELECT current_setting('server_version_num')::int4, current_setting('server_version'), current_user::text, current_database()::text",
                 &[],
             )
             .await?;

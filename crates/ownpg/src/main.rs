@@ -1,7 +1,12 @@
 mod app;
 mod build_info;
 mod cli;
+mod config_cmd;
+mod context;
+mod doctor;
+mod logging;
 mod output;
+mod serve;
 
 use std::io::{self, Write};
 use std::process::ExitCode;

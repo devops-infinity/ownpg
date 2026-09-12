@@ -1,20 +1,47 @@
 use clap::CommandFactory;
 use ownpg_core::{Error, ExitClass, Result};
 
-use crate::cli::{Cli, Command, ShellArg};
+use crate::cli::{Cli, Command, ServeArgs, ShellArg};
 use crate::output::{emit, report_error, stdout_error};
+use crate::{config_cmd, context, doctor, logging, serve};
 
 pub(crate) fn run(args: Cli) -> ExitClass {
-    let outcome = match args.command {
-        Command::Man { command } => show_manual(&command),
-        Command::Completions { shell } => show_completions(shell),
-    };
+    let outcome = dispatch(args);
     match outcome {
         Ok(class) => class,
         Err(error) => {
             report_error(&error);
             error.exit_class()
         }
+    }
+}
+
+fn dispatch(args: Cli) -> Result<ExitClass> {
+    match &args.command {
+        Some(Command::Man { command }) => return show_manual(command),
+        Some(Command::Completions { shell }) => return show_completions(*shell),
+        _ => {}
+    }
+    let process = context::detect(&args.global)?;
+    let _log_guard = logging::init(&args.global, &process.paths)?;
+    match args.command {
+        None => {
+            let defaults = ServeArgs {
+                connection: crate::cli::ConnectionArgs::default(),
+                no_audit: false,
+                audit_path: None,
+                pg_bindir: None,
+                output_dir: None,
+                http: false,
+                bind: None,
+                auth: None,
+            };
+            serve::run(&args.global, &defaults, &process)
+        }
+        Some(Command::Serve(serve_args)) => serve::run(&args.global, &serve_args, &process),
+        Some(Command::Doctor(doctor_args)) => doctor::run(&args.global, &doctor_args, &process),
+        Some(Command::Config(config)) => config_cmd::run(&args.global, &config, &process),
+        Some(Command::Man { .. } | Command::Completions { .. }) => Ok(ExitClass::Success),
     }
 }
 
@@ -78,5 +105,12 @@ mod tests {
         assert_eq!(error.exit_class(), ExitClass::Usage);
         assert!(error.remedy().contains("man"));
         assert!(error.remedy().contains("completions"));
+        assert!(error.remedy().contains("serve"));
+    }
+
+    #[test]
+    fn a_nested_manual_page_renders() {
+        let outcome = show_manual(&["config".to_owned(), "show".to_owned()]);
+        assert!(outcome.is_ok());
     }
 }

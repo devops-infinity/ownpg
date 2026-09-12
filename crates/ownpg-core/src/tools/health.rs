@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::catalog;
 use super::{AuditFacts, Context, Outcome, Route, ToolOutput, route};
-use crate::config::Origin;
+use crate::config::describe::{SettingLine, describe};
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::groups;
@@ -284,13 +284,6 @@ pub fn health(context: Context, _args: NoArgs) -> BoxFuture<'static, Outcome> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct SettingLine {
-    pub name: String,
-    pub value: String,
-    pub origin: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct AttemptLine {
     pub target: String,
     pub user: String,
@@ -325,13 +318,6 @@ pub struct DoctorReport {
     pub version: String,
 }
 
-fn origin_name(origin: Origin) -> String {
-    serde_json::to_value(origin)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "preset".to_owned())
-}
-
 pub async fn doctor_report(
     engine: &Engine,
     audit_path: Option<&std::path::Path>,
@@ -361,64 +347,7 @@ pub async fn doctor_report(
     for membership in &role.memberships {
         attributes.push(format!("member of {membership}"));
     }
-    let limits = &settings.limits;
-    let setting_lines = vec![
-        SettingLine {
-            name: "mode".to_owned(),
-            value: settings.mode.value.to_string(),
-            origin: origin_name(settings.mode.origin),
-        },
-        SettingLine {
-            name: "database".to_owned(),
-            value: settings.database.value.clone(),
-            origin: origin_name(settings.database.origin),
-        },
-        SettingLine {
-            name: "schema".to_owned(),
-            value: settings.schema.value.clone(),
-            origin: origin_name(settings.schema.origin),
-        },
-        SettingLine {
-            name: "strict_role".to_owned(),
-            value: settings.strict_role.value.to_string(),
-            origin: origin_name(settings.strict_role.origin),
-        },
-        SettingLine {
-            name: "statement_timeout".to_owned(),
-            value: format!("{} ms", limits.statement_timeout.value.as_millis()),
-            origin: origin_name(limits.statement_timeout.origin),
-        },
-        SettingLine {
-            name: "lock_timeout".to_owned(),
-            value: format!("{} ms", limits.lock_timeout.value.as_millis()),
-            origin: origin_name(limits.lock_timeout.origin),
-        },
-        SettingLine {
-            name: "transaction_timeout".to_owned(),
-            value: format!("{} ms", limits.transaction_timeout.value.as_millis()),
-            origin: origin_name(limits.transaction_timeout.origin),
-        },
-        SettingLine {
-            name: "handle_expiry".to_owned(),
-            value: format!("{} s", limits.handle_expiry.value.as_secs()),
-            origin: origin_name(limits.handle_expiry.origin),
-        },
-        SettingLine {
-            name: "row_cap".to_owned(),
-            value: limits.row_cap.value.to_string(),
-            origin: origin_name(limits.row_cap.origin),
-        },
-        SettingLine {
-            name: "byte_cap".to_owned(),
-            value: limits.byte_cap.value.to_string(),
-            origin: origin_name(limits.byte_cap.origin),
-        },
-        SettingLine {
-            name: "audit".to_owned(),
-            value: settings.audit.enabled.value.to_string(),
-            origin: origin_name(settings.audit.enabled.origin),
-        },
-    ];
+    let setting_lines = describe(settings);
     let attempts = info
         .attempts
         .iter()
@@ -586,11 +515,5 @@ mod tests {
             ]),
             Status::Critical
         );
-    }
-
-    #[test]
-    fn origins_render_in_kebab_case() {
-        assert_eq!(origin_name(Origin::Environment), "environment");
-        assert_eq!(origin_name(Origin::Libpq), "libpq");
     }
 }

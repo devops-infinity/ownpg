@@ -32,6 +32,7 @@ deny = [
   { crate = "backoff", reason = "unmaintained per RUSTSEC-2025-0012; backon replaces it" },
   { crate = "lazy_static", reason = "superseded by std::sync::LazyLock", wrappers = [
     "bindgen",
+    "sharded-slab",
   ] },
   { crate = "exitcode", reason = "last released 2017" },
   { crate = "anyhow", reason = "the workspace carries one error type with an exit class and a stable id", wrappers = [
