@@ -112,6 +112,28 @@ impl Gatekeeper {
 
 pub const RATE_LIMITED_CODE: i32 = -32000;
 
+pub fn announce_proxy(purpose: &str) {
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if let Ok(value) = std::env::var(name)
+            && !value.trim().is_empty()
+        {
+            let host = value
+                .rsplit_once('@')
+                .map_or(value.as_str(), |(_, host)| host)
+                .to_owned();
+            tracing::info!(variable = name, proxy = %host, "{purpose} requests go through a proxy");
+            return;
+        }
+    }
+}
+
 fn retry_after_seconds(wait: Duration) -> u64 {
     let whole = wait.as_secs();
     if wait.subsec_nanos() > 0 {

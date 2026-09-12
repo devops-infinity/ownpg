@@ -86,11 +86,74 @@ pub(crate) fn run(
             Ok(ExitClass::Success)
         }
         ConfigCommand::Init { force, dry_run } => init(process, *force, *dry_run),
-        ConfigCommand::SetPassword { profile } => set_password(global, process, profile),
-        ConfigCommand::UnsetPassword { profile } => unset_password(process, profile),
-        ConfigCommand::SetSshPassphrase { profile } => set_ssh_passphrase(global, process, profile),
-        ConfigCommand::UnsetSshPassphrase { profile } => unset_ssh_passphrase(process, profile),
-        ConfigCommand::CacheClear => cache_clear(process),
+        ConfigCommand::SetPassword { profile, dry_run } => {
+            if *dry_run {
+                return preview(
+                    process,
+                    profile,
+                    "store the password in the keychain and set password_keychain = true",
+                );
+            }
+            set_password(global, process, profile)
+        }
+        ConfigCommand::UnsetPassword { profile, dry_run } => {
+            if *dry_run {
+                return preview(
+                    process,
+                    profile,
+                    "remove the password from the keychain and clear password_keychain",
+                );
+            }
+            unset_password(process, profile)
+        }
+        ConfigCommand::SetSshPassphrase { profile, dry_run } => {
+            if *dry_run {
+                return preview(
+                    process,
+                    profile,
+                    "store the SSH passphrase in the keychain and set ssh.passphrase_keychain = true",
+                );
+            }
+            set_ssh_passphrase(global, process, profile)
+        }
+        ConfigCommand::UnsetSshPassphrase { profile, dry_run } => {
+            if *dry_run {
+                return preview(
+                    process,
+                    profile,
+                    "remove the SSH passphrase from the keychain and clear ssh.passphrase_keychain",
+                );
+            }
+            unset_ssh_passphrase(process, profile)
+        }
+        ConfigCommand::CacheClear { dry_run } => cache_clear(process, *dry_run),
+    }
+}
+
+fn preview(process: &Process, profile: &str, action: &str) -> Result<ExitClass> {
+    load_profiles(process, profile)?;
+    emit(|out| {
+        writeln!(
+            out,
+            "would {action} for profile `{profile}` in {}",
+            process.paths.config_file.display()
+        )
+    })
+    .map_err(stdout_error)?;
+    Ok(ExitClass::Success)
+}
+
+pub(crate) fn verify_audit(path: &std::path::Path) -> Result<ExitClass> {
+    match ownpg_core::audit::verify_chain(path) {
+        Ok(lines) => {
+            emit(|out| writeln!(out, "{}: {lines} chained lines verified", path.display()))
+                .map_err(stdout_error)?;
+            Ok(ExitClass::Success)
+        }
+        Err(problem) => Err(Error::AuditTampered {
+            path: path.to_path_buf(),
+            detail: problem,
+        }),
     }
 }
 
@@ -285,7 +348,7 @@ fn unset_password(process: &Process, profile: &str) -> Result<ExitClass> {
     Ok(ExitClass::Success)
 }
 
-fn cache_clear(process: &Process) -> Result<ExitClass> {
+fn cache_clear(process: &Process, dry_run: bool) -> Result<ExitClass> {
     let cache = &process.paths.cache_dir;
     let mut removed = 0usize;
     if cache.is_dir() {
@@ -295,6 +358,12 @@ fn cache_clear(process: &Process) -> Result<ExitClass> {
         })?;
         for entry in entries.flatten() {
             let path = entry.path();
+            if dry_run {
+                emit(|out| writeln!(out, "would remove {}", path.display()))
+                    .map_err(stdout_error)?;
+                removed += 1;
+                continue;
+            }
             let outcome = if path.is_dir() {
                 std::fs::remove_dir_all(&path)
             } else {
@@ -307,7 +376,8 @@ fn cache_clear(process: &Process) -> Result<ExitClass> {
             removed += 1;
         }
     }
-    emit(|out| writeln!(out, "removed {removed} entries from {}", cache.display()))
+    let verb = if dry_run { "would remove" } else { "removed" };
+    emit(|out| writeln!(out, "{verb} {removed} entries from {}", cache.display()))
         .map_err(stdout_error)?;
     Ok(ExitClass::Success)
 }

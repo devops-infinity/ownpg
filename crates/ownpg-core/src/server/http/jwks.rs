@@ -294,6 +294,7 @@ fn max_age(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 impl JwksClient {
     pub fn new(url: String) -> Result<Self, JwksError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        super::announce_proxy("key endpoint");
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(TOTAL_TIMEOUT)

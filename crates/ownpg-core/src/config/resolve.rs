@@ -554,6 +554,18 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
         sources.keychain,
     )?;
 
+    if cfg!(windows)
+        && (profile.password.is_some()
+            || profile
+                .http
+                .as_ref()
+                .is_some_and(|http| http.tokens_file.is_some()))
+    {
+        warnings.push(Warning {
+            code: "permissions_unchecked",
+            message: "file permissions are not checked on Windows; keep the profile and token files under your own user profile directory".to_owned(),
+        });
+    }
     let audit = AuditSettings {
         enabled: Pick::new(flags.audit, env_bool(env, "OWNPG_AUDIT")?, profile.audit)
             .or_preset(true),

@@ -41,6 +41,10 @@ pub(crate) fn run(global: &GlobalArgs, args: &ServeArgs, process: &Process) -> R
     })?;
     let environment_tokens = process.env.var("OWNPG_BEARER_TOKENS").map(str::to_owned);
     let over_http = args.http;
+    if !over_http && let Some(notice) = stdio::terminal_notice() {
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "{notice}");
+    }
     runtime.block_on(async move {
         let engine = if over_http {
             Engine::start_pooled(Arc::clone(&settings), ssh_hints).await?
@@ -96,10 +100,6 @@ pub(crate) fn run(global: &GlobalArgs, args: &ServeArgs, process: &Process) -> R
             .await;
         }
         let server = Server::new(Arc::new(engine), sink, Transport::Stdio, principal).await?;
-        if let Some(notice) = stdio::terminal_notice() {
-            let mut stderr = std::io::stderr().lock();
-            let _ = writeln!(stderr, "{notice}");
-        }
         stdio::serve(Arc::new(server), tokio::io::stdin(), tokio::io::stdout()).await
     })
 }

@@ -357,10 +357,17 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .map_err(unwritable)?;
     temporary.write_all(bytes).map_err(unwritable)?;
     temporary.flush().map_err(unwritable)?;
+    temporary.as_file().sync_all().map_err(unwritable)?;
     restrict_to_owner(temporary.path()).map_err(unwritable)?;
     temporary
         .persist(path)
         .map_err(|error| unwritable(error.error))?;
+    #[cfg(unix)]
+    {
+        if let Ok(handle) = fs::File::open(directory) {
+            let _ = handle.sync_all();
+        }
+    }
     Ok(())
 }
 

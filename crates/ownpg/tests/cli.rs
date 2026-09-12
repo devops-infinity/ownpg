@@ -520,7 +520,7 @@ fn an_unknown_manual_command_carries_its_error_id_and_the_usage_class() {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("error: `nope` is not a command"))
         .stderr(predicate::str::contains(
-            "try: Use one of: serve, doctor, config, man, completions.",
+            "try: Use one of: serve, doctor, config, audit, man, completions.",
         ))
         .stderr(predicate::str::contains("code: command.unknown"));
 }
@@ -648,4 +648,51 @@ fn the_platform_keychain_holds_the_password_and_the_ssh_passphrase() {
         .assert()
         .success()
         .stdout(predicate::str::contains("password = set").not());
+}
+
+#[test]
+fn audit_verify_checks_a_written_log_and_names_the_bad_line() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let log = dir.path().join("audit.jsonl");
+    std::fs::write(&log, "{\"v\":1,\"marker\":\"chain-start\",\"prev\":\"\"}\n")
+        .expect("the log is writable");
+    ownpg()
+        .arg("audit")
+        .arg("verify")
+        .arg(&log)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 chained lines verified"));
+    std::fs::write(
+        &log,
+        "{\"v\":1,\"marker\":\"chain-start\",\"prev\":\"\"}\n{\"tool\":\"x\",\"prev\":\"nope\"}\n",
+    )
+    .expect("the log is writable");
+    ownpg()
+        .arg("audit")
+        .arg("verify")
+        .arg(&log)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("line 2"));
+}
+
+#[test]
+fn a_role_the_policy_refuses_exits_with_the_refused_class() {
+    let Some(live) = live() else {
+        return;
+    };
+    let home = Home::new();
+    let mut probe = connected(&live, &home);
+    let report = probe.args(["doctor", "--format", "json"]).assert();
+    let text = String::from_utf8_lossy(&report.get_output().stdout).into_owned();
+    if text.contains("carries no elevated attribute") {
+        return;
+    }
+    let mut serve = connected(&live, &home);
+    serve
+        .args(["serve", "--strict-role", "--no-input"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("code: role.refused"));
 }

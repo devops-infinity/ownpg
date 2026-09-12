@@ -32,6 +32,7 @@ pub enum ErrorId {
     CommandUnknown,
     OutputUnwritable,
     InputUnreadable,
+    AuditTampered,
     StatementUnparsable,
     StatementMultiple,
     StatementRefused,
@@ -70,6 +71,7 @@ impl ErrorId {
             Self::CommandUnknown => "command.unknown",
             Self::OutputUnwritable => "output.unwritable",
             Self::InputUnreadable => "input.unreadable",
+            Self::AuditTampered => "audit.tampered",
             Self::StatementUnparsable => "statement.unparsable",
             Self::StatementMultiple => "statement.multiple",
             Self::StatementRefused => "statement.refused",
@@ -128,6 +130,9 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("the audit log at {path} does not verify: {detail}")]
+    AuditTampered { path: PathBuf, detail: String },
 
     #[error("the statement could not be parsed: {reason}")]
     StatementUnparsable { reason: String },
@@ -273,6 +278,7 @@ impl Error {
             Self::CommandUnknown { .. } => ErrorId::CommandUnknown,
             Self::OutputUnwritable { .. } => ErrorId::OutputUnwritable,
             Self::InputUnreadable { .. } => ErrorId::InputUnreadable,
+            Self::AuditTampered { .. } => ErrorId::AuditTampered,
             Self::StatementUnparsable { .. } => ErrorId::StatementUnparsable,
             Self::StatementMultiple { .. } => ErrorId::StatementMultiple,
             Self::StatementRefused { .. } => ErrorId::StatementRefused,
@@ -322,6 +328,7 @@ impl Error {
             | Self::ArgumentInvalid { .. } => ExitClass::Usage,
             Self::OutputUnwritable { .. }
             | Self::InputUnreadable { .. }
+            | Self::AuditTampered { .. }
             | Self::HandleState { .. }
             | Self::ProtocolFailed { .. }
             | Self::SqlFailed { .. }
@@ -358,6 +365,10 @@ impl Error {
             }
             Self::InputUnreadable { .. } => {
                 "Pipe the value on stdin, or run the command in a terminal that can prompt for it."
+                    .to_owned()
+            }
+            Self::AuditTampered { .. } => {
+                "Treat every line from the named one onward as unverified; a rotated or edited file breaks the chain there."
                     .to_owned()
             }
             Self::StatementUnparsable { .. } => {
@@ -490,6 +501,10 @@ mod tests {
             Error::InputUnreadable {
                 source_name: "stdin".to_owned(),
                 source: io_error(),
+            },
+            Error::AuditTampered {
+                path: PathBuf::from("/tmp/audit.jsonl"),
+                detail: "line 3".to_owned(),
             },
             Error::StatementUnparsable {
                 reason: "syntax error".to_owned(),
@@ -667,6 +682,7 @@ mod tests {
                 | ErrorId::ArgumentInvalid => ExitClass::Usage,
                 ErrorId::OutputUnwritable
                 | ErrorId::InputUnreadable
+                | ErrorId::AuditTampered
                 | ErrorId::HandleState
                 | ErrorId::ProtocolFailed
                 | ErrorId::SqlFailed

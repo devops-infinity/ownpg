@@ -46,16 +46,18 @@ pub(crate) fn log_filter(global: &GlobalArgs, rust_log: Option<&str>) -> EnvFilt
     env_filter
 }
 
-pub(crate) fn init(global: &GlobalArgs, paths: &AppPaths) -> Result<LogGuard> {
+pub(crate) fn init(global: &GlobalArgs, paths: &AppPaths, human: bool) -> Result<LogGuard> {
     let rust_log = std::env::var("RUST_LOG").ok();
     let env_filter = log_filter(global, rust_log.as_deref());
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(false)
         .with_writer(io::stderr);
-    let stderr_layer = match global.log_format {
-        LogFormatArg::Text => stderr_layer.boxed(),
-        LogFormatArg::Json => stderr_layer.json().flatten_event(true).boxed(),
+    let plain = human && global.verbose == 0 && !global.quiet;
+    let stderr_layer = match (global.log_format, plain) {
+        (LogFormatArg::Text, true) => stderr_layer.without_time().with_level(false).boxed(),
+        (LogFormatArg::Text, false) => stderr_layer.boxed(),
+        (LogFormatArg::Json, _) => stderr_layer.json().flatten_event(true).boxed(),
     };
     let (file_layer, worker) = match &global.log_file {
         Some(path) => {

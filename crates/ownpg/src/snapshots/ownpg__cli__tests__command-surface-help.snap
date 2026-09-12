@@ -1,0 +1,879 @@
+---
+source: crates/ownpg/src/cli.rs
+expression: stable
+---
+===== ownpg =====
+OwnPG serves one PostgreSQL database and one schema to an AI client over
+the Model Context Protocol, in read-only, write-only, or read-write mode.
+
+With no command, `ownpg` serves over stdio with the default settings.
+
+Usage: ownpg [OPTIONS] [COMMAND]
+
+Commands:
+  serve        Serve the database to an MCP client over stdio (the default command)
+  doctor       Check the connection and the settings, and report every attempt
+  config       Manage connection profiles and local state
+  audit        Work with the audit log
+  man          Write the manual page to stdout
+  completions  Write a shell completion script to stdout
+
+Options:
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+EXAMPLES:
+  ownpg serve -d app                  serve app.public read-only over stdio
+  ownpg serve -d app -s billing -m rw --tools write,transactions
+  ownpg doctor -p staging --format json
+  ownpg serve --http --auth bearer --bind 127.0.0.1:8765 -d app
+  ownpg config init && ownpg config set-password local
+  ownpg completions zsh > ~/.zfunc/_ownpg
+
+EXIT CODES:
+  0 success   1 runtime failure   2 usage or configuration   4 refused by policy
+  5 external failure   130 interrupted   101 a bug
+
+Documentation: https://github.com/devops-infinity/ownpg-releases
+  Report a bug: https://github.com/devops-infinity/ownpg-releases/issues/new
+
+===== ownpg serve =====
+Serve the database to an MCP client over stdio (the default command)
+
+Usage: ownpg serve [OPTIONS]
+
+Options:
+  -p, --profile <NAME>
+          Profile to read from the profile file [env: OWNPG_PROFILE]
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -m, --mode <MODE>
+          Access mode for this run [env: OWNPG_MODE]
+          
+          [possible values: read-only, write-only, read-write]
+
+  -q, --quiet
+          Only errors on stderr
+
+  -d, --database <NAME>
+          Database to serve [env: OWNPG_DATABASE]
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+  -s, --schema <NAME>
+          Schema every call is scoped to (default public) [env: OWNPG_SCHEMA]
+
+      --host <HOST>
+          Host name, address, or Unix socket directory [env: OWNPG_HOST]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+      --port <PORT>
+          TCP port, or the socket file suffix [env: OWNPG_PORT]
+
+  -U, --user <ROLE>
+          Role to connect as [env: OWNPG_USER]
+
+      --sslmode <MODE>
+          TLS requirement, with the libpq meaning of each value [env: OWNPG_SSLMODE]
+          
+          [possible values: disable, allow, prefer, require, verify-ca, verify-full]
+
+      --sslrootcert <FILE>
+          Root certificate file, or `system` for the platform trust store [env: OWNPG_SSLROOTCERT]
+
+      --tools <GROUPS>
+          Extra tool groups to load: write, transactions, ddl, roles, maintenance, monitoring, host
+          [env: OWNPG_TOOLS]
+
+      --strict-role
+          Refuse to start on a superuser, rds_superuser, or BYPASSRLS role; on by default with
+          --http, off otherwise [env: OWNPG_STRICT_ROLE]
+
+      --ssh <[USER@]HOST[:PORT]>
+          Reach PostgreSQL through this SSH bastion [env: OWNPG_SSH]
+
+      --ssh-transport <TRANSPORT>
+          SSH client: the built-in one, or the system ssh command [env: OWNPG_SSH_TRANSPORT]
+          
+          [possible values: in-process, system]
+
+      --ssh-trust-new-host
+          Record an unknown bastion host key on first use [env: OWNPG_SSH_TRUST_NEW_HOST]
+
+      --no-audit
+          Turn the audit log off for this run [env: OWNPG_AUDIT=false]
+
+      --audit-path <FILE>
+          Write the audit log here instead of the data directory [env: OWNPG_AUDIT_PATH]
+
+      --pg-bindir <DIR>
+          Directory holding pg_dump and the other PostgreSQL programs [env: OWNPG_PG_BINDIR]
+
+      --output-dir <DIR>
+          Directory the host-binary tools write files into [env: OWNPG_OUTPUT_DIR]
+
+      --http
+          Serve Streamable HTTP instead of stdio
+
+      --bind <ADDR>
+          Address to bind in HTTP mode: host:port, a bare address, or :port (default 127.0.0.1:8765)
+          [env: OWNPG_BIND]
+
+      --auth <MODE>
+          How HTTP clients prove who they are [env: OWNPG_AUTH]
+          
+          [possible values: none, bearer, oauth]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+EXAMPLES:
+  ownpg serve -d app                  stdio, read-only, the public schema
+  ownpg serve -d app -m ro --ssh deploy@bastion.example
+  ownpg serve --http --auth none --bind 127.0.0.1:8765 -d app
+  ownpg serve --http --auth bearer --bind 0.0.0.0:8765 -d app --strict-role
+
+===== ownpg doctor =====
+Check the connection and the settings, and report every attempt
+
+Usage: ownpg doctor [OPTIONS]
+
+Options:
+  -p, --profile <NAME>
+          Profile to read from the profile file [env: OWNPG_PROFILE]
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -m, --mode <MODE>
+          Access mode for this run [env: OWNPG_MODE]
+          
+          [possible values: read-only, write-only, read-write]
+
+  -q, --quiet
+          Only errors on stderr
+
+  -d, --database <NAME>
+          Database to serve [env: OWNPG_DATABASE]
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+  -s, --schema <NAME>
+          Schema every call is scoped to (default public) [env: OWNPG_SCHEMA]
+
+      --host <HOST>
+          Host name, address, or Unix socket directory [env: OWNPG_HOST]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+      --port <PORT>
+          TCP port, or the socket file suffix [env: OWNPG_PORT]
+
+  -U, --user <ROLE>
+          Role to connect as [env: OWNPG_USER]
+
+      --sslmode <MODE>
+          TLS requirement, with the libpq meaning of each value [env: OWNPG_SSLMODE]
+          
+          [possible values: disable, allow, prefer, require, verify-ca, verify-full]
+
+      --sslrootcert <FILE>
+          Root certificate file, or `system` for the platform trust store [env: OWNPG_SSLROOTCERT]
+
+      --tools <GROUPS>
+          Extra tool groups to load: write, transactions, ddl, roles, maintenance, monitoring, host
+          [env: OWNPG_TOOLS]
+
+      --strict-role
+          Refuse to start on a superuser, rds_superuser, or BYPASSRLS role; on by default with
+          --http, off otherwise [env: OWNPG_STRICT_ROLE]
+
+      --ssh <[USER@]HOST[:PORT]>
+          Reach PostgreSQL through this SSH bastion [env: OWNPG_SSH]
+
+      --ssh-transport <TRANSPORT>
+          SSH client: the built-in one, or the system ssh command [env: OWNPG_SSH_TRANSPORT]
+          
+          [possible values: in-process, system]
+
+      --ssh-trust-new-host
+          Record an unknown bastion host key on first use [env: OWNPG_SSH_TRUST_NEW_HOST]
+
+      --format <FORMAT>
+          Report shape
+          
+          [default: text]
+          [possible values: text, json]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+EXAMPLES:
+  ownpg doctor -d app
+  ownpg doctor -p staging --format json
+
+===== ownpg config =====
+Manage connection profiles and local state
+
+Usage: ownpg config [OPTIONS] <COMMAND>
+
+Commands:
+  show                  Print every setting with the layer it came from; secrets show as `set`
+  path                  Print the profile file path and the data, cache, and log directories
+  init                  Write an example profile file
+  set-password          Store a profile's password in the platform keychain, read without echo
+  unset-password        Remove a profile's password from the platform keychain
+  set-ssh-passphrase    Store a profile's SSH key passphrase in the platform keychain, read without
+                        echo
+  unset-ssh-passphrase  Remove a profile's SSH key passphrase from the platform keychain
+  cache-clear           Delete the cache directory contents
+
+Options:
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+EXAMPLES:
+  ownpg config path
+  ownpg config init --dry-run         print a profile file that names every key
+  ownpg config show -p staging --format json
+  ownpg config set-password staging   read the password from the terminal or stdin
+
+===== ownpg config show =====
+Print every setting with the layer it came from; secrets show as `set`
+
+Usage: ownpg config show [OPTIONS]
+
+Options:
+  -p, --profile <NAME>
+          Profile to read from the profile file [env: OWNPG_PROFILE]
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -m, --mode <MODE>
+          Access mode for this run [env: OWNPG_MODE]
+          
+          [possible values: read-only, write-only, read-write]
+
+  -q, --quiet
+          Only errors on stderr
+
+  -d, --database <NAME>
+          Database to serve [env: OWNPG_DATABASE]
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+  -s, --schema <NAME>
+          Schema every call is scoped to (default public) [env: OWNPG_SCHEMA]
+
+      --host <HOST>
+          Host name, address, or Unix socket directory [env: OWNPG_HOST]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+      --port <PORT>
+          TCP port, or the socket file suffix [env: OWNPG_PORT]
+
+  -U, --user <ROLE>
+          Role to connect as [env: OWNPG_USER]
+
+      --sslmode <MODE>
+          TLS requirement, with the libpq meaning of each value [env: OWNPG_SSLMODE]
+          
+          [possible values: disable, allow, prefer, require, verify-ca, verify-full]
+
+      --sslrootcert <FILE>
+          Root certificate file, or `system` for the platform trust store [env: OWNPG_SSLROOTCERT]
+
+      --tools <GROUPS>
+          Extra tool groups to load: write, transactions, ddl, roles, maintenance, monitoring, host
+          [env: OWNPG_TOOLS]
+
+      --strict-role
+          Refuse to start on a superuser, rds_superuser, or BYPASSRLS role; on by default with
+          --http, off otherwise [env: OWNPG_STRICT_ROLE]
+
+      --ssh <[USER@]HOST[:PORT]>
+          Reach PostgreSQL through this SSH bastion [env: OWNPG_SSH]
+
+      --ssh-transport <TRANSPORT>
+          SSH client: the built-in one, or the system ssh command [env: OWNPG_SSH_TRANSPORT]
+          
+          [possible values: in-process, system]
+
+      --ssh-trust-new-host
+          Record an unknown bastion host key on first use [env: OWNPG_SSH_TRUST_NEW_HOST]
+
+      --format <FORMAT>
+          Report shape
+          
+          [default: text]
+          [possible values: text, json]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg config path =====
+Print the profile file path and the data, cache, and log directories
+
+Usage: ownpg config path [OPTIONS]
+
+Options:
+      --format <FORMAT>
+          Report shape
+          
+          [default: text]
+          [possible values: text, json]
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg config init =====
+Write an example profile file
+
+Usage: ownpg config init [OPTIONS]
+
+Options:
+      --force
+          Replace a profile file that already exists
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+      --dry-run
+          Print the file to stdout instead of writing it
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg config set-password =====
+Store a profile's password in the platform keychain, read without echo
+
+Usage: ownpg config set-password [OPTIONS] <PROFILE>
+
+Arguments:
+  <PROFILE>
+          Profile the password belongs to
+
+Options:
+      --dry-run
+          Say what would change without touching the keychain or the file
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg config unset-password =====
+Remove a profile's password from the platform keychain
+
+Usage: ownpg config unset-password [OPTIONS] <PROFILE>
+
+Arguments:
+  <PROFILE>
+          Profile whose password is removed
+
+Options:
+      --dry-run
+          Say what would change without touching the keychain or the file
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg config set-ssh-passphrase =====
+Store a profile's SSH key passphrase in the platform keychain, read without echo
+
+Usage: ownpg config set-ssh-passphrase [OPTIONS] <PROFILE>
+
+Arguments:
+  <PROFILE>
+          Profile whose ssh section uses the key
+
+Options:
+      --dry-run
+          Say what would change without touching the keychain or the file
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg config unset-ssh-passphrase =====
+Remove a profile's SSH key passphrase from the platform keychain
+
+Usage: ownpg config unset-ssh-passphrase [OPTIONS] <PROFILE>
+
+Arguments:
+  <PROFILE>
+          Profile whose passphrase is removed
+
+Options:
+      --dry-run
+          Say what would change without touching the keychain or the file
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg config cache-clear =====
+Delete the cache directory contents
+
+Usage: ownpg config cache-clear [OPTIONS]
+
+Options:
+      --dry-run
+          List what would be removed without removing it
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg audit =====
+Work with the audit log
+
+Usage: ownpg audit [OPTIONS] <COMMAND>
+
+Commands:
+  verify  Check that every line of an audit log chains to the one before it
+
+Options:
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg audit verify =====
+Check that every line of an audit log chains to the one before it
+
+Usage: ownpg audit verify [OPTIONS] <FILE>
+
+Arguments:
+  <FILE>
+          The audit log to check
+
+Options:
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg man =====
+Write the manual page to stdout
+
+Usage: ownpg man [OPTIONS] [COMMAND]...
+
+Arguments:
+  [COMMAND]...
+          Write the page for one command instead of the whole tool. A nested one is named in full,
+          as in `config show`
+
+Options:
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+
+===== ownpg completions =====
+Write a shell completion script to stdout
+
+Usage: ownpg completions [OPTIONS] <SHELL>
+
+Arguments:
+  <SHELL>
+          The shell to generate for
+          
+          [possible values: bash, elvish, fish, powershell, zsh]
+
+Options:
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest seven days kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version

@@ -138,6 +138,9 @@ pub(crate) enum Command {
     )]
     Config(ConfigCommand),
 
+    #[command(subcommand, about = "Work with the audit log")]
+    Audit(AuditCommand),
+
     #[command(about = "Write the manual page to stdout")]
     Man {
         #[arg(
@@ -381,6 +384,11 @@ pub(crate) enum ConfigCommand {
     SetPassword {
         #[arg(value_name = "PROFILE", help = "Profile the password belongs to")]
         profile: String,
+        #[arg(
+            long,
+            help = "Say what would change without touching the keychain or the file"
+        )]
+        dry_run: bool,
     },
 
     #[command(
@@ -390,6 +398,11 @@ pub(crate) enum ConfigCommand {
     UnsetPassword {
         #[arg(value_name = "PROFILE", help = "Profile whose password is removed")]
         profile: String,
+        #[arg(
+            long,
+            help = "Say what would change without touching the keychain or the file"
+        )]
+        dry_run: bool,
     },
 
     #[command(
@@ -402,6 +415,11 @@ pub(crate) enum ConfigCommand {
             help = "Profile whose ssh section uses the key"
         )]
         profile: String,
+        #[arg(
+            long,
+            help = "Say what would change without touching the keychain or the file"
+        )]
+        dry_run: bool,
     },
 
     #[command(
@@ -411,10 +429,27 @@ pub(crate) enum ConfigCommand {
     UnsetSshPassphrase {
         #[arg(value_name = "PROFILE", help = "Profile whose passphrase is removed")]
         profile: String,
+        #[arg(
+            long,
+            help = "Say what would change without touching the keychain or the file"
+        )]
+        dry_run: bool,
     },
 
     #[command(name = "cache-clear", about = "Delete the cache directory contents")]
-    CacheClear,
+    CacheClear {
+        #[arg(long, help = "List what would be removed without removing it")]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AuditCommand {
+    #[command(about = "Check that every line of an audit log chains to the one before it")]
+    Verify {
+        #[arg(value_name = "FILE", value_hint = ValueHint::FilePath, help = "The audit log to check")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -619,8 +654,54 @@ mod tests {
         let parsed = parse(&["config", "set-password", "prod"]).unwrap();
         assert!(matches!(
             parsed.command,
-            Some(Command::Config(ConfigCommand::SetPassword { profile })) if profile == "prod"
+            Some(Command::Config(ConfigCommand::SetPassword { profile, dry_run: false })) if profile == "prod"
         ));
+        let rehearsed = parse(&["config", "cache-clear", "--dry-run"]).unwrap();
+        assert!(matches!(
+            rehearsed.command,
+            Some(Command::Config(ConfigCommand::CacheClear { dry_run: true }))
+        ));
+        let verify = parse(&["audit", "verify", "/tmp/audit.jsonl"]).unwrap();
+        assert!(matches!(
+            verify.command,
+            Some(Command::Audit(AuditCommand::Verify { .. }))
+        ));
+    }
+
+    #[test]
+    fn the_rendered_help_of_every_command_is_pinned() {
+        fn collect(command: &mut clap::Command, prefix: &str, pages: &mut Vec<(String, String)>) {
+            let name = if prefix.is_empty() {
+                command.get_name().to_owned()
+            } else {
+                format!("{prefix} {}", command.get_name())
+            };
+            let help = command.render_long_help().to_string();
+            pages.push((name.clone(), help));
+            for sub in command.get_subcommands_mut() {
+                collect(sub, &name, pages);
+            }
+        }
+        let mut root = Cli::command();
+        root.build();
+        let mut pages = Vec::new();
+        collect(&mut root, "", &mut pages);
+        assert!(pages.len() > 10, "{}", pages.len());
+        let rendered: String = pages
+            .iter()
+            .map(|(name, help)| format!("===== {name} =====\n{help}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut stable = String::with_capacity(rendered.len());
+        let mut rest = rendered.as_str();
+        while let Some(start) = rest.find("[env: OWNPG_CONFIG=") {
+            stable.push_str(&rest[..start]);
+            stable.push_str("[env: OWNPG_CONFIG]");
+            let after = &rest[start..];
+            rest = after.find(']').map_or("", |end| &after[end + 1..]);
+        }
+        stable.push_str(rest);
+        insta::assert_snapshot!("command-surface-help", stable);
     }
 
     #[test]
