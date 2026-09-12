@@ -39,6 +39,9 @@ russh-config = "0.58.0"
 tracing = "0.1.44"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 openssh = "0.11.6"
+unicode-segmentation = "1.13.3"
+sha2 = "0.11.0"
+time = { version = "0.3.55", features = ["formatting", "std"] }
 rand = "0.10.2"
 ssh-key = { version = "0.7.0-rc.11", default-features = false, features = ["ed25519", "std", "rand_core"] }
 
