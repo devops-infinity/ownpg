@@ -1,14 +1,10 @@
-#![allow(
-    dead_code,
-    reason = "each integration test binary uses the subset of helpers it needs"
-)]
+#![allow(dead_code)]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
     clippy::print_stderr,
-    clippy::indexing_slicing,
-    reason = "clippy.toml exempts test modules, and an integration test is a separate crate it cannot reach"
+    clippy::indexing_slicing
 )]
 
 use std::collections::BTreeMap;

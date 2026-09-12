@@ -1,11 +1,5 @@
-#![allow(
-    clippy::print_stdout,
-    reason = "cargo directives are written to stdout"
-)]
-#![allow(
-    dead_code,
-    reason = "the command tree is compiled a second time here, where only its clap definition is used"
-)]
+#![allow(clippy::print_stdout)]
+#![allow(dead_code)]
 
 use std::env;
 use std::fs;
@@ -87,10 +81,7 @@ fn build_date() -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-#[allow(
-    clippy::integer_division,
-    reason = "calendar arithmetic on whole days is exact by construction"
-)]
+#[allow(clippy::integer_division)]
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);

@@ -1,7 +1,4 @@
-#![allow(
-    clippy::expect_used,
-    reason = "clippy.toml exempts test modules, and an integration test is a separate crate it cannot reach"
-)]
+#![allow(clippy::expect_used)]
 
 use assert_cmd::Command;
 use predicates::prelude::*;
