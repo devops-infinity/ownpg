@@ -7,6 +7,7 @@ pub mod stdio;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rmcp::model::{
@@ -33,6 +34,8 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(1);
 pub const SUPPORTED_VERSIONS: &[ProtocolVersion] =
     &[ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28];
 pub const WEBSITE_URL: &str = "https://github.com/devops-infinity/ownpg-releases";
+
+static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
@@ -75,14 +78,14 @@ impl Principal {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RoundTrip {
     pub request_state: Option<String>,
     pub input_responses: Option<rmcp::model::InputResponses>,
     pub elicitation: bool,
     pub progress: Option<tools::Progress>,
     pub older_peer: Option<Peer<RoleServer>>,
-    pub principal: Option<Principal>,
+    pub principal: Principal,
 }
 
 pub struct Server {
@@ -274,10 +277,14 @@ impl Server {
     ) -> Option<Outcome> {
         let route = self.route(name)?;
         let started = Instant::now();
-        let principal = round_trip
-            .principal
-            .clone()
-            .unwrap_or_else(|| self.principal.clone());
+        let RoundTrip {
+            request_state,
+            input_responses,
+            elicitation,
+            progress,
+            older_peer,
+            principal,
+        } = round_trip;
         if !principal.allows(route.spec.scope) {
             let outcome: Outcome = Err(crate::error::Error::ScopeInsufficient {
                 scope: route.spec.scope.to_owned(),
@@ -290,18 +297,18 @@ impl Server {
             context: self.context.clone(),
             arguments,
             principal: principal.name.clone(),
-            request_state: round_trip.request_state,
-            input_responses: round_trip.input_responses,
-            elicitation: round_trip.elicitation,
-            progress: round_trip.progress,
+            request_state,
+            input_responses,
+            elicitation,
+            progress,
             cancel: cancel.clone(),
         };
-        let older_peer = round_trip.older_peer.clone();
-        let mut work = std::pin::pin!((route.handler)(call));
+        let call_id = NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed);
+        let mut work = std::pin::pin!(crate::engine::CALL_ID.scope(call_id, (route.handler)(call)));
         let outcome = tokio::select! {
             outcome = &mut work => outcome,
             () = cancel.cancelled() => {
-                if let Err(error) = self.context.engine.cancel_running_statement().await {
+                if let Err(error) = self.context.engine.cancel_call(call_id).await {
                     tracing::warn!(%error, "the cancel request could not be sent");
                 }
                 work.await
@@ -439,7 +446,7 @@ impl Server {
     pub async fn shutdown(&self) {
         let engine = Arc::clone(&self.context.engine);
         let release = async {
-            if let Err(error) = engine.cancel_running_statement().await {
+            if let Err(error) = engine.cancel_running_statements().await {
                 tracing::debug!(%error, "no running statement to cancel");
             }
             if let Err(error) = engine.release_everything().await {
@@ -580,7 +587,7 @@ impl ServerHandler for Server {
             elicitation,
             progress,
             older_peer,
-            principal: Some(self.principal_for(&context)),
+            principal: self.principal_for(&context),
         };
         let outcome = self
             .call(&name, arguments, request_id, context.ct.clone(), round_trip)
@@ -729,6 +736,16 @@ impl ServerHandler for Server {
     }
 
     async fn listen(&self, context: SubscriptionContext) -> std::result::Result<(), ErrorData> {
+        let started = Instant::now();
+        let request_id = request_id_from(context.request_context());
+        let principal = self.principal_for(context.request_context());
+        self.require_scope(
+            &principal,
+            groups::SCOPE_READ,
+            "subscriptions/listen",
+            &request_id,
+            started,
+        )?;
         let sink = context.sink().clone();
         if let Ok(mut sinks) = self.sinks.lock() {
             sinks.push(sink);

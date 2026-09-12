@@ -244,6 +244,20 @@ pub fn describe(settings: &Settings) -> Vec<SettingLine> {
         http.otel_endpoint.as_ref(),
     ));
     lines.push(SettingLine::new(
+        "http.trusted_proxies",
+        http.trusted_proxies
+            .value
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        http.trusted_proxies.origin,
+    ));
+    lines.push(SettingLine::resolved(
+        "http.max_connections",
+        &http.max_connections,
+    ));
+    lines.push(SettingLine::new(
         "config_file",
         display(&settings.paths.config_file),
         Origin::Preset,

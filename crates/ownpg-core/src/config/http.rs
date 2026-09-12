@@ -14,6 +14,9 @@ pub const DEFAULT_RATE_LIMIT: u32 = 60;
 pub const DEFAULT_SHUTDOWN: Duration = Duration::from_secs(10);
 pub const DEFAULT_POOL_SIZE: u32 = 4;
 pub const MAX_POOL_SIZE: u32 = 64;
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 1_024;
+pub const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MCP_PATH: &str = "/mcp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -85,6 +88,10 @@ pub struct HttpEntry {
     pub state_key_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otel_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_proxies: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,18 +138,24 @@ pub struct HttpSettings {
     pub auth_origin: Origin,
     pub state_key_file: Option<Resolved<PathBuf>>,
     pub otel_endpoint: Option<Resolved<String>>,
+    pub trusted_proxies: Resolved<Vec<IpAddr>>,
+    pub max_connections: Resolved<u32>,
 }
 
 impl HttpSettings {
     #[must_use]
     pub fn metadata_url(&self) -> String {
-        let base = self
-            .public_url
-            .value
-            .trim_end_matches(MCP_PATH)
-            .trim_end_matches('/')
-            .to_owned();
-        format!("{base}/.well-known/oauth-protected-resource{MCP_PATH}")
+        match url::Url::parse(&self.public_url.value) {
+            Ok(parsed) if parsed.host_str().is_some() => {
+                let origin = origin_of(&self.public_url.value).unwrap_or_default();
+                let path = parsed.path().trim_end_matches('/');
+                format!("{origin}/.well-known/oauth-protected-resource{path}")
+            }
+            _ => format!(
+                "{}/.well-known/oauth-protected-resource{MCP_PATH}",
+                self.public_url.value
+            ),
+        }
     }
 
     #[must_use]
@@ -568,6 +581,46 @@ pub fn resolve_http(
             .map(str::to_owned),
         entry.otel_endpoint.clone(),
     );
+    let trusted_proxies = pick(
+        None,
+        env.var("OWNPG_TRUSTED_PROXIES").map(parse_list),
+        entry.trusted_proxies.clone(),
+    )
+    .map(|resolved| {
+        let parsed: Result<Vec<IpAddr>> = resolved
+            .value
+            .iter()
+            .map(|text| {
+                text.trim()
+                    .trim_matches(['[', ']'])
+                    .parse::<IpAddr>()
+                    .map_err(|_| {
+                        invalid(
+                            "http.trusted_proxies",
+                            text,
+                            "expected an IP address of a proxy this server sits behind",
+                        )
+                    })
+            })
+            .collect();
+        parsed.map(|value| Resolved::new(value, resolved.origin))
+    })
+    .transpose()?
+    .unwrap_or_else(|| Resolved::preset(Vec::new()));
+    let max_connections = pick(
+        None,
+        env_u64(env, "OWNPG_MAX_CONNECTIONS")?
+            .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
+        entry.max_connections,
+    )
+    .unwrap_or_else(|| Resolved::preset(DEFAULT_MAX_CONNECTIONS));
+    if max_connections.value == 0 {
+        return Err(invalid(
+            "http.max_connections",
+            "0",
+            "the connection cap must allow at least one connection",
+        ));
+    }
     let settings = HttpSettings {
         enabled: flags.enabled,
         bind,
@@ -583,6 +636,8 @@ pub fn resolve_http(
         auth_origin,
         state_key_file,
         otel_endpoint,
+        trusted_proxies,
+        max_connections,
     };
     if settings.enabled && settings.auth.mode() == AuthMode::None {
         if !settings.is_loopback() {
@@ -691,6 +746,52 @@ mod tests {
             settings.metadata_url(),
             "http://127.0.0.1:8765/.well-known/oauth-protected-resource/mcp"
         );
+        assert!(settings.trusted_proxies.value.is_empty());
+        assert_eq!(settings.max_connections.value, DEFAULT_MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn trusted_proxies_parse_as_addresses_and_the_metadata_url_sits_at_the_root() {
+        let flags = HttpFlags {
+            enabled: true,
+            bind: Some("0.0.0.0:8765".to_owned()),
+            auth: Some(AuthMode::Bearer),
+        };
+        let settings = resolve_http(
+            &flags,
+            &env(&[
+                (
+                    "OWNPG_BEARER_TOKENS",
+                    "reader-token-0123456789abcdef read-only",
+                ),
+                ("OWNPG_TRUSTED_PROXIES", "10.0.0.5, [::1]"),
+                ("OWNPG_PUBLIC_URL", "https://db.example.com:8443/api/mcp"),
+                ("OWNPG_MAX_CONNECTIONS", "64"),
+            ]),
+            None,
+            Mode::ReadOnly,
+        )
+        .unwrap();
+        assert_eq!(settings.trusted_proxies.value.len(), 2);
+        assert_eq!(settings.max_connections.value, 64);
+        assert_eq!(
+            settings.metadata_url(),
+            "https://db.example.com:8443/.well-known/oauth-protected-resource/api/mcp"
+        );
+        let error = resolve_http(
+            &flags,
+            &env(&[
+                (
+                    "OWNPG_BEARER_TOKENS",
+                    "reader-token-0123456789abcdef read-only",
+                ),
+                ("OWNPG_TRUSTED_PROXIES", "proxy.internal"),
+            ]),
+            None,
+            Mode::ReadOnly,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("proxy"), "{error}");
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::jwks::{Algorithm, JwksClient, JwksError, decode_base64url};
@@ -80,10 +81,14 @@ impl Rejection {
 }
 
 pub struct BearerToken {
-    secret: Vec<u8>,
+    digest: [u8; 32],
     name: String,
     scopes: Vec<String>,
     key: String,
+}
+
+fn digest_of(secret: &[u8]) -> [u8; 32] {
+    Sha256::digest(secret).into()
 }
 
 impl std::fmt::Debug for BearerToken {
@@ -145,7 +150,8 @@ impl BearerTokens {
                     detail: "two bearer tokens carry the same name; names must be distinct because handles and audit lines are attributed by name".to_owned(),
                 });
             }
-            if tokens.iter().any(|known| known.secret == secret.as_bytes()) {
+            let digest = digest_of(secret.as_bytes());
+            if tokens.iter().any(|known| known.digest == digest) {
                 return Err(Error::ConfigInvalid {
                     setting: source.to_owned(),
                     value: format!("line {}", index + 1),
@@ -168,7 +174,7 @@ impl BearerTokens {
             };
             tokens.push(BearerToken {
                 key: sha256_hex(secret.as_bytes()).chars().take(16).collect(),
-                secret: secret.as_bytes().to_vec(),
+                digest,
                 name,
                 scopes,
             });
@@ -204,7 +210,7 @@ impl BearerTokens {
                             .to_owned(),
                 });
             }
-            if self.tokens.iter().any(|known| known.secret == token.secret) {
+            if self.tokens.iter().any(|known| known.digest == token.digest) {
                 return Err(Error::ConfigInvalid {
                     setting: source.to_owned(),
                     value: token.name,
@@ -228,11 +234,10 @@ impl BearerTokens {
     }
 
     fn lookup(&self, presented: &[u8]) -> Option<&BearerToken> {
+        let digest = digest_of(presented);
         let mut found = None;
         for token in &self.tokens {
-            if token.secret.len() == presented.len()
-                && bool::from(token.secret.as_slice().ct_eq(presented))
-            {
+            if bool::from(token.digest.ct_eq(&digest)) {
                 found = Some(token);
             }
         }
@@ -268,6 +273,19 @@ pub struct Claims {
 }
 
 impl Claims {
+    fn principal_name(&self) -> Option<String> {
+        self.sub
+            .as_deref()
+            .filter(|sub| !sub.trim().is_empty())
+            .map(|sub| format!("sub:{sub}"))
+            .or_else(|| {
+                self.client_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(|id| format!("client:{id}"))
+            })
+    }
+
     fn audiences(&self) -> Vec<String> {
         match &self.aud {
             Some(serde_json::Value::String(text)) => vec![text.clone()],
@@ -333,7 +351,7 @@ pub fn check_claims(
     issuer: &str,
     audience: &str,
     now: u64,
-) -> std::result::Result<(), Rejection> {
+) -> std::result::Result<String, Rejection> {
     let Some(exp) = claims.exp else {
         return Err(Rejection::unauthorized("the token carries no expiry"));
     };
@@ -355,7 +373,9 @@ pub fn check_claims(
             "the token was issued for another audience",
         ));
     }
-    Ok(())
+    claims.principal_name().ok_or_else(|| {
+        Rejection::unauthorized("the token names no subject: it carries neither sub nor client_id")
+    })
 }
 
 impl Oauth {
@@ -414,17 +434,12 @@ impl Oauth {
         let claims: Claims = decode_base64url(payload_text)
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .ok_or_else(|| Rejection::unauthorized("the token claims are not valid"))?;
-        check_claims(
+        let name = check_claims(
             &claims,
             &self.settings.issuer.value,
             &self.settings.audience.value,
             now_seconds(),
         )?;
-        let name = claims
-            .sub
-            .clone()
-            .or_else(|| claims.client_id.clone())
-            .unwrap_or_else(|| "token".to_owned());
         Ok(Principal::from_token(
             name,
             PrincipalKind::TokenSubject,
@@ -658,5 +673,20 @@ mod tests {
         assert!(check_claims(&other_audience, issuer, audience, 10).is_err());
         let no_exp = claims(None, None, issuer, serde_json::json!(audience));
         assert!(check_claims(&no_exp, issuer, audience, 10).is_err());
+        assert_eq!(
+            check_claims(&good, issuer, audience, 990).ok().as_deref(),
+            Some("sub:alice")
+        );
+        let mut client = claims(Some(1_000), None, issuer, serde_json::json!(audience));
+        client.sub = None;
+        client.client_id = Some("svc-7".to_owned());
+        assert_eq!(
+            check_claims(&client, issuer, audience, 990).ok().as_deref(),
+            Some("client:svc-7")
+        );
+        let mut anonymous = claims(Some(1_000), None, issuer, serde_json::json!(audience));
+        anonymous.sub = Some("  ".to_owned());
+        let refusal = check_claims(&anonymous, issuer, audience, 990).unwrap_err();
+        assert!(refusal.description.contains("neither sub nor client_id"));
     }
 }

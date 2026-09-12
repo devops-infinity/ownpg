@@ -2,8 +2,7 @@ pub mod auth;
 pub mod jwks;
 pub mod limit;
 
-use std::future::IntoFuture;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +39,10 @@ pub struct Gatekeeper {
     pub public_url: String,
     pub authorization_server: Option<String>,
     pub cancel: CancellationToken,
+    pub trusted_proxies: Vec<IpAddr>,
+    pub max_connections: usize,
+    pub header_timeout: Duration,
+    pub body_timeout: Duration,
 }
 
 impl std::fmt::Debug for Gatekeeper {
@@ -133,6 +136,32 @@ fn method_not_allowed() -> Response {
     response
 }
 
+#[must_use]
+pub fn client_address(
+    peer: SocketAddr,
+    headers: &axum::http::HeaderMap,
+    trusted_proxies: &[IpAddr],
+) -> IpAddr {
+    if !trusted_proxies.contains(&peer.ip()) {
+        return peer.ip();
+    }
+    headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter_map(|item| {
+            item.trim_matches(['[', ']'])
+                .parse::<IpAddr>()
+                .ok()
+                .or_else(|| item.parse::<SocketAddr>().ok().map(|address| address.ip()))
+        })
+        .rev()
+        .find(|address| !trusted_proxies.contains(address))
+        .unwrap_or_else(|| peer.ip())
+}
+
 pub async fn guard(
     State(gate): State<Arc<Gatekeeper>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -148,9 +177,7 @@ pub async fn guard(
     ) {
         return method_not_allowed();
     }
-    if let Err(wait) = gate.limiter.check(&format!("addr:{}", peer.ip())) {
-        return too_many(wait);
-    }
+    let client = client_address(peer, request.headers(), &gate.trusted_proxies);
     let authorization = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -162,7 +189,12 @@ pub async fn guard(
         .await
     {
         Ok(found) => found,
-        Err(rejection) => return gate.challenge(&rejection),
+        Err(rejection) => {
+            if let Err(wait) = gate.limiter.check(&format!("auth-fail:{client}")) {
+                return too_many(wait);
+            }
+            return gate.challenge(&rejection);
+        }
     };
     let method_header = request
         .headers()
@@ -185,6 +217,9 @@ pub async fn guard(
         "resources/list"
             | "resources/read"
             | "resources/templates/list"
+            | "resources/subscribe"
+            | "resources/unsubscribe"
+            | "subscriptions/listen"
             | "prompts/list"
             | "prompts/get"
             | "completion/complete"
@@ -192,9 +227,12 @@ pub async fn guard(
     {
         return gate.challenge(&Rejection::insufficient(crate::groups::SCOPE_READ));
     }
-    if !key.is_empty()
-        && let Err(wait) = gate.limiter.check(&format!("token:{key}"))
-    {
+    let bucket = if key.is_empty() {
+        format!("addr:{client}")
+    } else {
+        format!("token:{key}")
+    };
+    if let Err(wait) = gate.limiter.check(&bucket) {
         return too_many(wait);
     }
     request.extensions_mut().insert(principal);
@@ -213,8 +251,10 @@ async fn live() -> Response {
 async fn ready(
     State(gate): State<Arc<Gatekeeper>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    if let Err(wait) = gate.limiter.check(&format!("ready:{}", peer.ip())) {
+    let client = client_address(peer, &headers, &gate.trusted_proxies);
+    if let Err(wait) = gate.limiter.check(&format!("ready:{client}")) {
         return too_many(wait);
     }
     if !gate.server.engine().is_alive().await {
@@ -262,6 +302,9 @@ pub fn router(gate: Arc<Gatekeeper>, settings: &Settings) -> Router {
     Router::new()
         .route_service(MCP_PATH, mcp)
         .route_layer(middleware::from_fn_with_state(Arc::clone(&gate), guard))
+        .route_layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
+            gate.body_timeout,
+        ))
         .route(LIVE_PATH, get(live))
         .route(READY_PATH, get(ready))
         .route(METADATA_PATH, get(metadata))
@@ -300,6 +343,10 @@ pub fn gatekeeper(
         public_url: http.public_url.value.clone(),
         authorization_server,
         cancel: CancellationToken::new(),
+        trusted_proxies: http.trusted_proxies.value.clone(),
+        max_connections: usize::try_from(http.max_connections.value).unwrap_or(usize::MAX),
+        header_timeout: crate::config::http::DEFAULT_HEADER_TIMEOUT,
+        body_timeout: crate::config::http::DEFAULT_BODY_TIMEOUT,
     })
 }
 
@@ -363,32 +410,130 @@ pub async fn serve(
     deadline: Duration,
 ) -> Result<ExitClass> {
     let stop = CancellationToken::new();
-    let stop_signal = stop.clone();
-    let server_task = tokio::spawn(
-        axum::serve(
-            listening.listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { stop_signal.cancelled().await })
-        .into_future(),
-    );
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let permits = Arc::new(tokio::sync::Semaphore::new(gate.max_connections));
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(gate.header_timeout)
+        .keep_alive(true);
+    let builder = Arc::new(builder);
+    let sweeper = {
+        let limiter_gate = Arc::clone(&gate);
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => limiter_gate.limiter.forget_idle(),
+                    () = stop.cancelled() => break,
+                }
+            }
+        })
+    };
     tracing::info!(address = %listening.local_addr, "listening for Streamable HTTP");
-    shutdown.await;
+    let mut shutdown = std::pin::pin!(shutdown);
+    let listener = listening.listener;
+    loop {
+        let permit = tokio::select! {
+            permit = permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+            () = &mut shutdown => break,
+        };
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            () = &mut shutdown => break,
+        };
+        let (socket, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::warn!(%error, "a connection could not be accepted");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        let app = router.clone();
+        let service = tower::util::ServiceExt::map_request(
+            app,
+            move |mut request: axum::http::Request<hyper::body::Incoming>| {
+                request.extensions_mut().insert(ConnectInfo(peer));
+                request.map(Body::new)
+            },
+        );
+        let hyper_service = hyper_util::service::TowerToHyperService::new(service);
+        let io = hyper_util::rt::TokioIo::new(socket);
+        let connection = builder.serve_connection_with_upgrades(io, hyper_service);
+        let watched = graceful.watch(connection.into_owned());
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(error) = watched.await {
+                tracing::debug!(%error, "a connection ended with an error");
+            }
+        });
+    }
     tracing::info!("shutting down; draining in-flight calls");
     stop.cancel();
-    let drained = tokio::time::timeout(deadline, server_task).await;
-    match drained {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(error))) => tracing::warn!(%error, "the listener ended with an error"),
-        Ok(Err(error)) => tracing::warn!(%error, "the listener task ended abnormally"),
-        Err(_) => {
-            tracing::warn!(
-                "in-flight calls did not finish within {} ms; closing them",
-                deadline.as_millis()
-            );
-        }
+    sweeper.abort();
+    drop(listener);
+    if tokio::time::timeout(deadline, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "in-flight calls did not finish within {} ms; closing them",
+            deadline.as_millis()
+        );
     }
     gate.cancel.cancel();
     gate.server.shutdown().await;
     Ok(ExitClass::Success)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(forwarded: &[&str]) -> axum::http::HeaderMap {
+        let mut map = axum::http::HeaderMap::new();
+        for value in forwarded {
+            map.append("x-forwarded-for", HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn forwarded_addresses_are_read_only_from_trusted_proxies() {
+        let proxy: IpAddr = "10.0.0.1".parse().unwrap();
+        let stranger: SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        let via_proxy: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let forwarded = headers(&["203.0.113.9, 10.0.0.1"]);
+        assert_eq!(
+            client_address(stranger, &forwarded, &[proxy]),
+            stranger.ip(),
+            "a peer that is not a proxy cannot name another client"
+        );
+        assert_eq!(
+            client_address(via_proxy, &forwarded, &[proxy]),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_address(via_proxy, &headers(&["[2001:db8::5]:443"]), &[proxy]),
+            "2001:db8::5".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_address(via_proxy, &headers(&["garbage", "10.0.0.1"]), &[proxy]),
+            via_proxy.ip(),
+            "a header naming only proxies or junk falls back to the peer"
+        );
+        assert_eq!(
+            client_address(via_proxy, &headers(&["1.1.1.1", "9.9.9.9"]), &[proxy]),
+            "9.9.9.9".parse::<IpAddr>().unwrap(),
+            "the rightmost non-proxy entry is the client"
+        );
+        assert_eq!(client_address(via_proxy, &forwarded, &[]), via_proxy.ip());
+    }
 }

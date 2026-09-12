@@ -487,6 +487,35 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
         "{answer}"
     );
 
+    let listen = json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "subscriptions/listen",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": PROTOCOL,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "notifications": {"resourcesListChanged": true}
+        }
+    });
+    let response = remote
+        .post(&listen)
+        .bearer_auth(TOKEN_WRITE_ONLY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    let refused: Value = response.json().await.unwrap();
+    assert_eq!(refused["error"], "insufficient_scope");
+    assert!(
+        refused["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("ownpg:read"),
+        "{refused}"
+    );
+
     let mut last = 401;
     for _ in 0..70 {
         let (status, _, _) = remote
@@ -499,6 +528,89 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     }
     assert_eq!(last, 429, "guessing tokens is not throttled");
     remote.finish().await;
+}
+
+async fn guess_until_throttled(remote: &Remote, forwarded: &str) -> (u16, u16) {
+    let body = remote.call_body("pg_health", json!({}));
+    let mut first = None;
+    let mut last = 401;
+    for _ in 0..70 {
+        let response = remote
+            .post(&body)
+            .header("Mcp-Name", "pg_health")
+            .header("X-Forwarded-For", forwarded)
+            .bearer_auth("wrong-token-0123456789")
+            .send()
+            .await
+            .unwrap();
+        last = response.status().as_u16();
+        first.get_or_insert(last);
+        if last == 429 {
+            break;
+        }
+    }
+    (first.unwrap_or(last), last)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forwarded_addresses_count_only_behind_a_trusted_proxy() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app")
+        .await
+        .unwrap();
+    let tokens = format!("{TOKEN_READ} read-only reader");
+    let behind_proxy = remote(
+        &scratch,
+        Some(AuthMode::Bearer),
+        &[
+            ("OWNPG_BEARER_TOKENS", tokens.as_str()),
+            ("OWNPG_TRUSTED_PROXIES", "127.0.0.1"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        guess_until_throttled(&behind_proxy, "203.0.113.1").await,
+        (401, 429)
+    );
+    assert_eq!(
+        guess_until_throttled(&behind_proxy, "203.0.113.2, 127.0.0.1").await,
+        (401, 429),
+        "a second forwarded client gets its own bucket"
+    );
+    let (status, body, _) = behind_proxy.tool("pg_health", Some(TOKEN_READ)).await;
+    assert_eq!(status, 200, "{body}");
+    behind_proxy.finish().await;
+
+    let exposed = remote(
+        &scratch,
+        Some(AuthMode::Bearer),
+        &[("OWNPG_BEARER_TOKENS", tokens.as_str())],
+    )
+    .await;
+    assert_eq!(
+        guess_until_throttled(&exposed, "203.0.113.1").await,
+        (401, 429)
+    );
+    let body = exposed.call_body("pg_health", json!({}));
+    let response = exposed
+        .post(&body)
+        .header("Mcp-Name", "pg_health")
+        .header("X-Forwarded-For", "203.0.113.2")
+        .bearer_auth("wrong-token-0123456789")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        429,
+        "a forged forwarded address must not open a fresh bucket"
+    );
+    exposed.finish().await;
 }
 
 struct Issuer {
@@ -701,6 +813,20 @@ async fn oauth_tokens_are_checked_against_the_issuer_keys() {
 
     let (status, body, _) = remote.tool("pg_health", Some("not.a.jwt")).await;
     assert_eq!(status, 401, "{body}");
+
+    let nameless = issuer.token(
+        "k1",
+        json!({"iss": "https://issuer.test", "aud": audience, "exp": now() + 600, "scope": "ownpg:read"}),
+    );
+    let (status, body, _) = remote.tool("pg_health", Some(&nameless)).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap()
+            .contains("neither sub nor client_id"),
+        "{body}"
+    );
     forged_issuer.task.abort();
     remote.finish().await;
     issuer.task.abort();
