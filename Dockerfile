@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 FROM rust:1.97.1-trixie@sha256:b1b3c9c0d921d7fa0a6d1f9ec7e4eab87f8c8ec97644c3d791450f131dec813f AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

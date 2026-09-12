@@ -21,7 +21,7 @@ Usage: tools/reinstall.sh [options]
   --debug           build the debug profile instead of release
   --dir <path>      install into this directory (default ~/.local/bin)
   --skip-gate       install without running the verification gate first
-  --keep-cache      leave the ownpg cache directory in place
+  --keep-cache      leave the OwnPG cache directory in place
   --full-clean      empty target/ first, so the next build starts cold
   --keep-build      leave target/ alone this run
   --stale-days <n>  drop unused build data older than this (default 7)

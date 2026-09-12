@@ -90,15 +90,15 @@ manual_finish_binaries() {
 	printf '  dist build --tag=v%s --artifacts=local --target=<triple> --no-local-paths --output-format=json   # once per target\n' "$VERSION"
 	printf '  dist build --tag=v%s --artifacts=global --no-local-paths\n' "$VERSION"
 	printf '  minisign -Sm target/distrib/sha256.sum -s %s\n' "$MINISIGN_KEY"
-	printf '  gh release create v%s <the files under target/distrib, not the directories> --title "ownpg %s" --notes-file <notes-file>\n' "$VERSION" "$VERSION"
-	printf '  gh release create v%s <the same files> --repo %s --title "ownpg %s" --notes-file <notes-file>\n' "$VERSION" "$PUBLIC_RELEASE_REPO" "$VERSION"
+	printf '  gh release create v%s <the files under target/distrib, not the directories> --title "OwnPG %s" --notes-file <notes-file>\n' "$VERSION" "$VERSION"
+	printf '  gh release create v%s <the same files> --repo %s --title "OwnPG %s" --notes-file <notes-file>\n' "$VERSION" "$PUBLIC_RELEASE_REPO" "$VERSION"
 }
 
 manual_finish() {
 	say INFO "finish by hand with:"
 	printf '  git add -- %s %s %s %s\n' "$ROOT_MANIFEST" "$CLI_MANIFEST" "$LOCK_FILE" "$CHANGELOG"
 	printf '  git commit -m "chore: release %s"\n' "$VERSION"
-	printf '  git tag %s v%s -m "ownpg v%s"\n' "$(tag_flag)" "$VERSION" "$VERSION"
+	printf '  git tag %s v%s -m "OwnPG v%s"\n' "$(tag_flag)" "$VERSION" "$VERSION"
 	printf '  git push %s %s\n' "$REMOTE" "$BRANCH"
 	printf '  git push %s v%s\n' "$REMOTE" "$VERSION"
 	manual_finish_binaries
@@ -715,7 +715,7 @@ write_server_json() {
 sign_checksums() {
 	local sums="target/distrib/sha256.sum"
 	[[ -f "$sums" ]] || die "$sums is missing; the global build did not produce a checksum file"
-	run "minisign -Sm $sums" minisign -Sm "$sums" -s "$MINISIGN_KEY" -t "ownpg $VERSION"
+	run "minisign -Sm $sums" minisign -Sm "$sums" -s "$MINISIGN_KEY" -t "OwnPG "
 	[[ -f "$sums.minisig" ]] || die "minisign did not write $sums.minisig"
 }
 
@@ -796,7 +796,7 @@ publish_github_release() {
 	local log
 	log="$(log_path_for "$label")"
 	run "$label" gh release create "v$VERSION" "${assets[@]}" "${repo_flag[@]}" \
-		--title "ownpg $VERSION" --notes-file "$notes"
+		--title "OwnPG " --notes-file "$notes"
 	local release_url
 	release_url="$(grep -oE 'https://github\.com/[^[:space:]]+/releases/tag/[^[:space:]]+' "$log" | tail -n 1)"
 	[[ -z "$release_url" ]] || say SUCCESS "release page: $release_url"
@@ -1056,7 +1056,7 @@ fi
 if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
 	say WARNING "tag v$VERSION already exists, leaving it alone"
 else
-	git tag "$(tag_flag)" "v$VERSION" -m "ownpg v$VERSION" || die "tagging v$VERSION failed"
+	git tag "$(tag_flag)" "v$VERSION" -m "OwnPG v" || die "tagging v$VERSION failed"
 	say SUCCESS "tagged v$VERSION"
 fi
 MUTATED=0

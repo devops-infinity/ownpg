@@ -349,7 +349,7 @@ impl Error {
                 "Check that the file exists and that you can read it.".to_owned()
             }
             Self::ConfigTooLarge { .. } => {
-                "A profile file this large is not one ownpg wrote; check the path.".to_owned()
+                "A profile file this large is not one OwnPG wrote; check the path.".to_owned()
             }
             Self::ConfigPermissions { path, .. } => {
                 format!("Run `chmod 600 {}` so only you can read it.", path.display())
@@ -358,7 +358,7 @@ impl Error {
                 "Fix the line named above; `ownpg config init` writes a fresh example.".to_owned()
             }
             Self::ConfigFormat { .. } => {
-                "Upgrade ownpg to a version that reads this format.".to_owned()
+                "Upgrade OwnPG to a version that reads this format.".to_owned()
             }
             Self::ConfigInvalid { setting, .. } => {
                 format!("Check the accepted values for `{setting}` in the profile reference.")
