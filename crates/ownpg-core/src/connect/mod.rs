@@ -318,20 +318,11 @@ impl Connector {
         config.keepalives(true);
         let mut options = Vec::new();
         if settings.connection.pooled.value != Some(true) {
-            let limits = &settings.limits;
-            options.push(format!(
-                "-c statement_timeout={}",
-                limits.statement_timeout.value.as_millis()
-            ));
-            options.push(format!(
-                "-c lock_timeout={}",
-                limits.lock_timeout.value.as_millis()
-            ));
-            options.push(format!(
-                "-c idle_in_transaction_session_timeout={}",
-                (limits.handle_expiry.value + Duration::from_secs(5)).as_millis()
-            ));
-            options.push("-c client_encoding=UTF8".to_owned());
+            options.extend(
+                session_settings(settings, None)
+                    .into_iter()
+                    .map(|(name, value)| format!("-c {name}={value}")),
+            );
         }
         if let Some(extra) = &connection.options {
             options.push(extra.value.clone());
@@ -534,15 +525,15 @@ impl Connector {
             String::new()
         } else {
             client
-                .execute(
+                .query_typed(
                     "SELECT pg_catalog.set_config('search_path', $1, false)",
-                    &[&schema],
+                    &[(&schema, tokio_postgres::types::Type::TEXT)],
                 )
                 .await?;
             schema
         };
         let row = client
-            .query_one(
+            .query_typed_one(
                 "SELECT current_setting('server_version_num')::int4, current_setting('server_version'), current_user::text, current_database()::text",
                 &[],
             )
@@ -589,6 +580,57 @@ impl Connector {
             keep: Vec::new(),
         })
     }
+}
+
+#[must_use]
+pub fn session_settings(
+    settings: &Settings,
+    server_version_num: Option<i32>,
+) -> Vec<(&'static str, String)> {
+    let limits = &settings.limits;
+    let mut out = vec![
+        (
+            "statement_timeout",
+            limits.statement_timeout.value.as_millis().to_string(),
+        ),
+        (
+            "lock_timeout",
+            limits.lock_timeout.value.as_millis().to_string(),
+        ),
+        (
+            "idle_in_transaction_session_timeout",
+            (limits.handle_expiry.value + Duration::from_secs(5))
+                .as_millis()
+                .to_string(),
+        ),
+        ("client_encoding", "UTF8".to_owned()),
+    ];
+    if server_version_num.is_some_and(|version| version >= 170_000) {
+        out.push((
+            "transaction_timeout",
+            limits.transaction_timeout.value.as_millis().to_string(),
+        ));
+    }
+    out
+}
+
+#[must_use]
+pub fn pooled_transaction_prefix(settings: &Settings, server_version_num: i32) -> Option<String> {
+    if settings.connection.pooled.value != Some(true) {
+        return None;
+    }
+    let mut statements = vec!["SET LOCAL search_path = ''".to_owned()];
+    statements.extend(
+        session_settings(settings, Some(server_version_num))
+            .into_iter()
+            .map(|(name, value)| {
+                format!(
+                    "SET LOCAL {name} = {}",
+                    crate::render::quote_literal(&value)
+                )
+            }),
+    );
+    Some(statements.join("; "))
 }
 
 impl SessionInfo {
@@ -761,6 +803,37 @@ mod tests {
                 .get_options()
                 .is_none()
         );
+        let prefix = pooled_transaction_prefix(&connector.settings, 180_000).unwrap();
+        assert!(
+            prefix.starts_with("SET LOCAL search_path = ''; "),
+            "{prefix}"
+        );
+        assert!(
+            prefix.contains("SET LOCAL statement_timeout = '30000'"),
+            "{prefix}"
+        );
+        assert!(
+            prefix.contains("SET LOCAL client_encoding = 'UTF8'"),
+            "{prefix}"
+        );
+        assert!(
+            prefix.contains("SET LOCAL transaction_timeout = '"),
+            "{prefix}"
+        );
+        assert!(
+            !pooled_transaction_prefix(&connector.settings, 160_000)
+                .unwrap()
+                .contains("transaction_timeout"),
+            "transaction_timeout exists from 17 on"
+        );
+        let plain = settings_for(
+            FlagLayer {
+                database: Some("app".to_owned()),
+                ..FlagLayer::default()
+            },
+            &env,
+        );
+        assert!(pooled_transaction_prefix(&plain, 180_000).is_none());
     }
 
     #[test]

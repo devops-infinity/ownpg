@@ -73,6 +73,8 @@ pub struct ProfileEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle_expiry_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_expiry_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_cap: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byte_cap: Option<u32>,

@@ -34,6 +34,7 @@ pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_HANDLE_EXPIRY: Duration = Duration::from_secs(60);
+pub const DEFAULT_CURSOR_EXPIRY: Duration = Duration::from_secs(30);
 pub const DEFAULT_AUDIT_MAX_BYTES: u64 = 52_428_800;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -365,6 +366,7 @@ pub struct LimitSettings {
     pub lock_timeout: Resolved<Duration>,
     pub transaction_timeout: Resolved<Duration>,
     pub handle_expiry: Resolved<Duration>,
+    pub cursor_expiry: Resolved<Duration>,
     pub row_cap: Resolved<u32>,
     pub byte_cap: Resolved<u32>,
 }

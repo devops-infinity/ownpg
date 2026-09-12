@@ -116,7 +116,7 @@ pub fn run_query(call: Call, args: RunQueryArgs) -> BoxFuture<'static, Outcome> 
             };
             let result = context
                 .engine
-                .fetch(&args.cursor, caps)
+                .fetch(&args.cursor, caps, &call.principal)
                 .await
                 .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
             return finish(result, facts);
@@ -134,7 +134,7 @@ pub fn run_query(call: Call, args: RunQueryArgs) -> BoxFuture<'static, Outcome> 
         let is_select = classification.kind == "SelectStmt";
         let result = context
             .engine
-            .run_read(&args.sql, is_select, caps)
+            .run_query(&args.sql, is_select, caps, &call.principal)
             .await
             .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
         finish(result, facts)
@@ -200,7 +200,7 @@ pub fn count(call: Call, args: CountArgs) -> BoxFuture<'static, Outcome> {
             let facts = facts_for(&classification);
             let result = context
                 .engine
-                .run_read(&sql, false, context.caps(1))
+                .run_read(&sql, context.caps(1))
                 .await
                 .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
             let value = result
@@ -265,7 +265,7 @@ async fn explain_estimate(context: &Context, sql: &str) -> Result<i64, ToolFailu
     let explained = format!("EXPLAIN (FORMAT JSON) {sql}");
     let result = context
         .engine
-        .run_read(&explained, false, context.caps(1_000))
+        .run_read(&explained, context.caps(1_000))
         .await?;
     let text: String = result
         .rows
@@ -417,7 +417,7 @@ pub fn explain(call: Call, args: ExplainArgs) -> BoxFuture<'static, Outcome> {
         let result = if writes {
             context.engine.run_and_rollback(&statement, caps).await
         } else {
-            context.engine.run_read(&statement, false, caps).await
+            context.engine.run_read(&statement, caps).await
         }
         .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
         let lines: Vec<String> = result

@@ -110,6 +110,11 @@ pub fn describe(settings: &Settings) -> Vec<SettingLine> {
             format!("{} s", limits.handle_expiry.value.as_secs()),
             limits.handle_expiry.origin,
         ),
+        SettingLine::new(
+            "cursor_expiry",
+            format!("{} s", limits.cursor_expiry.value.as_secs()),
+            limits.cursor_expiry.origin,
+        ),
         SettingLine::resolved("row_cap", &limits.row_cap),
         SettingLine::resolved("byte_cap", &limits.byte_cap),
         SettingLine::resolved("strict_role", &settings.strict_role),

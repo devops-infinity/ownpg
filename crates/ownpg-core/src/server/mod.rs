@@ -439,7 +439,7 @@ impl Server {
             return;
         };
         let cursors = self.context.engine.open_cursors().await.len();
-        let handles = usize::from(self.context.engine.open_transaction().await.is_some());
+        let handles = self.context.engine.open_transactions().await;
         metrics.set_open_handles((cursors + handles) as u64);
     }
 

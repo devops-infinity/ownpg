@@ -7,17 +7,53 @@ use futures_util::{SinkExt, TryStreamExt};
 use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio_postgres::SimpleQueryMessage;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{ToSql, Type};
 
 use crate::config::Settings;
 use crate::connect::role::RoleProfile;
 use crate::connect::ssh::Hints;
-use crate::connect::{Connector, Session, SessionInfo, describe_sqlstate};
+use crate::connect::{
+    Connector, Session, SessionInfo, describe_sqlstate, pooled_transaction_prefix,
+};
 use crate::error::{Error, Result};
 use crate::shape::{Caps, Collector, Column, ResultSet};
 
 pub const CURSOR_CAP: usize = 8;
 const SAVEPOINT: &str = "ownpg_call";
+
+pub trait CatalogParam: ToSql + Sync {
+    fn pg_type(&self) -> Type;
+}
+
+macro_rules! catalog_param {
+    ($($rust:ty => $pg:expr),* $(,)?) => {
+        $(impl CatalogParam for $rust {
+            fn pg_type(&self) -> Type {
+                $pg
+            }
+        })*
+    };
+}
+
+catalog_param! {
+    String => Type::TEXT,
+    &str => Type::TEXT,
+    i64 => Type::INT8,
+    i32 => Type::INT4,
+    i16 => Type::INT2,
+    u32 => Type::OID,
+    bool => Type::BOOL,
+    Vec<String> => Type::TEXT_ARRAY,
+}
+
+impl<T: CatalogParam> CatalogParam for Option<T>
+where
+    Option<T>: ToSql + Sync,
+{
+    fn pg_type(&self) -> Type {
+        self.as_ref().map_or(Type::TEXT, CatalogParam::pg_type)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Features {
@@ -108,6 +144,7 @@ impl Features {
 #[derive(Debug)]
 struct Cursor {
     name: String,
+    principal: String,
     columns: Vec<Column>,
     estimate: Option<i64>,
     expires_at: Instant,
@@ -267,6 +304,18 @@ struct Primary {
     closed: BTreeMap<String, HandleState>,
 }
 
+#[derive(Debug)]
+struct PooledHandle {
+    lane: Lane,
+    handle: WriteHandle,
+}
+
+#[derive(Debug, Default)]
+struct PooledHandles {
+    open: HashMap<String, PooledHandle>,
+    closed: BTreeMap<String, HandleState>,
+}
+
 tokio::task_local! {
     pub static CALL_ID: u64;
 }
@@ -306,9 +355,11 @@ pub struct Engine {
     secondary: Mutex<Option<Lane>>,
     pool: Option<Pool>,
     pinned: Mutex<Vec<Lane>>,
+    pooled_handles: Mutex<PooledHandles>,
     running: std::sync::Mutex<Running>,
     role: tokio::sync::OnceCell<RoleProfile>,
     features: Features,
+    prefix: Option<String>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -325,12 +376,6 @@ pub struct CursorSummary {
     pub expires_in_seconds: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LaneChoice {
-    Primary,
-    Secondary,
-}
-
 impl Engine {
     pub async fn start(settings: Arc<Settings>, hints: Hints) -> Result<Self> {
         Self::start_with(settings, hints, false).await
@@ -344,12 +389,16 @@ impl Engine {
         let connector = Arc::new(Connector::new(Arc::clone(&settings)).with_ssh_hints(hints));
         let session = connector.connect().await?;
         let features = Features::from_version(session.info.server_version_num);
+        let prefix = pooled_transaction_prefix(&settings, session.info.server_version_num);
         let pool = if pooled {
             let size = usize::try_from(settings.http.pool_size.value).unwrap_or(4);
             let pool = Pool::builder(SessionManager {
                 connector: Arc::clone(&connector),
             })
             .max_size(size)
+            .wait_timeout(Some(settings.limits.statement_timeout.value))
+            .create_timeout(Some(settings.connection.connect_timeout.value))
+            .recycle_timeout(Some(Duration::from_secs(5)))
             .runtime(deadpool::Runtime::Tokio1)
             .build()
             .map_err(|error| Error::ProtocolFailed {
@@ -372,9 +421,11 @@ impl Engine {
             secondary: Mutex::new(None),
             pool,
             pinned: Mutex::new(Vec::new()),
+            pooled_handles: Mutex::new(PooledHandles::default()),
             running: std::sync::Mutex::new(Running::default()),
             role: tokio::sync::OnceCell::new(),
             features,
+            prefix,
         };
         if engine.settings.strict_role.value {
             engine.role().await?.enforce(true)?;
@@ -501,29 +552,38 @@ impl Engine {
 
     pub async fn sweep(&self) -> Result<usize> {
         let mut swept = 0;
-        {
+        let write_open = {
             let mut primary = self.primary.lock().await;
             swept += sweep_expired(&mut primary.lane).await?;
             finish_if_idle(&mut primary.lane).await?;
             self.expire_write_handle(&mut primary).await?;
-        }
+            primary.write.is_some()
+        };
         if let Some(lane) = self.secondary.lock().await.as_mut() {
             swept += sweep_expired(lane).await?;
             finish_if_idle(lane).await?;
         }
-        let mut pinned = self.pinned.lock().await;
-        for lane in pinned.iter_mut() {
-            swept += sweep_expired(lane).await?;
-            finish_if_idle(lane).await?;
+        if !write_open {
+            self.drop_idle_secondary().await;
         }
-        pinned.retain(|lane| !lane.cursors.is_empty());
+        {
+            let mut pinned = self.pinned.lock().await;
+            for lane in pinned.iter_mut() {
+                swept += sweep_expired(lane).await?;
+                finish_if_idle(lane).await?;
+            }
+            pinned.retain(|lane| !lane.cursors.is_empty());
+        }
+        let mut handles = self.pooled_handles.lock().await;
+        swept += self.pooled_sweep(&mut handles).await;
         Ok(swept)
     }
 
-    pub async fn close_cursor(&self, id: &str) -> Result<()> {
+    pub async fn close_cursor(&self, id: &str, principal: &str) -> Result<()> {
         {
             let mut primary = self.primary.lock().await;
             if primary.lane.cursors.contains_key(id) {
+                check_cursor_owner(&primary.lane, id, principal)?;
                 close_cursor_now(&mut primary.lane, id).await?;
                 return finish_if_idle(&mut primary.lane).await;
             }
@@ -531,11 +591,15 @@ impl Engine {
         if let Some(lane) = self.secondary.lock().await.as_mut()
             && lane.cursors.contains_key(id)
         {
+            check_cursor_owner(lane, id, principal)?;
             close_cursor_now(lane, id).await?;
             return finish_if_idle(lane).await;
         }
         let mut pinned = self.pinned.lock().await;
         if let Some(position) = pinned.iter().position(|lane| lane.cursors.contains_key(id)) {
+            if let Some(lane) = pinned.get(position) {
+                check_cursor_owner(lane, id, principal)?;
+            }
             let mut lane = pinned.remove(position);
             close_cursor_now(&mut lane, id).await?;
             let outcome = finish_if_idle(&mut lane).await;
@@ -550,14 +614,8 @@ impl Engine {
         })
     }
 
-    async fn read_lane(&self) -> Result<LaneChoice> {
-        let mut primary = self.primary.lock().await;
-        self.expire_write_handle(&mut primary).await?;
-        Ok(if primary.write.is_some() {
-            LaneChoice::Secondary
-        } else {
-            LaneChoice::Primary
-        })
+    fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
     }
 
     async fn ensure_secondary(&self, slot: &mut Option<Lane>) -> Result<()> {
@@ -574,42 +632,72 @@ impl Engine {
         Ok(())
     }
 
-    pub async fn run_read(&self, sql: &str, is_select: bool, caps: Caps) -> Result<ResultSet> {
-        let expiry = self.settings.limits.handle_expiry.value;
-        if self.pool.is_some() {
-            let mut lane = self.checkout().await?;
-            let _tracked = self.track(lane.conn.session());
-            let result = read_on_lane(&mut lane, sql, is_select, caps, expiry).await;
-            if !lane.cursors.is_empty() {
-                self.pinned.lock().await.push(lane);
-            }
-            return result;
-        }
-        match self.read_lane().await? {
-            LaneChoice::Primary => {
-                let mut primary = self.primary.lock().await;
-                self.ensure_alive(&mut primary).await?;
-                let _tracked = self.track(primary.lane.conn.session());
-                read_on_lane(&mut primary.lane, sql, is_select, caps, expiry).await
-            }
-            LaneChoice::Secondary => {
-                let mut slot = self.secondary.lock().await;
-                self.ensure_secondary(&mut slot).await?;
-                let lane = slot.as_mut().ok_or_else(|| Error::ProtocolFailed {
-                    detail: "the second connection is missing".to_owned(),
-                })?;
-                let _tracked = self.track(lane.conn.session());
-                read_on_lane(lane, sql, is_select, caps, expiry).await
-            }
+    async fn drop_idle_secondary(&self) {
+        let mut slot = self.secondary.lock().await;
+        if slot.as_ref().is_some_and(|lane| lane.cursors.is_empty()) {
+            tracing::debug!("closing the second connection");
+            *slot = None;
         }
     }
 
-    pub async fn fetch(&self, id: &str, caps: Caps) -> Result<ResultSet> {
-        let expiry = self.settings.limits.handle_expiry.value;
+    async fn read_hold(&self) -> Result<LaneHold<'_>> {
+        if self.pool.is_some() {
+            return Ok(LaneHold::Pooled(Box::new(self.checkout().await?)));
+        }
+        let mut primary = self.primary.lock().await;
+        self.ensure_alive(&mut primary).await?;
+        self.expire_write_handle(&mut primary).await?;
+        if primary.write.is_none() {
+            return Ok(LaneHold::Primary(primary));
+        }
+        drop(primary);
+        let mut slot = self.secondary.lock().await;
+        self.ensure_secondary(&mut slot).await?;
+        Ok(LaneHold::Secondary(slot))
+    }
+
+    async fn release_hold(&self, hold: LaneHold<'_>) {
+        if let LaneHold::Pooled(lane) = hold
+            && !lane.cursors.is_empty()
+        {
+            self.pinned.lock().await.push(*lane);
+        }
+    }
+
+    pub async fn run_read(&self, sql: &str, caps: Caps) -> Result<ResultSet> {
+        let expiry = self.settings.limits.cursor_expiry.value;
+        let mut hold = self.read_hold().await?;
+        let lane = hold.lane()?;
+        let _tracked = self.track(lane.conn.session());
+        let result = read_on_lane(lane, self.prefix(), sql, None, caps, expiry).await;
+        self.release_hold(hold).await;
+        result
+    }
+
+    pub async fn run_query(
+        &self,
+        sql: &str,
+        is_select: bool,
+        caps: Caps,
+        principal: &str,
+    ) -> Result<ResultSet> {
+        let expiry = self.settings.limits.cursor_expiry.value;
+        let owner = is_select.then_some(principal);
+        let mut hold = self.read_hold().await?;
+        let lane = hold.lane()?;
+        let _tracked = self.track(lane.conn.session());
+        let result = read_on_lane(lane, self.prefix(), sql, owner, caps, expiry).await;
+        self.release_hold(hold).await;
+        result
+    }
+
+    pub async fn fetch(&self, id: &str, caps: Caps, principal: &str) -> Result<ResultSet> {
+        let expiry = self.settings.limits.cursor_expiry.value;
         {
             let mut primary = self.primary.lock().await;
             sweep_expired(&mut primary.lane).await?;
             if primary.lane.cursors.contains_key(id) {
+                check_cursor_owner(&primary.lane, id, principal)?;
                 let _tracked = self.track(primary.lane.conn.session());
                 return fetch_on_lane(&mut primary.lane, id, caps, expiry).await;
             }
@@ -617,6 +705,7 @@ impl Engine {
         if let Some(lane) = self.secondary.lock().await.as_mut() {
             sweep_expired(lane).await?;
             if lane.cursors.contains_key(id) {
+                check_cursor_owner(lane, id, principal)?;
                 let _tracked = self.track(lane.conn.session());
                 return fetch_on_lane(lane, id, caps, expiry).await;
             }
@@ -626,6 +715,9 @@ impl Engine {
             sweep_expired(lane).await?;
         }
         if let Some(position) = pinned.iter().position(|lane| lane.cursors.contains_key(id)) {
+            if let Some(lane) = pinned.get(position) {
+                check_cursor_owner(lane, id, principal)?;
+            }
             let mut lane = pinned.remove(position);
             let _tracked = self.track(lane.conn.session());
             let result = fetch_on_lane(&mut lane, id, caps, expiry).await;
@@ -644,36 +736,20 @@ impl Engine {
     pub fn catalog_rows<'a>(
         &'a self,
         sql: &'a str,
-        params: &'a [&'a (dyn ToSql + Sync)],
+        params: &'a [&'a dyn CatalogParam],
     ) -> futures_util::future::BoxFuture<'a, Result<Vec<tokio_postgres::Row>>> {
         Box::pin(async move {
-            if self.pool.is_some() {
-                let lane = self.checkout().await?;
-                let _tracked = self.track(lane.conn.session());
-                return query_rows(lane.conn.client(), sql, params).await;
-            }
-            match self.read_lane().await? {
-                LaneChoice::Primary => {
-                    let mut primary = self.primary.lock().await;
-                    self.ensure_alive(&mut primary).await?;
-                    let _tracked = self.track(primary.lane.conn.session());
-                    query_rows(primary.lane.conn.client(), sql, params).await
-                }
-                LaneChoice::Secondary => {
-                    let mut slot = self.secondary.lock().await;
-                    self.ensure_secondary(&mut slot).await?;
-                    let lane = slot.as_ref().ok_or_else(|| Error::ProtocolFailed {
-                        detail: "the second connection is missing".to_owned(),
-                    })?;
-                    let _tracked = self.track(lane.conn.session());
-                    query_rows(lane.conn.client(), sql, params).await
-                }
-            }
+            let mut hold = self.read_hold().await?;
+            let lane = hold.lane()?;
+            let _tracked = self.track(lane.conn.session());
+            let result = catalog_on_lane(lane, self.prefix(), sql, params).await;
+            self.release_hold(hold).await;
+            result
         })
     }
 
     pub async fn catalog_text(&self, sql: &str, caps: Caps) -> Result<ResultSet> {
-        self.run_read(sql, false, caps).await
+        self.run_read(sql, caps).await
     }
 
     async fn ensure_alive(&self, primary: &mut Primary) -> Result<()> {
@@ -753,6 +829,9 @@ impl Engine {
     }
 
     pub async fn begin_transaction(&self, principal: &str) -> Result<HandleInfo> {
+        if self.pool.is_some() {
+            return self.pooled_begin(principal).await;
+        }
         let mut primary = self.primary.lock().await;
         self.ensure_alive(&mut primary).await?;
         self.expire_write_handle(&mut primary).await?;
@@ -768,46 +847,42 @@ impl Engine {
             .lane
             .conn
             .client()
-            .batch_execute("BEGIN")
+            .batch_execute(&begin_statement(self.prefix()))
             .await
             .map_err(|error| describe_sqlstate(&error))?;
-        let handle = WriteHandle {
-            id: new_handle_id(),
-            principal: principal.to_owned(),
-            savepoints: Vec::new(),
-            statements: 0,
-            expires_at: Instant::now() + self.settings.limits.handle_expiry.value,
-        };
+        let handle = self.new_write_handle(principal);
         let info = Self::describe_handle(&handle);
         primary.write = Some(handle);
         Ok(info)
     }
 
+    fn new_write_handle(&self, principal: &str) -> WriteHandle {
+        WriteHandle {
+            id: new_handle_id(),
+            principal: principal.to_owned(),
+            savepoints: Vec::new(),
+            statements: 0,
+            expires_at: Instant::now() + self.settings.limits.handle_expiry.value,
+        }
+    }
+
     pub async fn transaction_status(&self, id: &str) -> Result<HandleInfo> {
+        if self.pool.is_some() {
+            return self.pooled_status(id).await;
+        }
         let mut primary = self.primary.lock().await;
         self.expire_write_handle(&mut primary).await?;
         if let Some(handle) = primary.write.as_ref().filter(|handle| handle.id == id) {
             return Ok(Self::describe_handle(handle));
         }
-        match primary.closed.get(id) {
-            Some(state) => Ok(HandleInfo {
-                id: id.to_owned(),
-                state: *state,
-                principal: String::new(),
-                savepoints: Vec::new(),
-                statements: 0,
-                expires_in_seconds: 0,
-            }),
-            None => Err(Error::HandleState {
-                handle: id.to_owned(),
-                state: "unknown".to_owned(),
-            }),
-        }
+        closed_handle_info(&primary.closed, id)
     }
 
-    pub async fn open_transaction(&self) -> Option<HandleInfo> {
-        let primary = self.primary.lock().await;
-        primary.write.as_ref().map(Self::describe_handle)
+    pub async fn open_transactions(&self) -> usize {
+        if self.pool.is_some() {
+            return self.pooled_handles.lock().await.open.len();
+        }
+        usize::from(self.primary.lock().await.write.is_some())
     }
 
     pub async fn commit(&self, id: &str, principal: &str) -> Result<HandleInfo> {
@@ -827,57 +902,77 @@ impl Engine {
         statement: &str,
         state: HandleState,
     ) -> Result<HandleInfo> {
-        let mut primary = self.primary.lock().await;
-        self.expire_write_handle(&mut primary).await?;
-        Self::check_handle(&mut primary, id, principal)?;
-        let _tracked = self.track(primary.lane.conn.session());
-        if primary.lane.conn.client().is_closed() {
-            if let Some(handle) = primary.write.take() {
-                primary.closed.insert(handle.id, HandleState::Lost);
-            }
-            return Err(Error::HandleState {
-                handle: id.to_owned(),
-                state: "lost".to_owned(),
-            });
+        if self.pool.is_some() {
+            return self.pooled_finish(id, principal, statement, state).await;
         }
-        let outcome = primary.lane.conn.client().batch_execute(statement).await;
-        let Some(handle) = primary.write.take() else {
-            return Err(Error::HandleState {
-                handle: id.to_owned(),
-                state: "unknown".to_owned(),
-            });
+        let outcome = {
+            let mut primary = self.primary.lock().await;
+            self.expire_write_handle(&mut primary).await?;
+            Self::check_handle(&mut primary, id, principal)?;
+            let _tracked = self.track(primary.lane.conn.session());
+            if primary.lane.conn.client().is_closed() {
+                if let Some(handle) = primary.write.take() {
+                    primary.closed.insert(handle.id, HandleState::Lost);
+                }
+                return Err(Error::HandleState {
+                    handle: id.to_owned(),
+                    state: "lost".to_owned(),
+                });
+            }
+            let outcome = primary.lane.conn.client().batch_execute(statement).await;
+            let Some(handle) = primary.write.take() else {
+                return Err(Error::HandleState {
+                    handle: id.to_owned(),
+                    state: "unknown".to_owned(),
+                });
+            };
+            let mut info = Self::describe_handle(&handle);
+            match outcome {
+                Ok(()) => {
+                    info.state = state;
+                    info.expires_in_seconds = 0;
+                    primary.closed.insert(handle.id, state);
+                    Ok(info)
+                }
+                Err(error) => {
+                    let final_state = if primary.lane.conn.client().is_closed() {
+                        HandleState::Lost
+                    } else {
+                        HandleState::RolledBack
+                    };
+                    primary.closed.insert(handle.id, final_state);
+                    Err(describe_sqlstate(&error))
+                }
+            }
         };
-        let mut info = Self::describe_handle(&handle);
-        match outcome {
-            Ok(()) => {
-                info.state = state;
-                info.expires_in_seconds = 0;
-                primary.closed.insert(handle.id, state);
-                Ok(info)
-            }
-            Err(error) => {
-                let final_state = if primary.lane.conn.client().is_closed() {
-                    HandleState::Lost
-                } else {
-                    HandleState::RolledBack
-                };
-                primary.closed.insert(handle.id, final_state);
-                Err(describe_sqlstate(&error))
-            }
-        }
+        self.drop_idle_secondary().await;
+        outcome
     }
 
     pub async fn savepoint(&self, id: &str, principal: &str, name: &str) -> Result<HandleInfo> {
+        let quoted = crate::render::quote_ident(name);
+        let statement = format!("SAVEPOINT {quoted}");
+        if self.pool.is_some() {
+            return self
+                .pooled_on_handle(
+                    id,
+                    principal,
+                    |handle| {
+                        handle.savepoints.push(name.to_owned());
+                    },
+                    &statement,
+                )
+                .await;
+        }
         let mut primary = self.primary.lock().await;
         self.expire_write_handle(&mut primary).await?;
         Self::check_handle(&mut primary, id, principal)?;
-        let quoted = crate::render::quote_ident(name);
         let _tracked = self.track(primary.lane.conn.session());
         primary
             .lane
             .conn
             .client()
-            .batch_execute(&format!("SAVEPOINT {quoted}"))
+            .batch_execute(&statement)
             .await
             .map_err(|error| describe_sqlstate(&error))?;
         let expiry = self.settings.limits.handle_expiry.value;
@@ -888,30 +983,36 @@ impl Engine {
     }
 
     pub async fn rollback_to(&self, id: &str, principal: &str, name: &str) -> Result<HandleInfo> {
+        let quoted = crate::render::quote_ident(name);
+        let statement = format!("ROLLBACK TO SAVEPOINT {quoted}");
+        if self.pool.is_some() {
+            self.pooled_check_savepoint(id, principal, name).await?;
+            return self
+                .pooled_on_handle(
+                    id,
+                    principal,
+                    |handle| truncate_savepoints(handle, name),
+                    &statement,
+                )
+                .await;
+        }
         let mut primary = self.primary.lock().await;
         self.expire_write_handle(&mut primary).await?;
         {
             let handle = Self::check_handle(&mut primary, id, principal)?;
-            if !handle.savepoints.iter().any(|known| known == name) {
-                return Err(Error::HandleState {
-                    handle: id.to_owned(),
-                    state: format!("holding no savepoint named `{name}`"),
-                });
-            }
+            check_savepoint(handle, id, name)?;
         }
-        let quoted = crate::render::quote_ident(name);
+        let _tracked = self.track(primary.lane.conn.session());
         primary
             .lane
             .conn
             .client()
-            .batch_execute(&format!("ROLLBACK TO SAVEPOINT {quoted}"))
+            .batch_execute(&statement)
             .await
             .map_err(|error| describe_sqlstate(&error))?;
         let expiry = self.settings.limits.handle_expiry.value;
         let handle = Self::check_handle(&mut primary, id, principal)?;
-        if let Some(position) = handle.savepoints.iter().position(|known| known == name) {
-            handle.savepoints.truncate(position + 1);
-        }
+        truncate_savepoints(handle, name);
         handle.expires_at = Instant::now() + expiry;
         Ok(Self::describe_handle(handle))
     }
@@ -944,6 +1045,11 @@ impl Engine {
                     mode: self.settings.mode.value.to_string(),
                 });
             }
+            if self.pool.is_some() {
+                return self
+                    .pooled_run_in_handle(id, principal, sql, caps, timeout)
+                    .await;
+            }
             let mut primary = self.primary.lock().await;
             self.expire_write_handle(&mut primary).await?;
             Self::check_handle(&mut primary, id, principal)?;
@@ -972,6 +1078,11 @@ impl Engine {
             }
             return result;
         }
+        if self.pool.is_some() {
+            let lane = self.checkout().await?;
+            let _tracked = self.track(lane.conn.session());
+            return autocommit(lane.conn.client(), self.prefix(), timeout, sql, caps).await;
+        }
         let mut primary = self.primary.lock().await;
         self.ensure_alive(&mut primary).await?;
         self.expire_write_handle(&mut primary).await?;
@@ -985,9 +1096,13 @@ impl Engine {
         finish_if_idle(&mut primary.lane).await?;
         if !primary.lane.in_read_transaction {
             let _tracked = self.track(primary.lane.conn.session());
-            return timed(primary.lane.conn.client(), timeout, false, || {
-                autocommit_statement(primary.lane.conn.client(), sql, caps)
-            })
+            return autocommit(
+                primary.lane.conn.client(),
+                self.prefix(),
+                timeout,
+                sql,
+                caps,
+            )
             .await;
         }
         drop(primary);
@@ -1006,10 +1121,7 @@ impl Engine {
             });
         }
         let _tracked = self.track(lane.conn.session());
-        timed(lane.conn.client(), timeout, false, || {
-            autocommit_statement(lane.conn.client(), sql, caps)
-        })
-        .await
+        autocommit(lane.conn.client(), self.prefix(), timeout, sql, caps).await
     }
 
     pub async fn run_unparsed(
@@ -1020,11 +1132,10 @@ impl Engine {
         handle: Option<&str>,
     ) -> Result<ResultSet> {
         {
-            let mut primary = self.primary.lock().await;
-            self.ensure_alive(&mut primary).await?;
-            let _tracked = self.track(primary.lane.conn.session());
-            let statement = primary
-                .lane
+            let mut hold = self.read_hold().await?;
+            let lane = hold.lane()?;
+            let _tracked = self.track(lane.conn.session());
+            let statement = lane
                 .conn
                 .client()
                 .prepare(sql)
@@ -1056,20 +1167,20 @@ impl Engine {
     pub async fn secondary_rows(
         &self,
         sql: &str,
-        params: &[&(dyn ToSql + Sync)],
+        params: &[&dyn CatalogParam],
     ) -> Result<Vec<tokio_postgres::Row>> {
         if self.pool.is_some() {
-            let lane = self.checkout().await?;
+            let mut lane = self.checkout().await?;
             let _tracked = self.track(lane.conn.session());
-            return query_rows(lane.conn.client(), sql, params).await;
+            return catalog_on_lane(&mut lane, self.prefix(), sql, params).await;
         }
         let mut slot = self.secondary.lock().await;
         self.ensure_secondary(&mut slot).await?;
-        let lane = slot.as_ref().ok_or_else(|| Error::ProtocolFailed {
+        let lane = slot.as_mut().ok_or_else(|| Error::ProtocolFailed {
             detail: "the second connection is missing".to_owned(),
         })?;
         let _tracked = self.track(lane.conn.session());
-        query_rows(lane.conn.client(), sql, params).await
+        catalog_on_lane(lane, self.prefix(), sql, params).await
     }
 
     pub async fn copy_in(
@@ -1079,6 +1190,9 @@ impl Engine {
         principal: &str,
         handle: Option<&str>,
     ) -> Result<u64> {
+        if self.pool.is_some() {
+            return self.pooled_copy_in(sql, data, principal, handle).await;
+        }
         let mut primary = self.primary.lock().await;
         self.ensure_alive(&mut primary).await?;
         self.expire_write_handle(&mut primary).await?;
@@ -1105,19 +1219,14 @@ impl Engine {
             }
         }
         let _tracked = self.track(primary.lane.conn.session());
-        let client = &primary.lane.conn.client();
-        let sink = client
-            .copy_in(sql)
-            .await
-            .map_err(|error| describe_sqlstate(&error))?;
-        let mut sink = std::pin::pin!(sink);
-        sink.send(bytes::Bytes::copy_from_slice(data))
-            .await
-            .map_err(|error| describe_sqlstate(&error))?;
-        let rows = sink
-            .finish()
-            .await
-            .map_err(|error| describe_sqlstate(&error))?;
+        let rows = copy_in_on(
+            primary.lane.conn.client(),
+            self.prefix(),
+            handle.is_some(),
+            sql,
+            data,
+        )
+        .await?;
         if let Some(id) = handle
             && let Ok(open) = Self::check_handle(&mut primary, id, principal)
         {
@@ -1128,54 +1237,20 @@ impl Engine {
     }
 
     pub async fn copy_out(&self, sql: &str, byte_cap: usize) -> Result<(Vec<u8>, bool)> {
-        let choice = self.read_lane().await?;
-        let mut primary = self.primary.lock().await;
-        let mut slot = self.secondary.lock().await;
-        let session = match choice {
-            LaneChoice::Primary => {
-                self.ensure_alive(&mut primary).await?;
-                primary.lane.conn.session()
-            }
-            LaneChoice::Secondary => {
-                self.ensure_secondary(&mut slot).await?;
-                slot.as_ref()
-                    .ok_or_else(|| Error::ProtocolFailed {
-                        detail: "the second connection is missing".to_owned(),
-                    })?
-                    .conn
-                    .session()
-            }
-        };
-        let _tracked = self.track(session);
-        let stream = session
-            .client
-            .copy_out(sql)
-            .await
-            .map_err(|error| describe_sqlstate(&error))?;
-        let mut stream = std::pin::pin!(stream);
-        let mut out = Vec::new();
-        let mut truncated = false;
-        while let Some(chunk) = stream
-            .try_next()
-            .await
-            .map_err(|error| describe_sqlstate(&error))?
-        {
-            if out.len() + chunk.len() > byte_cap {
-                let room = byte_cap.saturating_sub(out.len());
-                out.extend_from_slice(chunk.get(..room).unwrap_or_default());
-                truncated = true;
-                break;
-            }
-            out.extend_from_slice(&chunk);
-        }
-        if truncated {
-            let _ = session.cancel_running_statement().await;
-            while stream.try_next().await.ok().flatten().is_some() {}
-        }
-        Ok((out, truncated))
+        let mut hold = self.read_hold().await?;
+        let lane = hold.lane()?;
+        let _tracked = self.track(lane.conn.session());
+        let result = copy_out_on(lane, self.prefix(), sql, byte_cap).await;
+        self.release_hold(hold).await;
+        result
     }
 
     pub async fn run_and_rollback(&self, sql: &str, caps: Caps) -> Result<ResultSet> {
+        if self.pool.is_some() {
+            let lane = self.checkout().await?;
+            let _tracked = self.track(lane.conn.session());
+            return discard_after(lane.conn.client(), self.prefix(), sql, caps).await;
+        }
         let mut primary = self.primary.lock().await;
         self.ensure_alive(&mut primary).await?;
         self.expire_write_handle(&mut primary).await?;
@@ -1190,7 +1265,7 @@ impl Engine {
         finish_if_idle(&mut primary.lane).await?;
         if !primary.lane.in_read_transaction {
             let _tracked = self.track(primary.lane.conn.session());
-            return discard_after(primary.lane.conn.client(), sql, caps).await;
+            return discard_after(primary.lane.conn.client(), self.prefix(), sql, caps).await;
         }
         drop(primary);
         let mut slot = self.secondary.lock().await;
@@ -1207,7 +1282,7 @@ impl Engine {
             });
         }
         let _tracked = self.track(lane.conn.session());
-        discard_after(lane.conn.client(), sql, caps).await
+        discard_after(lane.conn.client(), self.prefix(), sql, caps).await
     }
 
     pub async fn release_everything(&self) -> Result<()> {
@@ -1241,11 +1316,466 @@ impl Engine {
             }
         }
         pinned.clear();
+        {
+            let mut handles = self.pooled_handles.lock().await;
+            let open: Vec<(String, PooledHandle)> = handles.open.drain().collect();
+            for (id, held) in open {
+                if !held.lane.conn.client().is_closed() {
+                    let _ = held.lane.conn.client().batch_execute("ROLLBACK").await;
+                }
+                handles.closed.insert(id, HandleState::RolledBack);
+            }
+        }
         if let Some(pool) = &self.pool {
             pool.close();
         }
         Ok(())
     }
+
+    async fn pooled_sweep(&self, handles: &mut PooledHandles) -> usize {
+        let now = Instant::now();
+        let expired: Vec<String> = handles
+            .open
+            .iter()
+            .filter(|(_, held)| held.handle.expires_at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let count = expired.len();
+        for id in expired {
+            if let Some(held) = handles.open.remove(&id) {
+                tracing::info!(handle = %id, "the transaction handle expired; rolling back");
+                if !held.lane.conn.client().is_closed() {
+                    let _ = held.lane.conn.client().batch_execute("ROLLBACK").await;
+                }
+                handles.closed.insert(id, HandleState::Expired);
+            }
+        }
+        count
+    }
+
+    async fn pooled_begin(&self, principal: &str) -> Result<HandleInfo> {
+        let mut handles = self.pooled_handles.lock().await;
+        self.pooled_sweep(&mut handles).await;
+        if let Some(open) = handles
+            .open
+            .values()
+            .find(|held| held.handle.principal == principal)
+        {
+            return Err(Error::HandleState {
+                handle: open.handle.id.clone(),
+                state: "open; commit or roll it back before opening another".to_owned(),
+            });
+        }
+        let lane = self.checkout().await?;
+        let _tracked = self.track(lane.conn.session());
+        lane.conn
+            .client()
+            .batch_execute(&begin_statement(self.prefix()))
+            .await
+            .map_err(|error| describe_sqlstate(&error))?;
+        let handle = self.new_write_handle(principal);
+        let info = Self::describe_handle(&handle);
+        handles
+            .open
+            .insert(handle.id.clone(), PooledHandle { lane, handle });
+        Ok(info)
+    }
+
+    async fn pooled_status(&self, id: &str) -> Result<HandleInfo> {
+        let mut handles = self.pooled_handles.lock().await;
+        self.pooled_sweep(&mut handles).await;
+        if let Some(held) = handles.open.get(id) {
+            return Ok(Self::describe_handle(&held.handle));
+        }
+        closed_handle_info(&handles.closed, id)
+    }
+
+    fn pooled_take<'a>(
+        handles: &'a mut PooledHandles,
+        id: &str,
+        principal: &str,
+    ) -> Result<&'a mut PooledHandle> {
+        match handles.open.get_mut(id) {
+            Some(held) if held.handle.principal == principal => Ok(held),
+            Some(_) => Err(Error::HandleState {
+                handle: id.to_owned(),
+                state: "owned by another principal".to_owned(),
+            }),
+            None => Err(Error::HandleState {
+                handle: id.to_owned(),
+                state: handles
+                    .closed
+                    .get(id)
+                    .map_or("unknown", |state| state.as_str())
+                    .to_owned(),
+            }),
+        }
+    }
+
+    fn pooled_lose(handles: &mut PooledHandles, id: &str) {
+        if handles.open.remove(id).is_some() {
+            handles.closed.insert(id.to_owned(), HandleState::Lost);
+        }
+    }
+
+    async fn pooled_finish(
+        &self,
+        id: &str,
+        principal: &str,
+        statement: &str,
+        state: HandleState,
+    ) -> Result<HandleInfo> {
+        let mut handles = self.pooled_handles.lock().await;
+        self.pooled_sweep(&mut handles).await;
+        Self::pooled_take(&mut handles, id, principal)?;
+        let Some(held) = handles.open.remove(id) else {
+            return Err(Error::HandleState {
+                handle: id.to_owned(),
+                state: "unknown".to_owned(),
+            });
+        };
+        if held.lane.conn.client().is_closed() {
+            handles.closed.insert(id.to_owned(), HandleState::Lost);
+            return Err(Error::HandleState {
+                handle: id.to_owned(),
+                state: "lost".to_owned(),
+            });
+        }
+        let _tracked = self.track(held.lane.conn.session());
+        let outcome = held.lane.conn.client().batch_execute(statement).await;
+        let mut info = Self::describe_handle(&held.handle);
+        match outcome {
+            Ok(()) => {
+                info.state = state;
+                info.expires_in_seconds = 0;
+                handles.closed.insert(id.to_owned(), state);
+                Ok(info)
+            }
+            Err(error) => {
+                let final_state = if held.lane.conn.client().is_closed() {
+                    HandleState::Lost
+                } else {
+                    HandleState::RolledBack
+                };
+                handles.closed.insert(id.to_owned(), final_state);
+                Err(describe_sqlstate(&error))
+            }
+        }
+    }
+
+    async fn pooled_check_savepoint(&self, id: &str, principal: &str, name: &str) -> Result<()> {
+        let mut handles = self.pooled_handles.lock().await;
+        self.pooled_sweep(&mut handles).await;
+        let held = Self::pooled_take(&mut handles, id, principal)?;
+        check_savepoint(&held.handle, id, name)
+    }
+
+    async fn pooled_on_handle<F>(
+        &self,
+        id: &str,
+        principal: &str,
+        update: F,
+        statement: &str,
+    ) -> Result<HandleInfo>
+    where
+        F: FnOnce(&mut WriteHandle),
+    {
+        let mut handles = self.pooled_handles.lock().await;
+        self.pooled_sweep(&mut handles).await;
+        let held = Self::pooled_take(&mut handles, id, principal)?;
+        if held.lane.conn.client().is_closed() {
+            Self::pooled_lose(&mut handles, id);
+            return Err(Error::HandleState {
+                handle: id.to_owned(),
+                state: "lost".to_owned(),
+            });
+        }
+        let _tracked = self.track(held.lane.conn.session());
+        held.lane
+            .conn
+            .client()
+            .batch_execute(statement)
+            .await
+            .map_err(|error| describe_sqlstate(&error))?;
+        update(&mut held.handle);
+        held.handle.expires_at = Instant::now() + self.settings.limits.handle_expiry.value;
+        Ok(Self::describe_handle(&held.handle))
+    }
+
+    async fn pooled_run_in_handle(
+        &self,
+        id: &str,
+        principal: &str,
+        sql: &str,
+        caps: Caps,
+        timeout: Option<Duration>,
+    ) -> Result<ResultSet> {
+        let mut handles = self.pooled_handles.lock().await;
+        self.pooled_sweep(&mut handles).await;
+        let held = Self::pooled_take(&mut handles, id, principal)?;
+        if held.lane.conn.client().is_closed() {
+            Self::pooled_lose(&mut handles, id);
+            return Err(Error::HandleState {
+                handle: id.to_owned(),
+                state: "lost".to_owned(),
+            });
+        }
+        let _tracked = self.track(held.lane.conn.session());
+        let client = held.lane.conn.client();
+        let result = timed(client, timeout, true, || {
+            guarded_statement(client, sql, caps)
+        })
+        .await;
+        if held.lane.conn.client().is_closed() {
+            Self::pooled_lose(&mut handles, id);
+        } else {
+            held.handle.statements += 1;
+            held.handle.expires_at = Instant::now() + self.settings.limits.handle_expiry.value;
+        }
+        result
+    }
+
+    async fn pooled_copy_in(
+        &self,
+        sql: &str,
+        data: &[u8],
+        principal: &str,
+        handle: Option<&str>,
+    ) -> Result<u64> {
+        let Some(id) = handle else {
+            let lane = self.checkout().await?;
+            let _tracked = self.track(lane.conn.session());
+            return copy_in_on(lane.conn.client(), self.prefix(), false, sql, data).await;
+        };
+        let mut handles = self.pooled_handles.lock().await;
+        self.pooled_sweep(&mut handles).await;
+        let held = Self::pooled_take(&mut handles, id, principal)?;
+        if held.lane.conn.client().is_closed() {
+            Self::pooled_lose(&mut handles, id);
+            return Err(Error::HandleState {
+                handle: id.to_owned(),
+                state: "lost".to_owned(),
+            });
+        }
+        let _tracked = self.track(held.lane.conn.session());
+        let rows = copy_in_on(held.lane.conn.client(), self.prefix(), true, sql, data).await?;
+        held.handle.statements += 1;
+        held.handle.expires_at = Instant::now() + self.settings.limits.handle_expiry.value;
+        Ok(rows)
+    }
+}
+
+enum LaneHold<'a> {
+    Pooled(Box<Lane>),
+    Primary(tokio::sync::MutexGuard<'a, Primary>),
+    Secondary(tokio::sync::MutexGuard<'a, Option<Lane>>),
+}
+
+impl LaneHold<'_> {
+    fn lane(&mut self) -> Result<&mut Lane> {
+        match self {
+            Self::Pooled(lane) => Ok(lane),
+            Self::Primary(primary) => Ok(&mut primary.lane),
+            Self::Secondary(slot) => slot.as_mut().ok_or_else(|| Error::ProtocolFailed {
+                detail: "the second connection is missing".to_owned(),
+            }),
+        }
+    }
+}
+
+fn begin_statement(prefix: Option<&str>) -> String {
+    match prefix {
+        Some(prefix) => format!("BEGIN; {prefix}"),
+        None => "BEGIN".to_owned(),
+    }
+}
+
+fn closed_handle_info(closed: &BTreeMap<String, HandleState>, id: &str) -> Result<HandleInfo> {
+    match closed.get(id) {
+        Some(state) => Ok(HandleInfo {
+            id: id.to_owned(),
+            state: *state,
+            principal: String::new(),
+            savepoints: Vec::new(),
+            statements: 0,
+            expires_in_seconds: 0,
+        }),
+        None => Err(Error::HandleState {
+            handle: id.to_owned(),
+            state: "unknown".to_owned(),
+        }),
+    }
+}
+
+fn check_savepoint(handle: &WriteHandle, id: &str, name: &str) -> Result<()> {
+    if handle.savepoints.iter().any(|known| known == name) {
+        return Ok(());
+    }
+    Err(Error::HandleState {
+        handle: id.to_owned(),
+        state: format!("holding no savepoint named `{name}`"),
+    })
+}
+
+fn truncate_savepoints(handle: &mut WriteHandle, name: &str) {
+    if let Some(position) = handle.savepoints.iter().position(|known| known == name) {
+        handle.savepoints.truncate(position + 1);
+    }
+}
+
+fn check_cursor_owner(lane: &Lane, id: &str, principal: &str) -> Result<()> {
+    match lane.cursors.get(id) {
+        Some(cursor) if cursor.principal == principal => Ok(()),
+        Some(_) => Err(Error::HandleState {
+            handle: id.to_owned(),
+            state: "owned by another principal".to_owned(),
+        }),
+        None => Err(Error::HandleState {
+            handle: id.to_owned(),
+            state: "unknown or expired".to_owned(),
+        }),
+    }
+}
+
+async fn catalog_on_lane(
+    lane: &mut Lane,
+    prefix: Option<&str>,
+    sql: &str,
+    params: &[&dyn CatalogParam],
+) -> Result<Vec<tokio_postgres::Row>> {
+    if prefix.is_none() {
+        return query_rows(lane.conn.client(), sql, params).await;
+    }
+    sweep_expired(lane).await?;
+    begin_read(lane, prefix).await?;
+    let outcome = query_rows(lane.conn.client(), sql, params).await;
+    if lane.conn.client().is_closed() {
+        lane.forget_state();
+    } else if outcome.is_ok() {
+        finish_if_idle(lane).await?;
+    } else {
+        let _ = finish_if_idle(lane).await;
+    }
+    outcome
+}
+
+async fn autocommit(
+    client: &tokio_postgres::Client,
+    prefix: Option<&str>,
+    timeout: Option<Duration>,
+    sql: &str,
+    caps: Caps,
+) -> Result<ResultSet> {
+    let Some(prefix) = prefix else {
+        return timed(client, timeout, false, || {
+            autocommit_statement(client, sql, caps)
+        })
+        .await;
+    };
+    client
+        .batch_execute(&format!("BEGIN; {prefix}"))
+        .await
+        .map_err(|error| describe_sqlstate(&error))?;
+    let result = timed(client, timeout, true, || {
+        autocommit_statement(client, sql, caps)
+    })
+    .await;
+    settle_wrapper(client, result.is_ok()).await?;
+    result
+}
+
+async fn settle_wrapper(client: &tokio_postgres::Client, commit: bool) -> Result<()> {
+    if client.is_closed() {
+        return Ok(());
+    }
+    let outcome = client
+        .batch_execute(if commit { "COMMIT" } else { "ROLLBACK" })
+        .await;
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(error) if commit => Err(describe_sqlstate(&error)),
+        Err(_) => Ok(()),
+    }
+}
+
+async fn copy_in_on(
+    client: &tokio_postgres::Client,
+    prefix: Option<&str>,
+    inside_handle: bool,
+    sql: &str,
+    data: &[u8],
+) -> Result<u64> {
+    let wrap = prefix.filter(|_| !inside_handle);
+    if let Some(prefix) = wrap {
+        client
+            .batch_execute(&format!("BEGIN; {prefix}"))
+            .await
+            .map_err(|error| describe_sqlstate(&error))?;
+    }
+    let result = async {
+        let sink = client
+            .copy_in(sql)
+            .await
+            .map_err(|error| describe_sqlstate(&error))?;
+        let mut sink = std::pin::pin!(sink);
+        sink.send(bytes::Bytes::copy_from_slice(data))
+            .await
+            .map_err(|error| describe_sqlstate(&error))?;
+        sink.finish()
+            .await
+            .map_err(|error| describe_sqlstate(&error))
+    }
+    .await;
+    if wrap.is_some() {
+        settle_wrapper(client, result.is_ok()).await?;
+    }
+    result
+}
+
+async fn copy_out_on(
+    lane: &mut Lane,
+    prefix: Option<&str>,
+    sql: &str,
+    byte_cap: usize,
+) -> Result<(Vec<u8>, bool)> {
+    sweep_expired(lane).await?;
+    begin_read(lane, prefix).await?;
+    let session = lane.conn.session();
+    let outcome = async {
+        let stream = session
+            .client
+            .copy_out(sql)
+            .await
+            .map_err(|error| describe_sqlstate(&error))?;
+        let mut stream = std::pin::pin!(stream);
+        let mut out = Vec::new();
+        let mut truncated = false;
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|error| describe_sqlstate(&error))?
+        {
+            if out.len() + chunk.len() > byte_cap {
+                let room = byte_cap.saturating_sub(out.len());
+                out.extend_from_slice(chunk.get(..room).unwrap_or_default());
+                truncated = true;
+                break;
+            }
+            out.extend_from_slice(&chunk);
+        }
+        if truncated {
+            let _ = session.cancel_running_statement().await;
+            while stream.try_next().await.ok().flatten().is_some() {}
+        }
+        Ok((out, truncated))
+    }
+    .await;
+    if lane.conn.client().is_closed() {
+        lane.forget_state();
+    } else {
+        let _ = finish_if_idle(lane).await;
+    }
+    outcome
 }
 
 fn summaries(lane: &Lane, now: Instant) -> Vec<CursorSummary> {
@@ -1261,10 +1791,13 @@ fn summaries(lane: &Lane, now: Instant) -> Vec<CursorSummary> {
 async fn query_rows(
     client: &tokio_postgres::Client,
     sql: &str,
-    params: &[&(dyn ToSql + Sync)],
+    params: &[&dyn CatalogParam],
 ) -> Result<Vec<tokio_postgres::Row>> {
+    let typed = params
+        .iter()
+        .map(|param| (*param as &(dyn ToSql + Sync), param.pg_type()));
     let stream = client
-        .query_raw(sql, params.iter().copied())
+        .query_typed_raw(sql, typed)
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     let mut stream = std::pin::pin!(stream);
@@ -1281,17 +1814,19 @@ async fn query_rows(
 
 async fn read_on_lane(
     lane: &mut Lane,
+    prefix: Option<&str>,
     sql: &str,
-    is_select: bool,
+    owner: Option<&str>,
     caps: Caps,
     expiry: Duration,
 ) -> Result<ResultSet> {
     sweep_expired(lane).await?;
-    begin_read(lane).await?;
-    let outcome = if is_select && lane.cursors.len() < CURSOR_CAP {
-        read_through_cursor(lane, sql, caps, expiry).await
-    } else {
-        guarded_statement(lane.conn.client(), sql, caps).await
+    begin_read(lane, prefix).await?;
+    let outcome = match owner {
+        Some(principal) if lane.cursors.len() < CURSOR_CAP => {
+            read_through_cursor(lane, sql, principal, caps, expiry).await
+        }
+        _ => guarded_statement(lane.conn.client(), sql, caps).await,
     };
     match outcome {
         Ok(result) => {
@@ -1349,6 +1884,7 @@ async fn fetch_on_lane(
 async fn read_through_cursor(
     lane: &mut Lane,
     sql: &str,
+    principal: &str,
     caps: Caps,
     expiry: Duration,
 ) -> Result<ResultSet> {
@@ -1411,6 +1947,7 @@ async fn read_through_cursor(
             id.clone(),
             Cursor {
                 name,
+                principal: principal.to_owned(),
                 columns,
                 estimate,
                 expires_at: Instant::now() + expiry,
@@ -1431,13 +1968,17 @@ fn new_handle_id() -> String {
     format!("{:016x}", rand::random::<u64>())
 }
 
-async fn begin_read(lane: &mut Lane) -> Result<()> {
+async fn begin_read(lane: &mut Lane, prefix: Option<&str>) -> Result<()> {
     if lane.in_read_transaction {
         return Ok(());
     }
+    let statement = match prefix {
+        Some(prefix) => format!("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY; {prefix}"),
+        None => "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY".to_owned(),
+    };
     lane.conn
         .client()
-        .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY")
+        .batch_execute(&statement)
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     lane.in_read_transaction = true;
@@ -1620,11 +2161,12 @@ async fn autocommit_statement(
 
 async fn discard_after(
     client: &tokio_postgres::Client,
+    prefix: Option<&str>,
     sql: &str,
     caps: Caps,
 ) -> Result<ResultSet> {
     client
-        .batch_execute("BEGIN")
+        .batch_execute(&begin_statement(prefix))
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     let result = guarded_statement(client, sql, caps).await;

@@ -31,7 +31,7 @@ async fn run_catalog(call: &Call, operation: &str, sql: &str, row_cap: u32) -> O
     facts.operation = Some(operation.to_owned());
     let result = call
         .engine()
-        .run_read(sql, false, call.caps(row_cap))
+        .run_read(sql, call.caps(row_cap))
         .await
         .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
     let facts = facts.with_result(&result);
@@ -454,7 +454,7 @@ pub fn top_queries(call: Call, args: TopQueriesArgs) -> BoxFuture<'static, Outco
         facts.operation = Some("top_queries".to_owned());
         let result = call
             .engine()
-            .run_read(&sql, false, call.caps(args.row_cap))
+            .run_read(&sql, call.caps(args.row_cap))
             .await
             .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
         let facts = facts.with_result(&result);
@@ -493,6 +493,7 @@ pub fn routes() -> Result<Vec<Route>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     #[test]
     fn every_monitoring_statement_parses_as_one_select() {

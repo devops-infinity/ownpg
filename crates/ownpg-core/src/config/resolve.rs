@@ -6,8 +6,8 @@ use super::libpq::{self, LibpqLayer, PasswordFileOutcome};
 use super::profile::{ProfileEntry, ProfileFile};
 use super::{
     AppPaths, AuditSettings, ChannelBinding, ConnectionSettings, DEFAULT_AUDIT_MAX_BYTES,
-    DEFAULT_BYTE_CAP, DEFAULT_CONNECT_TIMEOUT, DEFAULT_HANDLE_EXPIRY, DEFAULT_LOCK_TIMEOUT,
-    DEFAULT_PORT, DEFAULT_ROW_CAP, DEFAULT_SCHEMA, DEFAULT_STATEMENT_TIMEOUT,
+    DEFAULT_BYTE_CAP, DEFAULT_CONNECT_TIMEOUT, DEFAULT_CURSOR_EXPIRY, DEFAULT_HANDLE_EXPIRY,
+    DEFAULT_LOCK_TIMEOUT, DEFAULT_PORT, DEFAULT_ROW_CAP, DEFAULT_SCHEMA, DEFAULT_STATEMENT_TIMEOUT,
     DEFAULT_TRANSACTION_TIMEOUT, LimitSettings, MAX_ROW_CAP, Mode, Origin, Resolved, Secret,
     Settings, SshSettings, SshTransport, SslMode, ToolGroup,
 };
@@ -452,6 +452,12 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
             seconds(profile.handle_expiry_seconds),
         )
         .or_preset(DEFAULT_HANDLE_EXPIRY),
+        cursor_expiry: Pick::new(
+            None,
+            seconds(env_u64(env, "OWNPG_CURSOR_EXPIRY")?),
+            seconds(profile.cursor_expiry_seconds),
+        )
+        .or_preset(DEFAULT_CURSOR_EXPIRY),
         row_cap: Pick::new(
             None,
             env_u64(env, "OWNPG_ROW_CAP")?.map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
@@ -477,6 +483,18 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
             setting: "handle_expiry_seconds".to_owned(),
             value: "0".to_owned(),
             detail: "a handle needs an expiry above zero".to_owned(),
+        });
+    }
+    if limits.cursor_expiry.value.is_zero()
+        || limits.cursor_expiry.value > limits.handle_expiry.value
+    {
+        return Err(Error::ConfigInvalid {
+            setting: "cursor_expiry_seconds".to_owned(),
+            value: limits.cursor_expiry.value.as_secs().to_string(),
+            detail: format!(
+                "a cursor expiry is above zero and at most the handle expiry ({} s), because the server-side idle timeout is derived from the handle expiry",
+                limits.handle_expiry.value.as_secs()
+            ),
         });
     }
 
@@ -722,7 +740,29 @@ mod tests {
         assert_eq!(settings.connection.sslmode.value, SslMode::Prefer);
         assert!(settings.connection.password.is_none());
         assert!(settings.audit.enabled.value);
+        assert_eq!(settings.limits.cursor_expiry.value.as_secs(), 30);
         assert_eq!(settings.loaded_groups(), Vec::new());
+    }
+
+    #[test]
+    fn a_cursor_expiry_past_the_handle_expiry_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tight = Environment::default()
+            .with_os_user("sharkar")
+            .with_var("OWNPG_CURSOR_EXPIRY", "90");
+        let error = resolve_with(
+            FlagLayer {
+                database: Some("app".to_owned()),
+                ..FlagLayer::default()
+            },
+            &tight,
+            sources(dir.path(), &tight),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("cursor_expiry_seconds"),
+            "{error}"
+        );
     }
 
     #[test]
