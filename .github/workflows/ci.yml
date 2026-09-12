@@ -232,11 +232,10 @@ jobs:
         with:
           tool: cargo-nextest@0.9.144,cargo-insta@1.48.0
 
-      - name: cargo nextest against the live server
-        run: cargo nextest run --workspace --locked --no-tests=warn --color=never
-
-      - name: every snapshot file belongs to a test
-        run: cargo insta test --workspace --locked --test-runner nextest --unreferenced=reject --color=never
+      - name: cargo nextest against the live server, rejecting unreferenced snapshots
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo insta test --workspace --all-features --test-runner nextest --unreferenced=reject --color=never
 
       - name: doctor against the official image
         env:
