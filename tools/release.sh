@@ -17,7 +17,7 @@ RELEASE_URL_BASE="https://github.com/devops-infinity/ownpg-releases/releases/tag
 REGISTRY_API="https://crates.io/api/v1/crates"
 USER_AGENT="ownpg-release-script (+https://github.com/devops-infinity/ownpg-releases)"
 MINISIGN_KEY="${OWNPG_MINISIGN_KEY:-$HOME/.minisign/minisign.key}"
-AUDIT_EXEMPT=" CLAUDE.md AGENTS.md constitution.md release.sh "
+AUDIT_EXEMPT=" release.sh "
 PROPAGATE_TRIES=30
 PROPAGATE_WAIT=10
 
@@ -278,7 +278,7 @@ check_registry_state() {
 }
 
 audit_files() {
-	git ls-files -- crates tools docs ':(top,glob)*.md' | grep -vE '^docs/planning/|^[0-9]{4}-.*\.md$' | sort -u
+	git ls-files -- crates tools ':(top,glob)*.md' | sort -u
 }
 
 collect_scannable_files() {
@@ -324,7 +324,7 @@ audit_scan() {
 }
 
 house_rule_audit() {
-	say INFO "auditing every tracked file under crates/, tools/, docs/, and the markdown files, apart from the planning pack and the decision records"
+	say INFO "auditing every tracked file under crates/ and tools/ plus the markdown files at the root"
 	say INFO "these carry the rule text itself and are exempt from it:$AUDIT_EXEMPT"
 	local hits
 	hits="$(audit_scan)"

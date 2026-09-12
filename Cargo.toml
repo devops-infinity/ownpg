@@ -10,7 +10,6 @@ license = "MIT OR Apache-2.0"
 authors = ["Md. Sazzad Hossain Sharkar <sazzad@devops.bd>"]
 repository = "https://github.com/devops-infinity/ownpg-releases"
 homepage = "https://github.com/devops-infinity/ownpg-releases"
-readme = "README.md"
 keywords = ["postgresql", "mcp", "database", "dba", "cli"]
 categories = ["command-line-utilities", "database"]
 
