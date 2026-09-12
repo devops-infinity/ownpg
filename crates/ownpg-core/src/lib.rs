@@ -2,6 +2,7 @@ pub mod audit;
 pub mod classify;
 pub mod config;
 pub mod connect;
+pub mod engine;
 pub mod error;
 pub mod shape;
 
