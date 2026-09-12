@@ -3,11 +3,11 @@ ARG OWNPG_BUILD_COMMIT=unknown
 ARG SOURCE_DATE_EPOCH=
 ENV OWNPG_BUILD_COMMIT=$OWNPG_BUILD_COMMIT \
     SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
+RUN cargo install --locked cargo-auditable@0.7.5 cargo-about@0.9.2
 WORKDIR /src
 COPY Cargo.toml Cargo.lock about.toml about.hbs LICENSE-MIT LICENSE-APACHE ./
 COPY crates ./crates
-RUN cargo install --locked cargo-auditable@0.7.5 cargo-about@0.9.2 \
-    && cargo auditable build --profile dist --locked -p ownpg \
+RUN cargo auditable build --profile dist --locked -p ownpg \
     && cargo about generate about.hbs -o THIRD-PARTY.txt \
     && install -m 0755 target/dist/ownpg /ownpg \
     && mkdir -p /doc \
