@@ -47,25 +47,21 @@ pub(crate) fn detect(global: &GlobalArgs) -> Result<Process> {
     Ok(Process { env, paths })
 }
 
-pub(crate) fn keychain_account(profile: &str) -> String {
-    format!("profile:{profile}")
+pub(crate) fn keychain_entry(account: &str) -> Result<keyring::Entry> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, account).map_err(|error| Error::ConfigInvalid {
+        setting: "keychain".to_owned(),
+        value: account.to_owned(),
+        detail: error.to_string(),
+    })
 }
 
-pub(crate) fn keychain_lookup(profile: &str) -> Result<Option<String>> {
-    let entry =
-        keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(profile)).map_err(|error| {
-            Error::ConfigInvalid {
-                setting: "password_keychain".to_owned(),
-                value: profile.to_owned(),
-                detail: error.to_string(),
-            }
-        })?;
-    match entry.get_password() {
-        Ok(password) => Ok(Some(password)),
+pub(crate) fn keychain_lookup(account: &str) -> Result<Option<String>> {
+    match keychain_entry(account)?.get_password() {
+        Ok(secret) => Ok(Some(secret)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(Error::ConfigInvalid {
-            setting: "password_keychain".to_owned(),
-            value: profile.to_owned(),
+            setting: "keychain".to_owned(),
+            value: account.to_owned(),
             detail: error.to_string(),
         }),
     }

@@ -223,6 +223,7 @@ fn config_path_and_init_write_under_the_config_directory() {
     show.args(["config", "show", "--profile", "local", "--format", "json"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("\"format_version\": 1"))
         .stdout(predicate::str::contains("\"name\": \"database\""))
         .stdout(predicate::str::contains("your-database"));
 
@@ -263,6 +264,15 @@ fn doctor_reports_the_live_connection_in_json_and_text() {
         .stdout
         .clone();
     let verdict: serde_json::Value = serde_json::from_slice(&output).expect("json report");
+    assert_eq!(verdict["format_version"], 1);
+    assert!(
+        verdict["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["name"] == "public_schema"),
+        "{verdict}"
+    );
     assert!(
         verdict["checks"]
             .as_array()
@@ -479,4 +489,74 @@ fn the_first_discover_answer_arrives_quickly() {
         elapsed < std::time::Duration::from_secs(3),
         "startup took {elapsed:?}"
     );
+}
+
+#[test]
+fn the_platform_keychain_holds_the_password_and_the_ssh_passphrase() {
+    if std::env::var("OWNPG_TEST_KEYCHAIN").is_err() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = dir.path().join("profiles.toml");
+    let profile = format!("kc-test-{}", std::process::id());
+    std::fs::write(
+        &profiles,
+        format!(
+            "format = 1\n\n[profiles.{profile}]\ndatabase = \"app\"\n\n[profiles.{profile}.ssh]\nhost = \"bastion.test\"\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&profiles, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let isolated = || {
+        let mut command = ownpg();
+        command.env("OWNPG_CONFIG", &profiles);
+        command
+    };
+
+    isolated()
+        .args(["config", "set-password", &profile])
+        .write_stdin("keychain-secret-1\n")
+        .assert()
+        .success();
+    isolated()
+        .args(["config", "show", "--profile", &profile])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("password = set (profile)"))
+        .stdout(predicate::str::contains("keychain-secret-1").not());
+    let stored = std::fs::read_to_string(&profiles).unwrap();
+    assert!(stored.contains("password_keychain = true"), "{stored}");
+    assert!(!stored.contains("keychain-secret-1"), "{stored}");
+
+    isolated()
+        .args(["config", "set-ssh-passphrase", &profile])
+        .write_stdin("phrase-secret-2\n")
+        .assert()
+        .success();
+    isolated()
+        .args(["config", "show", "--profile", &profile])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ssh.password = set (profile)"))
+        .stdout(predicate::str::contains("phrase-secret-2").not());
+    let stored = std::fs::read_to_string(&profiles).unwrap();
+    assert!(stored.contains("passphrase_keychain = true"), "{stored}");
+
+    isolated()
+        .args(["config", "unset-password", &profile])
+        .assert()
+        .success();
+    isolated()
+        .args(["config", "unset-ssh-passphrase", &profile])
+        .assert()
+        .success();
+    isolated()
+        .args(["config", "show", "--profile", &profile])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("password = set").not());
 }

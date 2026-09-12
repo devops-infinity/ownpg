@@ -39,8 +39,13 @@ pub(crate) struct Check {
     pub detail: String,
 }
 
+pub(crate) const FORMAT_VERSION: u32 = 1;
+
+const PUBLIC_CREATE_SQL: &str = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) a WHERE n.nspname = 'public' AND a.grantee = 0 AND a.privilege_type = 'CREATE')";
+
 #[derive(Debug, Serialize)]
 pub(crate) struct Verdict {
+    pub format_version: u32,
     pub version: &'static str,
     pub status: CheckStatus,
     pub checks: Vec<Check>,
@@ -318,6 +323,30 @@ async fn connected_checks(
             info.search_path.clone()
         },
     ));
+    checks.push(match engine.catalog_rows(PUBLIC_CREATE_SQL, &[]).await {
+        Ok(rows) => {
+            let open = rows
+                .first()
+                .and_then(|row| row.try_get::<_, bool>(0).ok())
+                .unwrap_or(false);
+            if open {
+                check(
+                    "public_schema",
+                    CheckStatus::Warning,
+                    false,
+                    "schema public grants CREATE to PUBLIC; run REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_owned(),
+                )
+            } else {
+                check(
+                    "public_schema",
+                    CheckStatus::Ok,
+                    false,
+                    "schema public grants no CREATE to PUBLIC".to_owned(),
+                )
+            }
+        }
+        Err(error) => check("public_schema", CheckStatus::Warning, false, error.to_string()),
+    });
     let audit_path = match audit_sink(settings) {
         Ok(sink) => {
             let path = sink.path().map(std::path::Path::to_path_buf);
@@ -390,6 +419,7 @@ async fn connected_checks(
 
 fn finish(checks: Vec<Check>, report: Option<DoctorReport>) -> Verdict {
     Verdict {
+        format_version: FORMAT_VERSION,
         version: ownpg_core::VERSION,
         status: Verdict::overall(&checks),
         checks,

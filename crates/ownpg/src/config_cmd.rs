@@ -2,11 +2,11 @@ use std::io::{IsTerminal, Read};
 
 use ownpg_core::config::describe::describe;
 use ownpg_core::config::profile::{ProfileFile, write_private};
-use ownpg_core::config::{Sources, resolve};
+use ownpg_core::config::{Sources, keychain_account, resolve, ssh_keychain_account};
 use ownpg_core::{Error, ExitClass, Result};
 
 use crate::cli::{ConfigCommand, GlobalArgs, OutputFormatArg};
-use crate::context::{self, KEYCHAIN_SERVICE, Process, keychain_account};
+use crate::context::{self, Process, keychain_entry};
 use crate::output::{emit, stdout_error};
 
 pub(crate) fn run(
@@ -32,7 +32,11 @@ pub(crate) fn run(
             let lines = describe(&settings);
             match format {
                 OutputFormatArg::Json => {
-                    let rendered = serde_json::to_string_pretty(&lines).map_err(|error| {
+                    let document = serde_json::json!({
+                        "format_version": crate::doctor::FORMAT_VERSION,
+                        "settings": lines,
+                    });
+                    let rendered = serde_json::to_string_pretty(&document).map_err(|error| {
                         Error::ProtocolFailed {
                             detail: format!("the settings could not be serialized: {error}"),
                         }
@@ -64,6 +68,8 @@ pub(crate) fn run(
         ConfigCommand::Init { force, dry_run } => init(process, *force, *dry_run),
         ConfigCommand::SetPassword { profile } => set_password(global, process, profile),
         ConfigCommand::UnsetPassword { profile } => unset_password(process, profile),
+        ConfigCommand::SetSshPassphrase { profile } => set_ssh_passphrase(global, process, profile),
+        ConfigCommand::UnsetSshPassphrase { profile } => unset_ssh_passphrase(process, profile),
         ConfigCommand::CacheClear => cache_clear(process),
     }
 }
@@ -134,16 +140,6 @@ fn read_password(global: &GlobalArgs, process: &Process) -> Result<String> {
     Ok(text.trim_end_matches(['\r', '\n']).to_owned())
 }
 
-fn keychain_entry(profile: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &keychain_account(profile)).map_err(|error| {
-        Error::ConfigInvalid {
-            setting: "password_keychain".to_owned(),
-            value: profile.to_owned(),
-            detail: error.to_string(),
-        }
-    })
-}
-
 fn set_password(global: &GlobalArgs, process: &Process, profile: &str) -> Result<ExitClass> {
     let mut file = load_profiles(process, profile)?;
     let password = read_password(global, process)?;
@@ -153,13 +149,7 @@ fn set_password(global: &GlobalArgs, process: &Process, profile: &str) -> Result
             detail: "an empty password was given".to_owned(),
         });
     }
-    keychain_entry(profile)?
-        .set_password(&password)
-        .map_err(|error| Error::ConfigInvalid {
-            setting: "password_keychain".to_owned(),
-            value: profile.to_owned(),
-            detail: error.to_string(),
-        })?;
+    store_secret(&keychain_account(profile), "password_keychain", &password)?;
     if let Some(entry) = file.profiles.get_mut(profile) {
         entry.password = None;
         entry.password_keychain = Some(true);
@@ -169,18 +159,81 @@ fn set_password(global: &GlobalArgs, process: &Process, profile: &str) -> Result
     Ok(ExitClass::Success)
 }
 
+fn store_secret(account: &str, setting: &str, secret: &str) -> Result<()> {
+    keychain_entry(account)?
+        .set_password(secret)
+        .map_err(|error| Error::ConfigInvalid {
+            setting: setting.to_owned(),
+            value: account.to_owned(),
+            detail: error.to_string(),
+        })
+}
+
+fn forget_secret(account: &str, setting: &str) -> Result<()> {
+    match keychain_entry(account)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(Error::ConfigInvalid {
+            setting: setting.to_owned(),
+            value: account.to_owned(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
+fn set_ssh_passphrase(global: &GlobalArgs, process: &Process, profile: &str) -> Result<ExitClass> {
+    let mut file = load_profiles(process, profile)?;
+    if file
+        .profiles
+        .get(profile)
+        .is_none_or(|entry| entry.ssh.is_none())
+    {
+        return Err(Error::ArgumentInvalid {
+            argument: "profile".to_owned(),
+            detail: format!("profile `{profile}` has no [profiles.{profile}.ssh] section"),
+        });
+    }
+    let passphrase = read_password(global, process)?;
+    if passphrase.is_empty() {
+        return Err(Error::ArgumentInvalid {
+            argument: "passphrase".to_owned(),
+            detail: "an empty passphrase was given".to_owned(),
+        });
+    }
+    store_secret(
+        &ssh_keychain_account(profile),
+        "passphrase_keychain",
+        &passphrase,
+    )?;
+    if let Some(ssh) = file
+        .profiles
+        .get_mut(profile)
+        .and_then(|entry| entry.ssh.as_mut())
+    {
+        ssh.passphrase_keychain = Some(true);
+    }
+    file.save(&process.paths.config_file)?;
+    tracing::info!(profile, "ssh passphrase stored in the platform keychain");
+    Ok(ExitClass::Success)
+}
+
+fn unset_ssh_passphrase(process: &Process, profile: &str) -> Result<ExitClass> {
+    let mut file = load_profiles(process, profile)?;
+    forget_secret(&ssh_keychain_account(profile), "passphrase_keychain")?;
+    if let Some(ssh) = file
+        .profiles
+        .get_mut(profile)
+        .and_then(|entry| entry.ssh.as_mut())
+    {
+        ssh.passphrase_keychain = None;
+    }
+    file.save(&process.paths.config_file)?;
+    tracing::info!(profile, "ssh passphrase removed from the platform keychain");
+    Ok(ExitClass::Success)
+}
+
 fn unset_password(process: &Process, profile: &str) -> Result<ExitClass> {
     let mut file = load_profiles(process, profile)?;
-    match keychain_entry(profile)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => {}
-        Err(error) => {
-            return Err(Error::ConfigInvalid {
-                setting: "password_keychain".to_owned(),
-                value: profile.to_owned(),
-                detail: error.to_string(),
-            });
-        }
-    }
+    forget_secret(&keychain_account(profile), "password_keychain")?;
     if let Some(entry) = file.profiles.get_mut(profile) {
         entry.password_keychain = None;
     }

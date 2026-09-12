@@ -144,7 +144,7 @@ async fn the_default_tool_list_is_the_seven_read_tools_in_registry_order() {
         info.instructions
             .as_ref()
             .unwrap()
-            .contains("Server features by version: merge=")
+            .contains("Server features by version: maintain_privilege=")
     );
     assert_eq!(rig.finish().await, ownpg_core::ExitClass::Success);
 }

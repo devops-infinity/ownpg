@@ -344,7 +344,8 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
         && profile.password_keychain == Some(true)
         && let (Some(name), Some(lookup)) = (&profile_name, sources.keychain)
     {
-        password = lookup(name)?.map(|value| Resolved::new(Secret::new(value), Origin::Profile));
+        password = lookup(&super::keychain_account(name))?
+            .map(|value| Resolved::new(Secret::new(value), Origin::Profile));
     }
     if password.is_none() {
         password = libpq_layer
@@ -503,7 +504,7 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
         env_bool(env, "OWNPG_STRICT_ROLE")?,
         profile.strict_role,
     )
-    .or_preset(false);
+    .or_preset(flags.http.enabled);
 
     let tools = Pick::new(
         flags.tools.clone(),
@@ -524,7 +525,13 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
         }
     }
 
-    let ssh = resolve_ssh(&flags, env, &profile)?;
+    let ssh = resolve_ssh(
+        &flags,
+        env,
+        &profile,
+        profile_name.as_deref(),
+        sources.keychain,
+    )?;
 
     let audit = AuditSettings {
         enabled: Pick::new(flags.audit, env_bool(env, "OWNPG_AUDIT")?, profile.audit)
@@ -605,6 +612,8 @@ fn resolve_ssh(
     flags: &FlagLayer,
     env: &Environment,
     profile: &ProfileEntry,
+    profile_name: Option<&str>,
+    keychain: Option<KeychainLookup<'_>>,
 ) -> Result<Option<SshSettings>> {
     let target = Pick::new(
         flags.ssh.as_deref().map(parse_ssh_target).transpose()?,
@@ -621,11 +630,18 @@ fn resolve_ssh(
     };
     let entry = profile.ssh.clone().unwrap_or_default();
     let origin = target.origin;
-    let password = entry
+    let mut password = entry
         .password_env
         .as_deref()
         .and_then(|variable| env.var(variable))
         .map(|value| Resolved::new(Secret::new(value.to_owned()), Origin::Profile));
+    if password.is_none()
+        && entry.passphrase_keychain == Some(true)
+        && let (Some(name), Some(lookup)) = (profile_name, keychain)
+    {
+        password = lookup(&super::ssh_keychain_account(name))?
+            .map(|value| Resolved::new(Secret::new(value), Origin::Profile));
+    }
     Ok(Some(SshSettings {
         host: Resolved::new(target.value.host, origin),
         port: target
@@ -740,13 +756,32 @@ mod tests {
         assert_eq!(settings.connection.sslmode.value, SslMode::Prefer);
         assert!(settings.connection.password.is_none());
         assert!(settings.audit.enabled.value);
+        assert!(!settings.strict_role.value);
         assert_eq!(settings.limits.cursor_expiry.value.as_secs(), 30);
         assert_eq!(settings.loaded_groups(), Vec::new());
     }
 
     #[test]
-    fn a_cursor_expiry_past_the_handle_expiry_is_refused() {
+    fn remote_mode_refuses_elevated_roles_unless_told_otherwise() {
         let dir = tempfile::tempdir().unwrap();
+        let env = Environment::default().with_os_user("sharkar");
+        let flags = FlagLayer {
+            database: Some("app".to_owned()),
+            http: crate::config::HttpFlags {
+                enabled: true,
+                bind: None,
+                auth: None,
+            },
+            ..FlagLayer::default()
+        };
+        let (settings, _) = resolve_with(flags.clone(), &env, sources(dir.path(), &env)).unwrap();
+        assert!(settings.strict_role.value);
+        assert_eq!(settings.strict_role.origin, Origin::Preset);
+        let relaxed = Environment::default()
+            .with_os_user("sharkar")
+            .with_var("OWNPG_STRICT_ROLE", "false");
+        let (settings, _) = resolve_with(flags, &relaxed, sources(dir.path(), &relaxed)).unwrap();
+        assert!(!settings.strict_role.value);
         let tight = Environment::default()
             .with_os_user("sharkar")
             .with_var("OWNPG_CURSOR_EXPIRY", "90");
@@ -959,8 +994,12 @@ mod tests {
                 .expose(),
             "from-env"
         );
-        let lookup = |name: &str| -> Result<Option<String>> {
-            Ok((name == "chain").then(|| "from-keychain".to_owned()))
+        let lookup = |account: &str| -> Result<Option<String>> {
+            Ok(match account {
+                "profile:chain" => Some("from-keychain".to_owned()),
+                "ssh:chain" => Some("key-phrase".to_owned()),
+                _ => None,
+            })
         };
         let flags = FlagLayer {
             profile: Some("chain".to_owned()),
@@ -970,7 +1009,7 @@ mod tests {
             flags,
             Sources {
                 env: &env,
-                paths,
+                paths: paths.clone(),
                 keychain: Some(&lookup),
             },
         )
@@ -985,6 +1024,30 @@ mod tests {
                 .expose(),
             "from-keychain"
         );
+        assert!(settings.ssh.is_none());
+        if let Some(entry) = file.profiles.get_mut("chain") {
+            entry.ssh = Some(super::super::profile::SshEntry {
+                host: "bastion".to_owned(),
+                passphrase_keychain: Some(true),
+                ..super::super::profile::SshEntry::default()
+            });
+        }
+        write_profiles(&paths, &file);
+        let flags = FlagLayer {
+            profile: Some("chain".to_owned()),
+            ..FlagLayer::default()
+        };
+        let (settings, _) = resolve(
+            flags,
+            Sources {
+                env: &env,
+                paths,
+                keychain: Some(&lookup),
+            },
+        )
+        .unwrap();
+        let ssh = settings.ssh.unwrap();
+        assert_eq!(ssh.password.as_ref().unwrap().value.expose(), "key-phrase");
     }
 
     #[test]

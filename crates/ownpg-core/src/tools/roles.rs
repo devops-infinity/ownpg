@@ -331,7 +331,7 @@ pub struct GrantArgs {
     pub transaction: String,
 }
 
-fn privilege_list(privileges: &[String]) -> Result<String> {
+fn privilege_list(privileges: &[String], maintain_available: bool) -> Result<String> {
     if privileges.is_empty() {
         return Err(Error::ArgumentInvalid {
             argument: "privileges".to_owned(),
@@ -367,6 +367,12 @@ fn privilege_list(privileges: &[String]) -> Result<String> {
                 detail: format!("`{privilege}` is not a privilege name"),
             });
         }
+        if upper == "MAINTAIN" && !maintain_available {
+            return Err(Error::ArgumentInvalid {
+                argument: "privileges".to_owned(),
+                detail: "MAINTAIN exists from PostgreSQL 17 on; this server is older".to_owned(),
+            });
+        }
         out.push(upper);
     }
     Ok(out.join(", "))
@@ -395,7 +401,10 @@ pub fn grant(call: Call, args: GrantArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let scoped = call.settings().schema.value.clone();
         let schema = quote_ident(&scoped);
-        let privileges = privilege_list(&args.privileges)?;
+        let privileges = privilege_list(
+            &args.privileges,
+            call.engine().features().maintain_privilege(),
+        )?;
         let roles = role_list(&args.roles)?;
         let named = |kind: &str| -> Result<String> {
             if args.names.is_empty() {
@@ -780,6 +789,7 @@ pub fn template_statements(template: Template, role: &str, schema: &str) -> Vec<
             statements.push(format!(
                 "ALTER ROLE {role} SET default_transaction_read_only = on"
             ));
+            statements.push(format!("ALTER ROLE {role} SET search_path = ''"));
             statements.push(format!("GRANT pg_read_all_stats TO {role}"));
         }
         Template::WriteOnly => {
@@ -986,10 +996,13 @@ mod tests {
     #[test]
     fn privilege_and_role_lists_are_validated() {
         assert_eq!(
-            privilege_list(&["select".to_owned(), "Insert".to_owned()]).unwrap(),
+            privilege_list(&["select".to_owned(), "Insert".to_owned()], false).unwrap(),
             "SELECT, INSERT"
         );
-        assert!(privilege_list(&["DROP".to_owned()]).is_err());
+        assert!(privilege_list(&["DROP".to_owned()], true).is_err());
+        assert!(privilege_list(&["maintain".to_owned()], true).is_ok());
+        let old = privilege_list(&["MAINTAIN".to_owned()], false).unwrap_err();
+        assert!(old.to_string().contains("PostgreSQL 17"), "{old}");
         assert_eq!(
             role_list(&["public".to_owned(), "app".to_owned()]).unwrap(),
             "PUBLIC, \"app\""
@@ -1000,7 +1013,12 @@ mod tests {
     #[test]
     fn the_read_only_template_matches_the_documented_grants() {
         let statements = template_statements(Template::ReadOnly, "reader", "app");
-        assert_eq!(statements.len(), 7);
+        assert_eq!(statements.len(), 8);
+        assert!(
+            statements
+                .iter()
+                .any(|s| s.ends_with("SET search_path = ''"))
+        );
         assert!(statements[0].contains("USAGE ON SCHEMA \"app\""));
         assert!(
             statements

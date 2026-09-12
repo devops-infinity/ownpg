@@ -198,7 +198,7 @@ pub(crate) struct ConnectionArgs {
 
     #[arg(
         long,
-        help = "Refuse to start on a superuser, rds_superuser, or BYPASSRLS role [env: OWNPG_STRICT_ROLE]"
+        help = "Refuse to start on a superuser, rds_superuser, or BYPASSRLS role; on by default with --http, off otherwise [env: OWNPG_STRICT_ROLE]"
     )]
     pub strict_role: bool,
 
@@ -336,6 +336,27 @@ pub(crate) enum ConfigCommand {
     )]
     UnsetPassword {
         #[arg(value_name = "PROFILE", help = "Profile whose password is removed")]
+        profile: String,
+    },
+
+    #[command(
+        name = "set-ssh-passphrase",
+        about = "Store a profile's SSH key passphrase in the platform keychain, read without echo"
+    )]
+    SetSshPassphrase {
+        #[arg(
+            value_name = "PROFILE",
+            help = "Profile whose ssh section uses the key"
+        )]
+        profile: String,
+    },
+
+    #[command(
+        name = "unset-ssh-passphrase",
+        about = "Remove a profile's SSH key passphrase from the platform keychain"
+    )]
+    UnsetSshPassphrase {
+        #[arg(value_name = "PROFILE", help = "Profile whose passphrase is removed")]
         profile: String,
     },
 

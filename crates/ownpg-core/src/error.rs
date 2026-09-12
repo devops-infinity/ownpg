@@ -232,6 +232,13 @@ pub enum Error {
     #[error("the extension `{name}` is not installed in this database")]
     ExtensionMissing { name: String },
 
+    #[error("the extension `{name}` is at version {installed}; this tool needs {needed} or newer")]
+    ExtensionOutdated {
+        name: String,
+        installed: String,
+        needed: String,
+    },
+
     #[error("the program `{name}` was not found on this host")]
     HostBinaryMissing { name: String },
 
@@ -277,6 +284,7 @@ impl Error {
             Self::ProtocolFailed { .. } => ErrorId::ProtocolFailed,
             Self::SqlFailed { .. } => ErrorId::SqlFailed,
             Self::ExtensionMissing { .. } => ErrorId::ExtensionMissing,
+            Self::ExtensionOutdated { .. } => ErrorId::ExtensionMissing,
             Self::HostBinaryMissing { .. } => ErrorId::HostBinaryMissing,
             Self::SubprocessFailed { .. } => ErrorId::SubprocessFailed,
             Self::ArgumentInvalid { .. } => ErrorId::ArgumentInvalid,
@@ -304,7 +312,8 @@ impl Error {
             | Self::HandleState { .. }
             | Self::ProtocolFailed { .. }
             | Self::SqlFailed { .. }
-            | Self::ExtensionMissing { .. } => ExitClass::Runtime,
+            | Self::ExtensionMissing { .. }
+            | Self::ExtensionOutdated { .. } => ExitClass::Runtime,
             Self::StatementUnparsable { .. }
             | Self::StatementMultiple { .. }
             | Self::StatementRefused { .. }
@@ -418,6 +427,9 @@ impl Error {
             }
             Self::ExtensionMissing { name } => {
                 format!("Run `CREATE EXTENSION {name}` as a role that may install extensions.")
+            }
+            Self::ExtensionOutdated { name, .. } => {
+                format!("Run `ALTER EXTENSION {name} UPDATE` as a role that may alter extensions.")
             }
             Self::HostBinaryMissing { name } => {
                 format!("Install the PostgreSQL client tools, or set `pg_bindir` to the directory that holds `{name}`.")

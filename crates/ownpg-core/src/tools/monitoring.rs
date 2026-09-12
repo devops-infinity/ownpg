@@ -233,20 +233,36 @@ pub struct BloatArgs {
 }
 
 async fn extension_schema(call: &Call, name: &str) -> Result<String> {
+    Ok(installed_extension(call, name).await?.0)
+}
+
+async fn installed_extension(call: &Call, name: &str) -> Result<(String, String)> {
     let rows = call
         .engine()
         .catalog_rows(
-            "SELECT n.nspname::text FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = $1",
+            "SELECT n.nspname::text, e.extversion::text FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = $1",
             &[&name],
         )
         .await?;
-    rows.first()
-        .map(|row| super::catalog::get::<String>(row, 0))
-        .transpose()?
-        .ok_or_else(|| Error::ExtensionMissing {
+    let Some(row) = rows.first() else {
+        return Err(Error::ExtensionMissing {
             name: name.to_owned(),
-        })
+        });
+    };
+    Ok((
+        super::catalog::get::<String>(row, 0)?,
+        super::catalog::get::<String>(row, 1)?,
+    ))
 }
+
+fn version_at_least(installed: &str, needed: (u32, u32)) -> bool {
+    let mut parts = installed.split('.').map(|part| part.parse::<u32>().ok());
+    let major = parts.next().flatten();
+    let minor = parts.next().flatten().unwrap_or(0);
+    major.is_some_and(|major| (major, minor) >= needed)
+}
+
+const STAT_STATEMENTS_NEEDED: &str = "1.8";
 
 fn exact_bloat_sql(extension_schema: &str, table: &crate::render::QualifiedName) -> String {
     let extension = crate::render::quote_ident(extension_schema);
@@ -433,7 +449,16 @@ pub struct TopQueriesArgs {
 
 pub fn top_queries(call: Call, args: TopQueriesArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
-        let extension_schema = extension_schema(&call, "pg_stat_statements").await?;
+        let (extension_schema, installed) =
+            installed_extension(&call, "pg_stat_statements").await?;
+        if !version_at_least(&installed, (1, 8)) {
+            return Err(Error::ExtensionOutdated {
+                name: "pg_stat_statements".to_owned(),
+                installed,
+                needed: STAT_STATEMENTS_NEEDED.to_owned(),
+            }
+            .into());
+        }
         let order = match args.order_by {
             TopQueriesOrder::TotalTime => "total_exec_time DESC",
             TopQueriesOrder::MeanTime => "mean_exec_time DESC",
@@ -494,6 +519,25 @@ pub fn routes() -> Result<Vec<Route>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn extension_versions_compare_as_major_minor_pairs() {
+        assert!(version_at_least("1.8", (1, 8)));
+        assert!(version_at_least("1.10", (1, 8)));
+        assert!(version_at_least("2.0", (1, 8)));
+        assert!(!version_at_least("1.7", (1, 8)));
+        assert!(!version_at_least("garbage", (1, 8)));
+        let error = Error::ExtensionOutdated {
+            name: "pg_stat_statements".to_owned(),
+            installed: "1.7".to_owned(),
+            needed: "1.8".to_owned(),
+        };
+        assert_eq!(error.id(), crate::error::ErrorId::ExtensionMissing);
+        assert!(
+            error
+                .remedy()
+                .contains("ALTER EXTENSION pg_stat_statements UPDATE")
+        );
+    }
 
     #[test]
     fn every_monitoring_statement_parses_as_one_select() {

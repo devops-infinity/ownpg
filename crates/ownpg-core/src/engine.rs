@@ -122,6 +122,11 @@ impl Features {
     }
 
     #[must_use]
+    pub const fn maintain_privilege(self) -> bool {
+        self.server_version_num >= 170_000
+    }
+
+    #[must_use]
     pub fn as_map(self) -> BTreeMap<&'static str, bool> {
         BTreeMap::from([
             ("pg_stat_io", self.stat_io()),
@@ -137,6 +142,7 @@ impl Features {
             ),
             ("nulls_not_distinct", self.nulls_not_distinct()),
             ("without_overlaps", self.without_overlaps()),
+            ("maintain_privilege", self.maintain_privilege()),
         ])
     }
 }
@@ -2262,12 +2268,14 @@ mod tests {
         assert!(seventeen.stat_io());
         assert!(seventeen.merge_returning());
         assert!(seventeen.transaction_timeout());
+        assert!(seventeen.maintain_privilege());
+        assert!(!fifteen.maintain_privilege());
         assert!(!seventeen.returning_old_new());
         let eighteen = Features::from_version(180_006);
         assert!(eighteen.returning_old_new());
         assert!(eighteen.not_enforced_constraints());
         assert!(eighteen.without_overlaps());
-        assert_eq!(eighteen.as_map().len(), 10);
+        assert_eq!(eighteen.as_map().len(), 11);
     }
 
     #[test]

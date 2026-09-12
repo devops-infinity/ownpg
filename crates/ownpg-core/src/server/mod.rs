@@ -380,11 +380,15 @@ impl Server {
         principal: &Principal,
     ) {
         let settings = self.context.settings();
+        let deprecated = self
+            .route(tool)
+            .is_some_and(|route| route.spec.deprecated.is_some())
+            .then(|| "deprecated".to_owned());
         let (facts, decision, rule, result) = match outcome {
             Ok(Reply::Output(output)) => (
                 &output.facts,
                 output.facts.decision.unwrap_or(Decision::Allowed),
-                None,
+                deprecated.clone(),
                 None,
             ),
             Ok(Reply::InputRequired(_)) => {
@@ -400,7 +404,7 @@ impl Server {
                     .facts()
                     .decision
                     .unwrap_or_else(|| failure.decision()),
-                failure.rule(),
+                failure.rule().or(deprecated),
                 Some(failure.outcome()),
             ),
         };

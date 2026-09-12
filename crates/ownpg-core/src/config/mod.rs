@@ -35,6 +35,16 @@ pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_HANDLE_EXPIRY: Duration = Duration::from_secs(60);
 pub const DEFAULT_CURSOR_EXPIRY: Duration = Duration::from_secs(30);
+
+#[must_use]
+pub fn keychain_account(profile: &str) -> String {
+    format!("profile:{profile}")
+}
+
+#[must_use]
+pub fn ssh_keychain_account(profile: &str) -> String {
+    format!("ssh:{profile}")
+}
 pub const DEFAULT_AUDIT_MAX_BYTES: u64 = 52_428_800;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

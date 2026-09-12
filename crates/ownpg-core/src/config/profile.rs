@@ -115,6 +115,8 @@ pub struct SshEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase_keychain: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_new_host: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<SshTransport>,

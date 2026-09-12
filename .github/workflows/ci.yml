@@ -353,6 +353,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked --color=never -- -D warnings
 
       - name: cargo nextest
+        env:
+          OWNPG_TEST_KEYCHAIN: "1"
         run: cargo nextest run --workspace --all-features --locked --no-tests=warn --color=never
 
       - name: cargo install from this checkout
