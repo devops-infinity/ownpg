@@ -995,7 +995,7 @@ expression: tools
   {
     "name": "pg_doctor",
     "title": "Report the connection and its settings",
-    "description": "Report how this server is connected and configured: the target and transport, TLS state, server version, connected role and its attributes, database, schema, access mode, loaded tool groups, effective limits, audit log path, open cursor handles, and the feature map for this server version. Secrets are never included.",
+    "description": "Report how this server is connected and configured: the target and transport, TLS state, server version, connected role and its attributes, database, schema, access mode, loaded tool groups, effective limits, audit log path, open cursor handles, the feature map for this server version, and the absolute path and version of each PostgreSQL host program (pg_dump, pg_dumpall, pg_restore, pg_basebackup, pg_upgrade) or that it was not found. Secrets are never included.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -1019,6 +1019,29 @@ expression: tools
             "target",
             "user",
             "outcome"
+          ],
+          "type": "object"
+        },
+        "HostProgram": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name"
           ],
           "type": "object"
         },
@@ -1064,6 +1087,12 @@ expression: tools
             "type": "boolean"
           },
           "type": "object"
+        },
+        "host_programs": {
+          "items": {
+            "$ref": "#/$defs/HostProgram"
+          },
+          "type": "array"
         },
         "loaded_groups": {
           "items": {
@@ -1155,6 +1184,7 @@ expression: tools
         "attempts",
         "open_cursors",
         "features",
+        "host_programs",
         "version"
       ],
       "type": "object"

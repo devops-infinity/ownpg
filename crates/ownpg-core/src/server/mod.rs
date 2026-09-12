@@ -162,6 +162,7 @@ impl Server {
             input_responses: round_trip.input_responses,
             elicitation: round_trip.elicitation,
             progress: round_trip.progress,
+            cancel: cancel.clone(),
         };
         let legacy_peer = round_trip.legacy_peer.clone();
         let mut work = std::pin::pin!((route.handler)(call));

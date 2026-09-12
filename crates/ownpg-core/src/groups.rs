@@ -22,6 +22,7 @@ pub struct ToolSpec {
     pub read_only: bool,
     pub destructive: bool,
     pub idempotent: bool,
+    pub program: Option<&'static str>,
 }
 
 impl ToolSpec {
@@ -45,10 +46,14 @@ impl ToolSpec {
         if !self.allowed_in(mode) {
             return false;
         }
-        match self.group {
+        let group_loaded = match self.group {
             None => true,
             Some(group) => settings.loaded_groups().contains(&group),
-        }
+        };
+        group_loaded
+            && self
+                .program
+                .is_none_or(|program| crate::tools::host::find_program(settings, program).is_some())
     }
 }
 
@@ -64,6 +69,7 @@ const fn read_tool(name: &'static str, title: &'static str, modes: &'static [Mod
         read_only: true,
         destructive: false,
         idempotent: true,
+        program: None,
     }
 }
 
@@ -83,6 +89,7 @@ const fn write_tool(
         read_only: false,
         destructive,
         idempotent,
+        program: None,
     }
 }
 
@@ -206,6 +213,7 @@ const fn monitoring_tool(name: &'static str, title: &'static str) -> ToolSpec {
         read_only: true,
         destructive: false,
         idempotent: true,
+        program: None,
     }
 }
 
@@ -223,6 +231,7 @@ pub const PG_VACUUM_NEEDS: ToolSpec = ToolSpec {
     read_only: true,
     destructive: false,
     idempotent: true,
+    program: None,
 };
 pub const PG_BACKEND: ToolSpec =
     maintenance_tool("pg_backend", "Cancel or terminate a backend", true);
@@ -238,6 +247,68 @@ pub const PG_BLOAT: ToolSpec = monitoring_tool("pg_bloat", "Estimate table and i
 pub const PG_SETTINGS: ToolSpec = monitoring_tool("pg_settings", "List server settings");
 pub const PG_TOP_QUERIES: ToolSpec =
     monitoring_tool("pg_top_queries", "List the most expensive statements");
+
+const fn host_tool(
+    name: &'static str,
+    title: &'static str,
+    program: &'static str,
+    modes: &'static [Mode],
+    read_only: bool,
+    destructive: bool,
+) -> ToolSpec {
+    ToolSpec {
+        name,
+        title,
+        group: Some(ToolGroup::Host),
+        modes,
+        scope: SCOPE_HOST,
+        read_only,
+        destructive,
+        idempotent: !destructive,
+        program: Some(program),
+    }
+}
+
+pub const PG_DUMP: ToolSpec = host_tool(
+    "pg_dump",
+    "Dump the scoped schema with pg_dump",
+    "pg_dump",
+    ALL_MODES,
+    true,
+    false,
+);
+pub const PG_DUMPALL_GLOBALS: ToolSpec = host_tool(
+    "pg_dumpall_globals",
+    "Dump roles and tablespaces with pg_dumpall",
+    "pg_dumpall",
+    ALL_MODES,
+    true,
+    false,
+);
+pub const PG_RESTORE: ToolSpec = host_tool(
+    "pg_restore",
+    "Restore an archive with pg_restore",
+    "pg_restore",
+    WRITE_MODES,
+    false,
+    true,
+);
+pub const PG_BASEBACKUP: ToolSpec = host_tool(
+    "pg_basebackup",
+    "Take a base backup with pg_basebackup",
+    "pg_basebackup",
+    ALL_MODES,
+    true,
+    false,
+);
+pub const PG_UPGRADE_CHECK: ToolSpec = host_tool(
+    "pg_upgrade_check",
+    "Check an upgrade with pg_upgrade --check",
+    "pg_upgrade",
+    ALL_MODES,
+    true,
+    false,
+);
 
 pub const TOOLS: &[ToolSpec] = &[
     PG_LIST_OBJECTS,
@@ -283,6 +354,11 @@ pub const TOOLS: &[ToolSpec] = &[
     PG_BLOAT,
     PG_SETTINGS,
     PG_TOP_QUERIES,
+    PG_DUMP,
+    PG_DUMPALL_GLOBALS,
+    PG_RESTORE,
+    PG_BASEBACKUP,
+    PG_UPGRADE_CHECK,
 ];
 
 #[must_use]

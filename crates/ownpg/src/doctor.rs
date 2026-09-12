@@ -350,6 +350,30 @@ async fn connected_checks(
                 false,
                 report.tools.join(", "),
             ));
+            for program in &report.host_programs {
+                let name: &'static str = ownpg_core::tools::host::PROGRAMS
+                    .iter()
+                    .copied()
+                    .find(|known| *known == program.name)
+                    .unwrap_or("host_program");
+                checks.push(match (&program.path, &program.version) {
+                    (Some(path), Some(version)) => {
+                        check(name, CheckStatus::Ok, false, format!("{path} ({version})"))
+                    }
+                    (Some(path), None) => check(
+                        name,
+                        CheckStatus::Warning,
+                        false,
+                        format!("{path} (the version could not be read)"),
+                    ),
+                    (None, _) => check(
+                        name,
+                        CheckStatus::Warning,
+                        false,
+                        "not found through pg_bindir or an absolute PATH entry".to_owned(),
+                    ),
+                });
+            }
             Some(report)
         }
         Err(error) => {

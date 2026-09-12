@@ -140,6 +140,7 @@ impl Server {
             input_responses: None,
             elicitation: false,
             progress: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 

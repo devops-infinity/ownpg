@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod confirm;
 pub mod ddl;
 pub mod health;
+pub mod host;
 pub mod maintenance;
 pub mod monitoring;
 pub mod objects;
@@ -64,6 +65,7 @@ pub struct Call {
     pub input_responses: Option<InputResponses>,
     pub elicitation: bool,
     pub progress: Option<Progress>,
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 impl Call {
@@ -345,6 +347,7 @@ pub fn all_routes() -> Result<Vec<Route>, Error> {
     routes.extend(ddl::routes()?);
     routes.extend(roles::routes()?);
     routes.extend(maintenance::routes()?);
+    routes.extend(host::routes()?);
     routes.extend(monitoring::routes()?);
     Ok(routes)
 }

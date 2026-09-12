@@ -15,7 +15,7 @@ use crate::shape::UNTRUSTED_NOTICE;
 
 const HEALTH_DESCRIPTION: &str = "Summarize the health of the connected server and database: connection use against max_connections, the buffer cache hit ratio, the transaction ID age of the database against autovacuum_freeze_max_age, the longest running transaction, sessions idle in a transaction, invalid and unused indexes in the scoped schema, estimated bloat in the scoped schema, replication lag and inactive slots, and the database size. Each check carries a status of ok, warning, or critical with the measured value and a short explanation. Checks are listed in that fixed order.";
 
-const DOCTOR_DESCRIPTION: &str = "Report how this server is connected and configured: the target and transport, TLS state, server version, connected role and its attributes, database, schema, access mode, loaded tool groups, effective limits, audit log path, open cursor handles, and the feature map for this server version. Secrets are never included.";
+const DOCTOR_DESCRIPTION: &str = "Report how this server is connected and configured: the target and transport, TLS state, server version, connected role and its attributes, database, schema, access mode, loaded tool groups, effective limits, audit log path, open cursor handles, the feature map for this server version, and the absolute path and version of each PostgreSQL host program (pg_dump, pg_dumpall, pg_restore, pg_basebackup, pg_upgrade) or that it was not found. Secrets are never included.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -445,6 +445,7 @@ pub struct DoctorReport {
     pub audit_path: Option<String>,
     pub open_cursors: usize,
     pub features: BTreeMap<String, bool>,
+    pub host_programs: Vec<super::host::HostProgram>,
     pub version: String,
 }
 
@@ -528,6 +529,7 @@ pub async fn doctor_report(
             .into_iter()
             .map(|(name, enabled)| (name.to_owned(), enabled))
             .collect(),
+        host_programs: super::host::program_report(settings).await,
         version: crate::VERSION.to_owned(),
     })
 }
@@ -608,6 +610,20 @@ pub fn render_doctor(report: &DoctorReport) -> String {
         .map(|(name, enabled)| format!("{name}={enabled}"))
         .collect();
     text.push_str(&format!("features: {}\n", features.join(", ")));
+    for program in &report.host_programs {
+        match (&program.path, &program.version) {
+            (Some(path), Some(version)) => {
+                text.push_str(&format!("{}: {path} ({version})\n", program.name));
+            }
+            (Some(path), None) => {
+                text.push_str(&format!(
+                    "{}: {path} (the version could not be read)\n",
+                    program.name
+                ));
+            }
+            (None, _) => text.push_str(&format!("{}: not found\n", program.name)),
+        }
+    }
     text
 }
 

@@ -76,6 +76,8 @@ impl Via {
 pub struct SessionInfo {
     pub target: String,
     pub via: Via,
+    pub endpoint: Option<Endpoint>,
+    pub user: String,
     pub tls: Option<TlsPlan>,
     pub tls_used: Option<bool>,
     pub server_version: String,
@@ -418,8 +420,16 @@ impl Connector {
         } else {
             Via::Tcp
         };
-        self.finish(client, driver, tls, candidate.endpoint.to_string(), via)
-            .await
+        self.finish(
+            client,
+            driver,
+            tls,
+            candidate.endpoint.to_string(),
+            via,
+            Some(candidate.endpoint.clone()),
+            candidate.user.clone(),
+        )
+        .await
     }
 
     async fn connect_through_ssh(&self, ssh: &crate::config::SshSettings) -> Result<Session> {
@@ -492,12 +502,20 @@ impl Connector {
                 tracing::warn!(%error, "the database connection ended");
             }
         });
-        self.finish(client, driver, &tls, target_name.to_owned(), via)
-            .await
-            .map_err(|error| Error::ConnectFailed {
-                tried: vec![format!("{target_name} as {}", candidate.user)],
-                source: error,
-            })
+        self.finish(
+            client,
+            driver,
+            &tls,
+            target_name.to_owned(),
+            via,
+            None,
+            candidate.user.clone(),
+        )
+        .await
+        .map_err(|error| Error::ConnectFailed {
+            tried: vec![format!("{target_name} as {}", candidate.user)],
+            source: error,
+        })
     }
 
     async fn finish(
@@ -507,6 +525,8 @@ impl Connector {
         tls: &Arc<Tls>,
         target: String,
         via: Via,
+        endpoint: Option<Endpoint>,
+        user: String,
     ) -> std::result::Result<Session, Box<dyn std::error::Error + Send + Sync>> {
         let pooled = self.settings.connection.pooled.value == Some(true);
         let schema = self.settings.schema.value.clone();
@@ -552,6 +572,8 @@ impl Connector {
             info: SessionInfo {
                 target,
                 via,
+                endpoint,
+                user,
                 tls: (via != Via::Socket).then_some(tls.plan),
                 tls_used,
                 server_version,
@@ -747,6 +769,8 @@ mod tests {
             SessionInfo {
                 target: "db:5432".to_owned(),
                 via,
+                endpoint: None,
+                user: String::new(),
                 tls: (via != Via::Socket).then_some(TlsPlan {
                     driver_mode: mode,
                     verification,
