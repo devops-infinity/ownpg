@@ -229,6 +229,12 @@ async fn maintenance_tools_vacuum_analyze_reindex_and_refresh_with_progress() {
 
     let bloat = rig.ok("pg_bloat", json!({})).await;
     assert!(bloat["row_count"].as_u64().unwrap() >= 1);
+    let exact = rig.call("pg_bloat", json!({"exact_table": "events"})).await;
+    let body = exact.structured_content.unwrap();
+    assert!(
+        body["code"] == "extension.missing" || body["row_count"].as_u64().unwrap() >= 1,
+        "{body}"
+    );
 
     let activity = rig.ok("pg_activity", json!({"include_idle": true})).await;
     assert!(activity["columns"].as_array().unwrap().len() >= 10);

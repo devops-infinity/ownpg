@@ -914,7 +914,7 @@ expression: tools
   {
     "name": "pg_health",
     "title": "Summarize server health",
-    "description": "Summarize the health of the connected server and database: connection use against max_connections, the buffer cache hit ratio, the transaction ID age of the database against autovacuum_freeze_max_age, the longest running transaction, sessions idle in a transaction, invalid indexes in the scoped schema, and the database size. Each check carries a status of ok, warning, or critical with the measured value and a short explanation.",
+    "description": "Summarize the health of the connected server and database: connection use against max_connections, the buffer cache hit ratio, the transaction ID age of the database against autovacuum_freeze_max_age, the longest running transaction, sessions idle in a transaction, invalid and unused indexes in the scoped schema, estimated bloat in the scoped schema, replication lag and inactive slots, and the database size. Each check carries a status of ok, warning, or critical with the measured value and a short explanation. Checks are listed in that fixed order.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,

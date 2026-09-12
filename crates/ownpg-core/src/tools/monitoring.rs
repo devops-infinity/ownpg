@@ -19,7 +19,7 @@ const WAL_DESCRIPTION: &str = "Report WAL and checkpoint activity: the current W
 
 const INDEXES_HEALTH_DESCRIPTION: &str = "Find indexes in the scoped schema that need attention: invalid ones left by a failed concurrent build, duplicates that cover the same columns as another index on the same table, and unused ones with zero scans since the statistics reset that are neither unique nor a primary key. Each row names the problem, the table, the index, and its size. Sorted by problem, then size largest first, then index name.";
 
-const BLOAT_DESCRIPTION: &str = "Estimate table and B-tree index bloat in the scoped schema from pg_class and pg_stats without scanning the data. is_na marks rows the estimator cannot judge (no statistics or unsupported types); install pgstattuple and query it for exact numbers on a table that matters. Sorted by wasted bytes, largest first, then name.";
+const BLOAT_DESCRIPTION: &str = "Estimate table and B-tree index bloat in the scoped schema from pg_class and pg_stats without scanning the data. is_na marks rows the estimator cannot judge (no statistics or unsupported types). Name exact_table to scan one table and its B-tree indexes with pgstattuple for exact numbers; that needs the extension installed and fails with extension.missing otherwise. Sorted by wasted bytes, largest first, then name.";
 
 const SETTINGS_DESCRIPTION: &str = "List server settings from pg_settings with value, unit, source, and whether a restart is pending. pattern filters names with LIKE; changed_only keeps settings that differ from their default. Sorted by name.";
 
@@ -180,7 +180,7 @@ pub fn wal(call: Call, _args: WalArgs) -> BoxFuture<'static, Outcome> {
 #[serde(deny_unknown_fields)]
 pub struct IndexesHealthArgs {}
 
-fn indexes_health_sql(schema: &str) -> String {
+pub(crate) fn indexes_health_sql(schema: &str) -> String {
     let scoped = quote_literal(schema);
     format!(
         "SELECT * FROM ( \
@@ -222,12 +222,54 @@ pub fn indexes_health(call: Call, _args: IndexesHealthArgs) -> BoxFuture<'static
 pub struct BloatArgs {
     #[serde(default)]
     #[schemars(
+        description = "A table in the scoped schema to measure exactly with pgstattuple, which scans the table and its B-tree indexes; empty runs the estimator over the whole schema."
+    )]
+    pub exact_table: String,
+    #[serde(default)]
+    #[schemars(
         description = "Rows per page. 0 uses the configured default (100). The maximum is 1000."
     )]
     pub row_cap: u32,
 }
 
-fn bloat_sql(schema: &str) -> String {
+async fn extension_schema(call: &Call, name: &str) -> Result<String> {
+    let rows = call
+        .engine()
+        .catalog_rows(
+            "SELECT n.nspname::text FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = $1",
+            &[&name],
+        )
+        .await?;
+    rows.first()
+        .map(|row| super::catalog::get::<String>(row, 0))
+        .transpose()?
+        .ok_or_else(|| Error::ExtensionMissing {
+            name: name.to_owned(),
+        })
+}
+
+fn exact_bloat_sql(extension_schema: &str, table: &crate::render::QualifiedName) -> String {
+    let extension = crate::render::quote_ident(extension_schema);
+    let relation = quote_literal(&table.sql());
+    let name = quote_literal(&table.name);
+    format!(
+        "SELECT * FROM ( \
+             SELECT 'table' AS kind, {name}::text AS name, table_len::int8 AS real_bytes, (dead_tuple_len + free_space)::int8 AS wasted_bytes, \
+             round((dead_tuple_percent + free_percent)::numeric, 1) AS wasted_percent, false AS is_na \
+             FROM {extension}.pgstattuple({relation}::regclass) \
+             UNION ALL \
+             SELECT 'index', i.relname::text, s.index_size::int8, \
+             (s.leaf_pages * pg_catalog.current_setting('block_size')::int8 * (100 - s.avg_leaf_density) / 100)::int8, \
+             round((100 - s.avg_leaf_density)::numeric, 1), false \
+             FROM pg_catalog.pg_index x JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid \
+             JOIN pg_catalog.pg_am am ON am.oid = i.relam \
+             CROSS JOIN LATERAL {extension}.pgstatindex(i.oid::regclass) AS s \
+             WHERE x.indrelid = {relation}::regclass AND am.amname = 'btree' AND x.indisvalid \
+             ) AS bloat ORDER BY wasted_bytes DESC, name"
+    )
+}
+
+pub(crate) fn bloat_sql(schema: &str) -> String {
     let scoped = quote_literal(schema);
     format!(
         "SELECT * FROM ( \
@@ -314,7 +356,13 @@ fn bloat_sql(schema: &str) -> String {
 
 pub fn bloat(call: Call, args: BloatArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
-        let sql = bloat_sql(&call.settings().schema.value);
+        if args.exact_table.trim().is_empty() {
+            let sql = bloat_sql(&call.settings().schema.value);
+            return run_catalog(&call, "bloat", &sql, args.row_cap).await;
+        }
+        let table = super::ddl::scoped_name(&call, "exact_table", &args.exact_table)?;
+        let extension = extension_schema(&call, "pgstattuple").await?;
+        let sql = exact_bloat_sql(&extension, &table);
         run_catalog(&call, "bloat", &sql, args.row_cap).await
     })
 }
@@ -385,23 +433,7 @@ pub struct TopQueriesArgs {
 
 pub fn top_queries(call: Call, args: TopQueriesArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
-        let installed = call
-            .engine()
-            .catalog_rows(
-                "SELECT n.nspname::text FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pg_stat_statements'",
-                &[],
-            )
-            .await?;
-        let Some(extension_schema) = installed
-            .first()
-            .map(|row| super::catalog::get::<String>(row, 0))
-            .transpose()?
-        else {
-            return Err(Error::ExtensionMissing {
-                name: "pg_stat_statements".to_owned(),
-            }
-            .into());
-        };
+        let extension_schema = extension_schema(&call, "pg_stat_statements").await?;
         let order = match args.order_by {
             TopQueriesOrder::TotalTime => "total_exec_time DESC",
             TopQueriesOrder::MeanTime => "mean_exec_time DESC",

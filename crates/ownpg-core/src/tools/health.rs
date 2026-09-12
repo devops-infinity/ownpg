@@ -5,6 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::catalog;
+use super::monitoring;
 use super::{AuditFacts, Call, Outcome, Route, ToolOutput, route};
 use crate::config::describe::{SettingLine, describe};
 use crate::engine::Engine;
@@ -12,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::groups;
 use crate::shape::UNTRUSTED_NOTICE;
 
-const HEALTH_DESCRIPTION: &str = "Summarize the health of the connected server and database: connection use against max_connections, the buffer cache hit ratio, the transaction ID age of the database against autovacuum_freeze_max_age, the longest running transaction, sessions idle in a transaction, invalid indexes in the scoped schema, and the database size. Each check carries a status of ok, warning, or critical with the measured value and a short explanation.";
+const HEALTH_DESCRIPTION: &str = "Summarize the health of the connected server and database: connection use against max_connections, the buffer cache hit ratio, the transaction ID age of the database against autovacuum_freeze_max_age, the longest running transaction, sessions idle in a transaction, invalid and unused indexes in the scoped schema, estimated bloat in the scoped schema, replication lag and inactive slots, and the database size. Each check carries a status of ok, warning, or critical with the measured value and a short explanation. Checks are listed in that fixed order.";
 
 const DOCTOR_DESCRIPTION: &str = "Report how this server is connected and configured: the target and transport, TLS state, server version, connected role and its attributes, database, schema, access mode, loaded tool groups, effective limits, audit log path, open cursor handles, and the feature map for this server version. Secrets are never included.";
 
@@ -226,6 +227,134 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
             detail: format!(
                 "indexes in schema {scoped} left invalid by a failed concurrent build; reindex or drop them"
             ),
+        });
+    }
+
+    let rows = engine
+        .catalog_rows(
+            &format!(
+                "SELECT count(*)::int8, COALESCE(sum(size_bytes), 0)::int8 FROM ({}) AS findings WHERE problem = 'unused'",
+                monitoring::indexes_health_sql(&scoped)
+            ),
+            &[],
+        )
+        .await?;
+    if let Some(row) = rows.first() {
+        let unused: i64 = catalog::get(row, 0)?;
+        let bytes: i64 = catalog::get(row, 1)?;
+        checks.push(Check {
+            name: "unused_indexes".to_owned(),
+            status: if unused > 0 && bytes >= 64 * 1024 * 1024 {
+                Status::Warning
+            } else {
+                Status::Ok
+            },
+            value: format!("{unused} using {bytes} bytes"),
+            detail: format!(
+                "indexes in schema {scoped} with zero scans since the statistics reset that are neither unique nor a primary key; pg_indexes_health lists them"
+            ),
+        });
+    }
+
+    let rows = engine
+        .catalog_rows(
+            &format!(
+                "SELECT COALESCE(sum(wasted_bytes), 0)::int8, COALESCE(sum(real_bytes), 0)::int8, COALESCE(bool_or(is_na), false) FROM ({}) AS bloat",
+                monitoring::bloat_sql(&scoped)
+            ),
+            &[],
+        )
+        .await?;
+    if let Some(row) = rows.first() {
+        let wasted: i64 = catalog::get(row, 0)?;
+        let real: i64 = catalog::get(row, 1)?;
+        let uncertain: bool = catalog::get(row, 2)?;
+        let ratio = if real == 0 {
+            0.0
+        } else {
+            wasted as f64 / real as f64
+        };
+        let status = if ratio >= 0.50 && wasted >= 1024 * 1024 * 1024 {
+            Status::Critical
+        } else if ratio >= 0.20 && wasted >= 64 * 1024 * 1024 {
+            Status::Warning
+        } else {
+            Status::Ok
+        };
+        checks.push(Check {
+            name: "bloat".to_owned(),
+            status,
+            value: format!("{wasted} of {real} bytes"),
+            detail: format!(
+                "estimated wasted space across tables and B-tree indexes in schema {scoped} from pg_class and pg_stats{}; pg_bloat lists each relation",
+                if uncertain {
+                    " (some relations could not be estimated)"
+                } else {
+                    ""
+                }
+            ),
+        });
+    }
+
+    let rows = engine
+        .catalog_rows(
+            "SELECT pg_catalog.pg_is_in_recovery(), \
+             (CASE WHEN pg_catalog.pg_is_in_recovery() THEN COALESCE(pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_last_wal_receive_lsn(), pg_catalog.pg_last_wal_replay_lsn()), 0) ELSE 0 END)::int8, \
+             (CASE WHEN pg_catalog.pg_is_in_recovery() THEN COALESCE(EXTRACT(EPOCH FROM pg_catalog.now() - pg_catalog.pg_last_xact_replay_timestamp()), 0) ELSE 0 END)::float8, \
+             (SELECT count(*) FROM pg_catalog.pg_stat_replication)::int8, \
+             (SELECT COALESCE(max(pg_catalog.pg_wal_lsn_diff(sent_lsn, replay_lsn)), 0) FROM pg_catalog.pg_stat_replication)::int8, \
+             (SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE NOT active)::int8, \
+             (SELECT COALESCE(max(CASE WHEN pg_catalog.pg_is_in_recovery() THEN 0 ELSE pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_current_wal_lsn(), restart_lsn) END), 0) \
+              FROM pg_catalog.pg_replication_slots WHERE NOT active)::int8",
+            &[],
+        )
+        .await?;
+    if let Some(row) = rows.first() {
+        let in_recovery: bool = catalog::get(row, 0)?;
+        let replay_lag: i64 = catalog::get(row, 1)?;
+        let replay_age: f64 = catalog::get(row, 2)?;
+        let standbys: i64 = catalog::get(row, 3)?;
+        let standby_lag: i64 = catalog::get(row, 4)?;
+        let inactive_slots: i64 = catalog::get(row, 5)?;
+        let retained: i64 = catalog::get(row, 6)?;
+        const WARN_BYTES: i64 = 64 * 1024 * 1024;
+        const CRITICAL_BYTES: i64 = 1024 * 1024 * 1024;
+        let (status, value, detail) = if in_recovery {
+            let status = if replay_lag >= CRITICAL_BYTES || replay_age >= 300.0 {
+                Status::Critical
+            } else if replay_lag >= WARN_BYTES || replay_age >= 60.0 {
+                Status::Warning
+            } else {
+                Status::Ok
+            };
+            (
+                status,
+                format!("standby, {replay_lag} bytes behind"),
+                format!(
+                    "this server is a standby; {replay_lag} bytes received but not replayed, last replayed transaction {replay_age:.0} s ago"
+                ),
+            )
+        } else {
+            let status = if standby_lag >= CRITICAL_BYTES || retained >= CRITICAL_BYTES {
+                Status::Critical
+            } else if inactive_slots > 0 || standby_lag >= WARN_BYTES {
+                Status::Warning
+            } else {
+                Status::Ok
+            };
+            (
+                status,
+                format!("primary, {standbys} standbys"),
+                format!(
+                    "{standbys} connected standbys with at most {standby_lag} bytes sent but not replayed; {inactive_slots} inactive replication slots holding {retained} bytes of WAL; pg_replication lists each one"
+                ),
+            )
+        };
+        checks.push(Check {
+            name: "replication".to_owned(),
+            status,
+            value,
+            detail,
         });
     }
 

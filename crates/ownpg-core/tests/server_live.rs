@@ -540,6 +540,9 @@ async fn health_and_doctor_report_without_secrets() {
             "longest_transaction",
             "idle_in_transaction",
             "invalid_indexes",
+            "unused_indexes",
+            "bloat",
+            "replication",
             "database_size"
         ]
     );
