@@ -64,7 +64,9 @@ devops-infinity/ownpg-releases repository the installer scripts, the Homebrew
 formula, the npm package, and cargo-binstall actually resolve against.
 
 Environment:
-  OWNPG_MINISIGN_KEY   the minisign secret key (default ~/.minisign/minisign.key)
+  OWNPG_MINISIGN_KEY        the minisign secret key (default ~/.minisign/minisign.key)
+  OWNPG_CODESIGN_IDENTITY   Developer ID Application identity for the macOS binaries
+  OWNPG_NOTARY_PROFILE      notarytool keychain profile; unset skips signing with a warning
 USAGE
 }
 
@@ -609,9 +611,38 @@ build_dist_artifacts() {
 				die "that did not match $VERSION; crates.io and the tag are already live, finish the binaries by hand when ready"
 		fi
 	fi
+	sign_macos_binaries "${built[@]}"
 	build_mcpb_bundles "${built[@]}"
 	run "dist build --artifacts=global" dist build --tag="v$VERSION" --artifacts=global --no-local-paths
 	cp -- "$ATTRIBUTION" target/distrib/ || die "could not place $ATTRIBUTION next to the archives"
+}
+
+sign_macos_binaries() {
+	local identity="${OWNPG_CODESIGN_IDENTITY:-}" profile="${OWNPG_NOTARY_PROFILE:-}"
+	if [[ -z "$identity" || -z "$profile" ]]; then
+		say WARNING "OWNPG_CODESIGN_IDENTITY or OWNPG_NOTARY_PROFILE is unset; the macOS binaries ship unsigned and Gatekeeper will warn on first run"
+		return 0
+	fi
+	[[ "$(uname -s)" == "Darwin" ]] || die "macOS signing needs codesign and notarytool, which only exist on macOS"
+	require_tools codesign xcrun ditto
+	local target archive stage zip
+	for target in "$@"; do
+		[[ "$target" == *-apple-darwin ]] || continue
+		archive="target/distrib/$BIN_CRATE-$target.tar.gz"
+		[[ -f "$archive" ]] || die "$archive is missing; dist did not produce the macOS archive for $target"
+		stage="$WORK/sign-$target"
+		rm -rf -- "$stage"
+		mkdir -p -- "$stage"
+		tar -xzf "$archive" -C "$stage" || die "could not unpack $archive"
+		run "codesign ($target)" codesign --sign "$identity" --timestamp --options=runtime --force "$stage/$BIN_CRATE-$target/$BIN_CRATE"
+		run "codesign --verify ($target)" codesign --verify --strict --verbose=2 "$stage/$BIN_CRATE-$target/$BIN_CRATE"
+		zip="$WORK/$BIN_CRATE-$target.zip"
+		rm -f -- "$zip"
+		run "ditto ($target)" ditto -c -k --keepParent "$stage/$BIN_CRATE-$target/$BIN_CRATE" "$zip"
+		run "notarytool submit ($target)" xcrun notarytool submit "$zip" --keychain-profile "$profile" --wait
+		tar -czf "$archive" -C "$stage" "$BIN_CRATE-$target" || die "could not repack $archive after signing"
+		say SUCCESS "signed and notarized $target"
+	done
 }
 
 mcpb_platform() {
