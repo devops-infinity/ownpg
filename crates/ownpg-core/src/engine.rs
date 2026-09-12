@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::TryStreamExt;
 use tokio::sync::Mutex;
 use tokio_postgres::SimpleQueryMessage;
 use tokio_postgres::types::ToSql;
@@ -100,6 +101,7 @@ pub struct Engine {
     settings: Arc<Settings>,
     connector: Connector,
     primary: Mutex<Primary>,
+    cancel: std::sync::Mutex<tokio_postgres::CancelToken>,
     role: tokio::sync::OnceCell<RoleProfile>,
     features: Features,
 }
@@ -123,9 +125,11 @@ impl Engine {
         let connector = Connector::new(Arc::clone(&settings)).with_ssh_hints(hints);
         let session = connector.connect().await?;
         let features = Features::from_version(session.info.server_version_num);
+        let cancel = std::sync::Mutex::new(session.cancel.clone());
         let engine = Self {
             settings,
             connector,
+            cancel,
             primary: Mutex::new(Primary {
                 session,
                 in_transaction: false,
@@ -169,10 +173,13 @@ impl Engine {
     }
 
     pub async fn cancel_running_statement(&self) -> Result<()> {
-        let cancel = {
-            let primary = self.primary.lock().await;
-            primary.session.cancel.clone()
-        };
+        let cancel = self
+            .cancel
+            .lock()
+            .map_err(|_| Error::ProtocolFailed {
+                detail: "the cancel token lock is poisoned".to_owned(),
+            })?
+            .clone();
         let tls = crate::connect::tls::build(&self.settings.connection, "cancel")?;
         cancel
             .cancel_query(tls.connector)
@@ -284,19 +291,31 @@ impl Engine {
         }
     }
 
-    pub async fn catalog_rows(
-        &self,
-        sql: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Vec<tokio_postgres::Row>> {
-        let mut primary = self.primary.lock().await;
-        self.ensure_alive(&mut primary).await?;
-        primary
-            .session
-            .client
-            .query(sql, params)
-            .await
-            .map_err(|error| describe_sqlstate(&error))
+    pub fn catalog_rows<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [&'a (dyn ToSql + Sync)],
+    ) -> futures_util::future::BoxFuture<'a, Result<Vec<tokio_postgres::Row>>> {
+        Box::pin(async move {
+            let mut primary = self.primary.lock().await;
+            self.ensure_alive(&mut primary).await?;
+            let stream = primary
+                .session
+                .client
+                .query_raw(sql, params.iter().copied())
+                .await
+                .map_err(|error| describe_sqlstate(&error))?;
+            let mut stream = std::pin::pin!(stream);
+            let mut rows = Vec::new();
+            while let Some(row) = stream
+                .try_next()
+                .await
+                .map_err(|error| describe_sqlstate(&error))?
+            {
+                rows.push(row);
+            }
+            Ok(rows)
+        })
     }
 
     pub async fn catalog_text(&self, sql: &str, caps: Caps) -> Result<ResultSet> {
@@ -309,6 +328,9 @@ impl Engine {
         }
         tracing::warn!("the database connection was lost; reconnecting once");
         let fresh = self.connector.connect().await?;
+        if let Ok(mut cancel) = self.cancel.lock() {
+            *cancel = fresh.cancel.clone();
+        }
         primary.session = fresh;
         primary.in_transaction = false;
         primary.cursors.clear();
@@ -597,6 +619,47 @@ async fn estimate_rows(client: &tokio_postgres::Client, sql: &str) -> Option<i64
 #[must_use]
 pub fn expiry_headroom(handle_expiry: Duration) -> Duration {
     handle_expiry + Duration::from_secs(5)
+}
+
+impl Engine {
+    pub async fn run_and_rollback(&self, sql: &str, caps: Caps) -> Result<ResultSet> {
+        let mut primary = self.primary.lock().await;
+        self.ensure_alive(&mut primary).await?;
+        sweep_expired(&mut primary).await?;
+        if primary.in_transaction {
+            return Err(Error::HandleState {
+                handle: "read transaction".to_owned(),
+                state: "holding open cursors; close them before a statement that needs a write transaction"
+                    .to_owned(),
+            });
+        }
+        primary
+            .session
+            .client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|error| describe_sqlstate(&error))?;
+        let result = read_direct(&mut primary, sql, caps).await;
+        let rolled_back = primary.session.client.batch_execute("ROLLBACK").await;
+        if let Err(error) = rolled_back
+            && !primary.session.client.is_closed()
+        {
+            return Err(describe_sqlstate(&error));
+        }
+        result
+    }
+}
+
+impl Engine {
+    pub async fn release_everything(&self) -> Result<()> {
+        let mut primary = self.primary.lock().await;
+        if primary.session.client.is_closed() {
+            primary.in_transaction = false;
+            primary.cursors.clear();
+            return Ok(());
+        }
+        rollback_all(&mut primary).await
+    }
 }
 
 #[cfg(test)]

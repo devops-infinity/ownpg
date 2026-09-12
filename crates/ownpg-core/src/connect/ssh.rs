@@ -11,7 +11,7 @@ use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_s
 use crate::config::{SshSettings, SshTransport, parse_ssh_target};
 use crate::error::{Error, Result};
 
-use super::BoxedStream;
+use super::TunnelStream;
 
 const DEFAULT_KEY_FILES: [&str; 3] = [".ssh/id_ed25519", ".ssh/id_ecdsa", ".ssh/id_rsa"];
 
@@ -31,9 +31,9 @@ pub struct Hints {
 }
 
 pub struct Tunnel {
-    pub stream: BoxedStream,
+    pub stream: TunnelStream,
     pub route: Vec<String>,
-    keep: Vec<Box<dyn std::any::Any + Send>>,
+    keep: Vec<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl std::fmt::Debug for Tunnel {
@@ -45,7 +45,13 @@ impl std::fmt::Debug for Tunnel {
 }
 
 impl Tunnel {
-    pub fn into_parts(self) -> (BoxedStream, Vec<String>, Vec<Box<dyn std::any::Any + Send>>) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        TunnelStream,
+        Vec<String>,
+        Vec<Box<dyn std::any::Any + Send + Sync>>,
+    ) {
         (self.stream, self.route, self.keep)
     }
 }
@@ -318,7 +324,9 @@ async fn open_in_process(
             format!("the bastion could not reach {target_host}:{target_port}: {error}"),
         )
     })?;
-    let stream: BoxedStream = Box::new(channel.into_stream());
+    let stream = TunnelStream::Channel {
+        inner: channel.into_stream(),
+    };
     Ok(Tunnel {
         stream,
         route,
@@ -548,7 +556,7 @@ async fn open_system(
             )
         })?;
     Ok(Tunnel {
-        stream: Box::new(stream),
+        stream: TunnelStream::Unix { inner: stream },
         route: vec![format!(
             "{}@{}:{} (system ssh)",
             bastion.user, bastion.host, bastion.port

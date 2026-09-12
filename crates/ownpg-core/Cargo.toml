@@ -40,11 +40,14 @@ unicode-segmentation.workspace = true
 sha2.workspace = true
 time.workspace = true
 rand.workspace = true
-rmcp = { version = "3.3.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server", "elicitation", "request-state", "schemars"] }
-schemars = "1.2.2"
+rmcp.workspace = true
+schemars.workspace = true
+tokio-util.workspace = true
+pin-project-lite.workspace = true
 
 [dev-dependencies]
 ssh-key.workspace = true
+rmcp = { workspace = true, features = ["client"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 

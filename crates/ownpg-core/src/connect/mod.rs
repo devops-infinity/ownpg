@@ -93,7 +93,7 @@ pub struct Session {
     pub info: SessionInfo,
     tls: Arc<Tls>,
     driver: tokio::task::JoinHandle<()>,
-    keep: Vec<Box<dyn std::any::Any + Send>>,
+    keep: Vec<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl fmt::Debug for Session {
@@ -123,11 +123,74 @@ impl Session {
     }
 }
 
-pub type BoxedStream = Box<dyn AsyncStream>;
+pin_project_lite::pin_project! {
+    #[project = TunnelStreamProj]
+    pub enum TunnelStream {
+        Channel { #[pin] inner: russh::ChannelStream<russh::client::Msg> },
+        #[cfg(unix)]
+        Unix { #[pin] inner: tokio::net::UnixStream },
+    }
+}
 
-pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl std::fmt::Debug for TunnelStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Channel { .. } => f.write_str("TunnelStream::Channel"),
+            #[cfg(unix)]
+            Self::Unix { .. } => f.write_str("TunnelStream::Unix"),
+        }
+    }
+}
 
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+impl AsyncRead for TunnelStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.project() {
+            TunnelStreamProj::Channel { inner } => inner.poll_read(cx, buf),
+            #[cfg(unix)]
+            TunnelStreamProj::Unix { inner } => inner.poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for TunnelStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.project() {
+            TunnelStreamProj::Channel { inner } => inner.poll_write(cx, buf),
+            #[cfg(unix)]
+            TunnelStreamProj::Unix { inner } => inner.poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.project() {
+            TunnelStreamProj::Channel { inner } => inner.poll_flush(cx),
+            #[cfg(unix)]
+            TunnelStreamProj::Unix { inner } => inner.poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.project() {
+            TunnelStreamProj::Channel { inner } => inner.poll_shutdown(cx),
+            #[cfg(unix)]
+            TunnelStreamProj::Unix { inner } => inner.poll_shutdown(cx),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Connector {
