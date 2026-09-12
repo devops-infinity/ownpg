@@ -194,6 +194,8 @@ impl ToolFailure {
     pub fn decision(&self) -> Decision {
         match self.0.error {
             Error::StatementRefused { .. }
+            | Error::StatementMultiple { .. }
+            | Error::StatementUnparsable { .. }
             | Error::RoleRefused { .. }
             | Error::ConfirmationRequired { .. }
             | Error::ScopeInsufficient { .. } => Decision::Refused,
@@ -205,6 +207,10 @@ impl ToolFailure {
     pub fn rule(&self) -> Option<String> {
         match &self.0.error {
             Error::StatementRefused { rule, .. } => Some(rule.clone()),
+            Error::StatementMultiple { count } => Some(format!("{count} statements in one call")),
+            Error::StatementUnparsable { .. } => {
+                Some("the parser could not read the statement".to_owned())
+            }
             Error::RoleRefused { attribute, .. } => Some(format!("role has {attribute}")),
             Error::ConfirmationRequired { operation } => {
                 Some(format!("{operation} needs confirmation"))

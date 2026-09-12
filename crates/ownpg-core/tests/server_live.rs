@@ -684,3 +684,65 @@ async fn an_initialize_handshake_negotiates_the_2025_revision() {
         started.elapsed()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_bypass_corpus_is_refused_by_the_live_read_only_server() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    prepare(&scratch).await;
+    let watcher = scratch.client().await;
+    let before: i64 = watcher
+        .query_one("SELECT count(*) FROM app.orders", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let rig = rig(&scratch, Mode::ReadOnly).await;
+    let mut refused = 0;
+    for sql in ownpg_core::classify::BYPASS_CORPUS {
+        let result = rig.call("pg_run_query", json!({"sql": sql})).await;
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "{sql} was not refused: {result:?}"
+        );
+        let code = result.structured_content.clone().unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            matches!(
+                code.as_str(),
+                "statement.refused" | "statement.multiple" | "statement.unparsable"
+            ),
+            "{sql} ended with {code} instead of a classifier refusal"
+        );
+        refused += 1;
+    }
+    assert!(refused >= 40);
+    let literal = rig
+        .call(
+            "pg_run_query",
+            json!({"sql": "SELECT customer FROM orders WHERE customer = 'needle-literal-7' AND id = 4242"}),
+        )
+        .await;
+    assert_ne!(literal.is_error, Some(true), "{literal:?}");
+    rig.finish().await;
+    let after: i64 = watcher
+        .query_one("SELECT count(*) FROM app.orders", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(before, after, "no corpus statement reached the table");
+    let content = std::fs::read_to_string(rig_path(&scratch)).unwrap();
+    let refusals = content.matches("\"decision\":\"refused\"").count();
+    assert!(
+        refusals >= refused,
+        "{refusals} refusals logged for {refused} inputs"
+    );
+    assert!(
+        !content.contains("needle-literal-7") && !content.contains("4242"),
+        "statement literals never reach the audit log"
+    );
+    assert!(content.contains("customer = $1"), "{content}");
+}

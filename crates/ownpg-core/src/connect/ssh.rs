@@ -137,9 +137,13 @@ pub fn plan_route(settings: &SshSettings, hints: &Hints) -> Result<Vec<Hop>> {
         specs.push((target.user, target.host, target.port));
     }
     specs.push((
-        settings.user.as_ref().map(|user| user.value.clone()),
+        settings
+            .user
+            .as_ref()
+            .filter(|user| user.origin != crate::config::Origin::Preset)
+            .map(|user| user.value.clone()),
         settings.host.value.clone(),
-        Some(settings.port.value),
+        (settings.port.origin != crate::config::Origin::Preset).then_some(settings.port.value),
     ));
     let alias_config = settings.config_file.as_ref().map(|file| file.value.clone());
     let mut extra_jumps: Vec<(Option<String>, String, Option<u16>)> = Vec::new();
@@ -644,8 +648,8 @@ mod tests {
             "Host staging\n  HostName staging.internal\n  User ops\n  Port 2222\n  IdentityFile /keys/staging\n  ProxyJump edge@gate.example.com:2200\n",
         )
         .unwrap();
-        let mut resolved = settings("staging", Vec::new(), Some(config));
-        resolved.user = None;
+        let mut resolved = settings("staging", Vec::new(), Some(config.clone()));
+        resolved.user = Some(Resolved::preset("sharkar".to_owned()));
         let hints = Hints::default();
         let hops = plan_route(&resolved, &hints).unwrap();
         assert_eq!(hops.len(), 2);
@@ -653,8 +657,17 @@ mod tests {
         assert_eq!(hops[0].port, 2200);
         assert_eq!(hops[0].user, "edge");
         assert_eq!(hops[1].host, "staging.internal");
-        assert_eq!(hops[1].user, "ops");
+        assert_eq!(hops[1].port, 2222, "a preset port yields to the alias");
+        assert_eq!(hops[1].user, "ops", "a preset user yields to the alias");
         assert_eq!(hops[1].key_files, vec![PathBuf::from("/keys/staging")]);
+        let mut explicit = settings("staging", Vec::new(), Some(config));
+        explicit.port = Resolved::new(2022, Origin::Flag);
+        let hops = plan_route(&explicit, &hints).unwrap();
+        assert_eq!(hops[1].port, 2022, "an explicit port wins over the alias");
+        assert_eq!(
+            hops[1].user, "deploy",
+            "an explicit user wins over the alias"
+        );
     }
 
     #[test]

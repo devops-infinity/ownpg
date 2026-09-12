@@ -124,8 +124,12 @@ struct ClientKey {
 }
 
 fn write_client_key(dir: &std::path::Path) -> ClientKey {
+    write_named_client_key(dir, "id_ed25519")
+}
+
+fn write_named_client_key(dir: &std::path::Path, name: &str) -> ClientKey {
     let key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
-    let path = dir.join("id_ed25519");
+    let path = dir.join(name);
     let encoded = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
     std::fs::write(&path, encoded.as_bytes()).unwrap();
     #[cfg(unix)]
@@ -360,4 +364,186 @@ async fn a_wrong_key_is_refused_with_every_method_named() {
         .expect_err("the wrong key is refused");
     assert_eq!(error.id(), ErrorId::SshFailed);
     assert!(error.to_string().contains("refused for deploy"), "{error}");
+}
+
+#[cfg(unix)]
+async fn start_agent(dir: &std::path::Path, key: &PrivateKey) -> PathBuf {
+    let socket = dir.join("agent.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let connections = futures_util::stream::unfold(listener, |listener| async move {
+        let next = listener.accept().await.map(|(stream, _)| stream);
+        Some((next, listener))
+    });
+    tokio::spawn(async move {
+        let _ = russh::keys::agent::server::serve(std::pin::pin!(connections), ()).await;
+    });
+    let mut client = russh::keys::agent::client::AgentClient::connect_uds(&socket)
+        .await
+        .unwrap();
+    client.add_identity(key, &[]).await.unwrap();
+    socket
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ssh_agent_holding_the_key_authenticates_the_tunnel() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    if scratch.host.starts_with('/') {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let key = PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap();
+    let bastion = start_bastion(key.public_key().clone()).await;
+    let socket = start_agent(dir.path(), &key).await;
+    let known_hosts = dir.path().join("known_hosts");
+    learn_known_hosts_path("127.0.0.1", bastion.port, &bastion.host_key, &known_hosts).unwrap();
+    let settings = settings_for(
+        &scratch,
+        SshEntry {
+            host: "127.0.0.1".to_owned(),
+            port: Some(bastion.port),
+            user: Some("deploy".to_owned()),
+            agent: Some(true),
+            known_hosts: Some(known_hosts.clone()),
+            ..SshEntry::default()
+        },
+        None,
+    );
+    let hints = Hints {
+        agent_socket: Some(socket.clone()),
+        home: Some(dir.path().to_path_buf()),
+        os_user: None,
+    };
+    let session = Connector::new(Arc::new(settings.clone()))
+        .with_ssh_hints(hints)
+        .connect()
+        .await
+        .expect("the agent key opens the tunnel");
+    assert_eq!(session.info.via, Via::Ssh);
+    let one: i32 = session
+        .client
+        .query_one("SELECT 1", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(one, 1);
+
+    let without_agent = Connector::new(Arc::new(settings))
+        .with_ssh_hints(Hints {
+            agent_socket: None,
+            home: Some(dir.path().to_path_buf()),
+            os_user: None,
+        })
+        .connect()
+        .await
+        .unwrap_err();
+    assert_eq!(without_agent.id(), ErrorId::SshFailed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ssh_config_alias_supplies_the_host_port_user_and_key() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    if scratch.host.starts_with('/') {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client_key = write_client_key(dir.path());
+    let bastion = start_bastion(client_key.public.clone()).await;
+    let known_hosts = dir.path().join("known_hosts");
+    learn_known_hosts_path("127.0.0.1", bastion.port, &bastion.host_key, &known_hosts).unwrap();
+    let config = dir.path().join("ssh_config");
+    std::fs::write(
+        &config,
+        format!(
+            "Host bastion-alias\n    HostName 127.0.0.1\n    Port {}\n    User deploy\n    IdentityFile {}\n",
+            bastion.port,
+            client_key.path.display()
+        ),
+    )
+    .unwrap();
+    let settings = settings_for(
+        &scratch,
+        SshEntry {
+            host: "bastion-alias".to_owned(),
+            agent: Some(false),
+            known_hosts: Some(known_hosts),
+            config_file: Some(config),
+            ..SshEntry::default()
+        },
+        None,
+    );
+    let session = Connector::new(Arc::new(settings))
+        .connect()
+        .await
+        .expect("the alias resolves through the ssh config");
+    assert_eq!(session.info.via, Via::Ssh);
+    assert!(
+        session.info.target.contains("deploy@127.0.0.1"),
+        "{}",
+        session.info.target
+    );
+    let one: i32 = session
+        .client
+        .query_one("SELECT 1", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(one, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pooled_engine_opens_one_tunnel_per_pooled_connection() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    if scratch.host.starts_with('/') {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client_key = write_client_key(dir.path());
+    let bastion = start_bastion(client_key.public.clone()).await;
+    let known_hosts = dir.path().join("known_hosts");
+    learn_known_hosts_path("127.0.0.1", bastion.port, &bastion.host_key, &known_hosts).unwrap();
+    let settings = settings_for(
+        &scratch,
+        SshEntry {
+            host: "127.0.0.1".to_owned(),
+            port: Some(bastion.port),
+            user: Some("deploy".to_owned()),
+            key_file: Some(client_key.path.clone()),
+            agent: Some(false),
+            known_hosts: Some(known_hosts),
+            ..SshEntry::default()
+        },
+        None,
+    );
+    let engine = ownpg_core::engine::Engine::start_pooled(Arc::new(settings), Hints::default())
+        .await
+        .expect("the pooled engine starts through the tunnel");
+    assert_eq!(engine.pool_size(), Some(4));
+    let caps = ownpg_core::shape::Caps {
+        row_cap: 10,
+        byte_cap: 100_000,
+    };
+    let alice = engine.begin_transaction("alice").await.unwrap();
+    let bob = engine.begin_transaction("bob").await.unwrap();
+    let pids = engine
+        .run_read(
+            "SELECT count(DISTINCT pid) FROM pg_stat_activity WHERE application_name LIKE 'ownpg/%' AND datname = current_database()",
+            caps,
+        )
+        .await
+        .unwrap();
+    let count: i64 = pids.rows[0][0].as_deref().unwrap().parse().unwrap();
+    assert!(
+        count >= 3,
+        "{count} tunneled connections for two handles and a read"
+    );
+    engine.rollback(&alice.id, "alice").await.unwrap();
+    engine.rollback(&bob.id, "bob").await.unwrap();
+    engine.release_everything().await.unwrap();
 }
