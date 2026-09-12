@@ -418,7 +418,7 @@ pub fn doctor(context: Context, _args: NoArgs) -> BoxFuture<'static, Outcome> {
 #[must_use]
 pub fn render_doctor(report: &DoctorReport) -> String {
     let mut text = String::new();
-    text.push_str(&format!("ownpg {}\n", report.version));
+    text.push_str(&format!("OwnPG {}\n", report.version));
     text.push_str(&format!("target: {} via {}\n", report.target, report.via));
     text.push_str(&format!("tls: {}\n", report.tls));
     if let Some(warning) = &report.tls_warning {

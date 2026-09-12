@@ -1,6 +1,6 @@
 [package]
 name = "ownpg"
-description = "PostgreSQL DBA tools for AI clients over the Model Context Protocol, one database and one schema per run"
+description = "OwnPG serves PostgreSQL DBA tools to AI clients over the Model Context Protocol, one database and one schema per run"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

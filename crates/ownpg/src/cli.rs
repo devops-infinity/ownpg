@@ -9,8 +9,8 @@ use clap::{
     name = "ownpg",
     version,
     about = "PostgreSQL DBA tools for AI clients over the Model Context Protocol",
-    long_about = "Serve one PostgreSQL database and one schema to an AI client over the\n\
-                  Model Context Protocol, in read-only, write-only, or read-write mode.\n\n\
+    long_about = "OwnPG serves one PostgreSQL database and one schema to an AI client over\n\
+                  the Model Context Protocol, in read-only, write-only, or read-write mode.\n\n\
                   With no command, `ownpg` serves over stdio with the default settings.",
     after_help = "EXIT CODES:\n  \
         0 success   1 runtime failure   2 usage or configuration   4 refused by policy\n  \

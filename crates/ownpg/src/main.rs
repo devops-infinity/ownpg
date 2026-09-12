@@ -23,7 +23,7 @@ fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut stderr = io::stderr().lock();
-        let _ = writeln!(stderr, "ownpg: stopped unexpectedly.");
+        let _ = writeln!(stderr, "OwnPG stopped unexpectedly.");
         let _ = writeln!(
             stderr,
             "This is a bug. Please report it with the lines below at"

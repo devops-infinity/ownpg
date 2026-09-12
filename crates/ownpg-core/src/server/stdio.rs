@@ -14,7 +14,7 @@ use crate::error::{Error, ExitClass, Result};
 
 pub const STDIN_LINE_CAP: usize = 16 * 1024 * 1024;
 pub const TERMINAL_NOTICE: &str =
-    "ownpg is waiting for an MCP client on stdin; start it from a client, or press Ctrl-C to stop";
+    "OwnPG is waiting for an MCP client on stdin; start it from a client, or press Ctrl-C to stop";
 
 pin_project_lite::pin_project! {
     #[derive(Debug)]
