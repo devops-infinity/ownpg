@@ -60,6 +60,25 @@ jobs:
             exit 1
           fi
 
+      - name: refuse a code comment in Rust source
+        run: |
+          hits=$(git ls-files -- '*.rs' | xargs grep -nE '^\s*//' 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "::error::a code comment was found in Rust source"
+            echo "$hits"
+            exit 1
+          fi
+
+      - name: refuse a code comment in a GitHub Actions workflow
+        run: |
+          hits=$(git ls-files -- '.github/workflows/*.yml' '.github/workflows/*.yaml' |
+            xargs grep -nE '^\s*#' 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "::error::a code comment was found in a workflow file"
+            echo "$hits"
+            exit 1
+          fi
+
   tool-scripts:
     name: tool scripts
     runs-on: ubuntu-latest
