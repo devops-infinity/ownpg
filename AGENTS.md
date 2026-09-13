@@ -12,6 +12,10 @@ The workspace has two crates. `ownpg-core` holds every piece of business and pro
 
 See `README.md` for what the project does and how to run it, `CHANGELOG.md` for the version history, and `SECURITY.md` for the vulnerability-reporting process.
 
+## Local verification
+
+This repository enforces its conventions locally, not in a hosted CI service. Run `tools/install-hooks.sh` once per checkout to point git at `.githooks/`: `.githooks/pre-commit` scans staged changes for secrets with `gitleaks`, and `.githooks/pre-push` runs `tools/verify.sh`, the full gate, before a push is allowed to leave the machine. Run `tools/verify.sh` directly at any time to check the same gate without pushing.
+
 ## Conventions this repository enforces
 
 - `cargo fmt --all -- --check`: formatting.
@@ -19,23 +23,23 @@ See `README.md` for what the project does and how to run it, `CHANGELOG.md` for 
 - `cargo nextest run --workspace --all-features --locked`: unit and integration tests. `cargo test --workspace --all-features --locked --doc`: doc tests.
 - `cargo doc --workspace --all-features --no-deps --locked` with `RUSTDOCFLAGS=-D warnings`: the documentation build stays clean.
 - `cargo machete`: no unused dependencies.
-- `cargo llvm-cov nextest --workspace --locked --fail-under-lines 80`: line coverage stays at 80 percent or higher.
 - `cargo audit --deny warnings` and `cargo deny check`: dependency advisories, license, and source checks against `deny.toml`.
-- `cargo semver-checks check-release -p ownpg-core`: the public API of `ownpg-core` stays compatible with the published crate.
-- Every tracked file under `crates/`, `tools/`, and the repository root's markdown files is grepped for the em-dash character, and the same scope excluding `LICENSE-*` is grepped for a short list of words that flag borrowed or superseded code. See the house-rules job in `.github/workflows/ci.yml` for the exact pattern.
+- `shellcheck tools/*.sh` and `shfmt -d tools/*.sh`: every tool script stays clean and formatted.
+- Every tracked file under `crates/`, `tools/`, and the repository root's markdown files is grepped for the em-dash character, and the same scope excluding `LICENSE-*` is grepped for a short list of words that flag borrowed or superseded code. Every tracked `.rs` file is grepped for a code comment. See `tools/verify.sh` for the exact patterns.
 - No markdown table appears in any tracked markdown file at the repository root.
-- Every GitHub Actions step is pinned to a full commit SHA, never a floating tag.
+- `cargo llvm-cov nextest --workspace --locked --fail-under-lines 80` (line coverage) and `cargo semver-checks check-release -p ownpg-core` (public-API compatibility with the published crate) are run by hand periodically; neither is part of `tools/verify.sh`, since coverage instrumentation recompiles the whole workspace and semver-checks has nothing to compare against before `ownpg-core` is first published.
 
 ## Do
 
 - Keep business and protocol logic in `ownpg-core`. Keep `ownpg` limited to the CLI shell.
-- Run `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo nextest run` before treating a change as finished.
+- Run `tools/verify.sh` before treating a change as finished, or let `.githooks/pre-push` run it for you.
 - Verify a claim about behavior against the actual source in `crates/`, not against a commit message or an earlier version of a document.
 
 ## Don't
 
 - Don't write `unsafe` code. The workspace denies it (`unsafe_code = "forbid"`).
 - Don't use `unwrap()`, `expect()`, `panic!()`, indexing or slicing, integer division, `todo!()`, `unimplemented!()`, `dbg!()`, `println!()`, or `eprintln!()` outside test code. Clippy denies each one.
+- Don't write a code comment anywhere, in any file, for any reason. `tools/verify.sh` refuses one on sight.
 - Don't add `anyhow`, `openssl`, `openssl-sys`, `native-tls`, `atty`, `ansi_term`, `structopt`, `backoff`, `lazy_static`, or `exitcode` as a dependency. `deny.toml` bans each one by name.
-- Don't pin a GitHub Actions step to a tag or a branch. Pin the full commit SHA.
+- Don't add a hosted CI workflow. This repository verifies itself locally, on the machine making the change.
 - Don't restate installation or usage instructions here. `README.md` covers them.

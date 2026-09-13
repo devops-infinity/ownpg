@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO"
+
+on_failure() {
+	status=$?
+	[[ "$status" -eq 0 ]] && exit 0
+	echo "" >&2
+	echo "[FAILED] Pre-push checks failed, nothing was pushed." >&2
+	echo "[INFO] Run the same gate directly with: tools/verify.sh" >&2
+	exit "$status"
+}
+trap on_failure EXIT
+
+"$REPO/tools/verify.sh"
