@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO/tools/lib.sh"
 BIN="ownpg"
 PROFILE="release"
 INSTALL_DIR="${OWNPG_INSTALL_DIR:-$HOME/.local/bin}"
@@ -35,12 +36,6 @@ Environment:
   OWNPG_INSTALL_DIR   same as --dir
   OWNPG_STALE_DAYS    same as --stale-days
 USAGE
-}
-
-say() { printf '[%s] %s\n' "$1" "$2"; }
-die() {
-	say FAILED "$1"
-	exit 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -87,8 +82,21 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$STALE_DAYS" =~ ^[0-9]+$ ]] || die "stale days must be a whole number, got: $STALE_DAYS"
+if [[ $FULL_CLEAN -eq 1 && $KEEP_BUILD -eq 1 ]]; then
+	say WARNING "--full-clean and --keep-build were both given; --full-clean wins"
+fi
 
 cd "$REPO"
+
+INSTALL_TMP=""
+cleanup_tmp() {
+	if [[ -n "$INSTALL_TMP" && -e "$INSTALL_TMP" ]]; then
+		rm -f "$INSTALL_TMP"
+	fi
+}
+trap cleanup_tmp EXIT
+trap 'say FAILED "interrupted"; exit 130' INT
+trap 'say FAILED "interrupted"; exit 143' TERM
 
 command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH"
 
@@ -98,7 +106,11 @@ say INFO "profile $PROFILE, installing into $INSTALL_DIR"
 REMOVED=0
 for CANDIDATE in "$INSTALL_DIR/$BIN" /usr/local/bin/"$BIN" "$HOME/.cargo/bin/$BIN"; do
 	if [[ -e "$CANDIDATE" ]]; then
-		rm -f "$CANDIDATE" && say INFO "removed $CANDIDATE"
+		if rm -f "$CANDIDATE"; then
+			say INFO "removed $CANDIDATE"
+		else
+			say WARNING "could not remove $CANDIDATE"
+		fi
 		REMOVED=$((REMOVED + 1))
 	fi
 done
@@ -112,7 +124,11 @@ if [[ $KEEP_CACHE -eq 0 ]]; then
 		"${XDG_CACHE_HOME:-$HOME/.cache}/ownpg" \
 		"${LOCALAPPDATA:-$HOME/AppData/Local}/devops/ownpg/cache"; do
 		if [[ -d "$CACHE" ]]; then
-			rm -rf "$CACHE" && say INFO "cleared cache $CACHE"
+			if rm -rf "$CACHE"; then
+				say INFO "cleared cache $CACHE"
+			else
+				say WARNING "could not clear cache $CACHE"
+			fi
 		fi
 	done
 fi
@@ -146,7 +162,7 @@ dir_kb() {
 		printf '0\n'
 		return 0
 	fi
-	du -sk "$1" 2>/dev/null | awk 'NR == 1 { print $1 + 0 }'
+	du -sk "$1" 2>/dev/null | awk 'NR == 1 { print $1 + 0 }' || true
 }
 
 resolve_build_dir() {
@@ -171,7 +187,7 @@ resolve_build_dir() {
 }
 
 inside_build_dir() {
-	local path=$1 real
+	local path="$1" real
 	[[ -n "$BUILD_DIR" && "$path" == /* ]] || return 1
 	[[ -d "$path" && ! -L "$path" ]] || return 1
 	real="$(cd -- "$path" 2>/dev/null && pwd -P)" || return 1
@@ -181,8 +197,8 @@ inside_build_dir() {
 	return 1
 }
 
-drop_path() {
-	local path=$1
+remove_path() {
+	local path="$1"
 	[[ -n "$path" ]] || return 0
 	if [[ "$path" != /* || "$path" == *..* ]]; then
 		say WARNING "refused to remove $path"
@@ -197,7 +213,7 @@ drop_path() {
 }
 
 newest_mtime() {
-	local dir=$1 newest=0 stamp line
+	local dir="$1" newest=0 stamp line
 	while IFS= read -r line; do
 		stamp="${line%% *}"
 		stamp="${stamp%%.*}"
@@ -222,19 +238,19 @@ prune_stale_dirs() {
 			continue
 		fi
 		if [[ "$entry" == "$BUILD_DIR/tmp" ]]; then
-			drop_path "$entry"
+			remove_path "$entry"
 			continue
 		fi
 		touched="$(newest_mtime "$entry")"
 		if [[ $touched -gt 0 && $touched -lt $cutoff ]]; then
 			say INFO "dropping ${entry#"$BUILD_DIR"/}; nothing has touched it for $STALE_DAYS days"
-			drop_path "$entry"
+			remove_path "$entry"
 		fi
 	done < <(find "$BUILD_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
 }
 
 prune_units() {
-	local dir=$1
+	local dir="$1"
 	local fingerprints="$dir/.fingerprint"
 	local live stamped current stale found newest rustc_id hash entry
 	[[ -d "$fingerprints" ]] || return 0
@@ -317,7 +333,7 @@ prune_units() {
 			"$dir"/deps/*-"$hash".* \
 			"$dir"/build/*-"$hash"; do
 			if [[ -e "$entry" ]]; then
-				drop_path "$entry"
+				remove_path "$entry"
 			fi
 		done
 	done < <(printf '%s\n' "$STALE_HASHES" | sort -u)
@@ -334,7 +350,7 @@ prune_incremental() {
 	[[ ${#caches[@]} -gt $KEEP_INCREMENTAL ]] || return 0
 	while IFS= read -r line; do
 		entry="${line#* }"
-		drop_path "$entry"
+		remove_path "$entry"
 	done < <(mtimes "${caches[@]}" 2>/dev/null | sort -rn | tail -n +$((KEEP_INCREMENTAL + 1)))
 }
 
@@ -407,8 +423,11 @@ fi
 say SUCCESS "built $(du -h "$BUILT" | cut -f1 | tr -d ' ')"
 
 mkdir -p "$INSTALL_DIR"
-cp "$BUILT" "$INSTALL_DIR/$BIN" || die "could not install into $INSTALL_DIR"
-chmod 755 "$INSTALL_DIR/$BIN" 2>/dev/null || true
+INSTALL_TMP="$(mktemp "$INSTALL_DIR/.$BIN.XXXXXX")" || die "could not create a temp file in $INSTALL_DIR"
+cp "$BUILT" "$INSTALL_TMP" || die "could not install into $INSTALL_DIR"
+chmod 755 "$INSTALL_TMP" 2>/dev/null || true
+mv -f "$INSTALL_TMP" "$INSTALL_DIR/$BIN" || die "could not install into $INSTALL_DIR"
+INSTALL_TMP=""
 say SUCCESS "installed $INSTALL_DIR/$BIN"
 
 if command -v shasum >/dev/null 2>&1; then
