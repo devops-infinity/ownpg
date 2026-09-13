@@ -1723,7 +1723,7 @@ expression: tools
   {
     "name": "pg_merge",
     "title": "Upsert rows with MERGE",
-    "description": "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. Matched rows have update_columns set from the source (default: every column except match_on); unmatched rows are inserted when insert_unmatched is true. returning (PostgreSQL 17 and later) lists columns to return. dry_run shows the statement without running it; a MERGE the classifier marks destructive needs confirm: true or the confirmation prompt.",
+    "description": "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. Matched rows have update_columns set from the source (default: every column except match_on); unmatched rows are inserted when insert_unmatched is true. returning (PostgreSQL 17 and later) lists columns to return. dry_run shows the statement without running it; confirm is accepted for the same reason it exists on pg_update and pg_delete, though match_on always builds a real join on named columns, so this tool never generates the unconditional MERGE the classifier would flag.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,

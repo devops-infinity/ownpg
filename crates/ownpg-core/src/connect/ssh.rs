@@ -234,11 +234,12 @@ pub fn plan_route(settings: &SshSettings, hints: &Hints) -> Result<Vec<Hop>> {
 }
 
 async fn spawn_plan_route(settings: &SshSettings, hints: &Hints) -> Result<Vec<Hop>> {
-    let settings = settings.clone();
-    let hints = hints.clone();
-    tokio::task::spawn_blocking(move || plan_route(&settings, &hints))
+    let host = settings.host.value.clone();
+    let owned_settings = settings.clone();
+    let owned_hints = hints.clone();
+    tokio::task::spawn_blocking(move || plan_route(&owned_settings, &owned_hints))
         .await
-        .map_err(|error| ssh_error("ssh", format!("the route planner panicked: {error}")))?
+        .map_err(|error| ssh_error(&host, format!("the route planner panicked: {error}")))?
 }
 
 pub async fn open(

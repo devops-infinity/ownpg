@@ -282,6 +282,29 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
     assert_eq!(repeat["code"], "argument.invalid", "{repeat}");
     assert!(dump_file.metadata().unwrap().len() > 0);
 
+    let restore_dry = rig
+        .ok(
+            "pg_restore",
+            json!({"file": "app.dump", "tables": ["items"], "dry_run": true}),
+        )
+        .await;
+    let restore_arguments: Vec<&str> = restore_dry["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert!(
+        restore_arguments.contains(&"--table=items"),
+        "{restore_arguments:?}"
+    );
+    assert!(
+        !restore_arguments
+            .iter()
+            .any(|argument| argument.contains('"')),
+        "{restore_arguments:?}"
+    );
+
     let plain = rig
         .ok(
             "pg_dump",

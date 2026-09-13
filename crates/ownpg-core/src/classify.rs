@@ -586,6 +586,16 @@ fn walk(value: &Value, found: &mut Findings) {
                             found.functions.push(name);
                         }
                     }
+                    "TypeCast" => {
+                        if let Some(name) = dotted_name(child.pointer("/type_name/names")) {
+                            found.functions.push(name);
+                        }
+                    }
+                    "AExpr" => {
+                        if let Some(name) = dotted_name(child.get("name")) {
+                            found.functions.push(name);
+                        }
+                    }
                     "CommonTableExpr" => {
                         if let Some(name) = child.get("ctename").and_then(Value::as_str) {
                             found.cte_names.push(name.to_owned());
@@ -656,7 +666,7 @@ fn walk(value: &Value, found: &mut Findings) {
                         }
                     }
                     "MergeStmt" => {
-                        if merge_matches_every_row(child) && merge_touches_matched_rows(child) {
+                        if merge_matches_every_row(child) && merge_has_mutating_clause(child) {
                             note_destructive(
                                 found,
                                 "MERGE with no narrowing ON condition updates or deletes every matched row",
@@ -771,7 +781,10 @@ fn merge_matches_every_row(statement: &Value) -> bool {
     }
 }
 
-fn merge_touches_matched_rows(statement: &Value) -> bool {
+const MERGE_COMMAND_UPDATE: i64 = 3;
+const MERGE_COMMAND_DELETE: i64 = 5;
+
+fn merge_has_mutating_clause(statement: &Value) -> bool {
     statement
         .get("merge_when_clauses")
         .and_then(Value::as_array)
@@ -781,7 +794,7 @@ fn merge_touches_matched_rows(statement: &Value) -> bool {
         .any(|clause| {
             matches!(
                 clause.get("command_type").and_then(Value::as_i64),
-                Some(3 | 5)
+                Some(MERGE_COMMAND_UPDATE | MERGE_COMMAND_DELETE)
             )
         })
 }
@@ -1167,6 +1180,24 @@ mod tests {
         allowed("SELECT pg_catalog.now()", Mode::ReadOnly);
         allowed("SELECT app.compute()", Mode::ReadOnly);
         allowed("SELECT count(*), lower(name) FROM orders", Mode::ReadOnly);
+    }
+
+    #[test]
+    fn a_schema_qualified_cast_or_operator_in_another_schema_is_refused() {
+        let message = refused("SELECT 'x'::other.sometype", Mode::ReadOnly);
+        assert!(
+            message.contains("function outside scoped schema"),
+            "{message}"
+        );
+        let message = refused("SELECT 1 OPERATOR(other.+) 2", Mode::ReadOnly);
+        assert!(
+            message.contains("function outside scoped schema"),
+            "{message}"
+        );
+        allowed("SELECT 'x'::int4", Mode::ReadOnly);
+        allowed("SELECT 'x'::app.sometype", Mode::ReadOnly);
+        allowed("SELECT 1 + 2", Mode::ReadOnly);
+        allowed("SELECT id::text FROM orders WHERE id = 1", Mode::ReadOnly);
     }
 
     #[test]

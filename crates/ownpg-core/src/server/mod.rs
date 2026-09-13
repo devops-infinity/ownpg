@@ -28,15 +28,17 @@ use crate::config::ToolGroup;
 use crate::engine::Engine;
 use crate::error::Result;
 use crate::tool_specs;
+use crate::tools::{self, Call, Context, Outcome, Reply, Route};
 
 static TLS_PROVIDER: OnceLock<()> = OnceLock::new();
 
 pub(crate) fn ensure_tls_provider() {
     TLS_PROVIDER.get_or_init(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        if let Err(error) = rustls::crypto::ring::default_provider().install_default() {
+            tracing::warn!(?error, "the ring crypto provider could not be installed");
+        }
     });
 }
-use crate::tools::{self, Call, Context, Outcome, Reply, Route};
 
 pub const LIST_TTL_MS: u64 = 60_000;
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(1);

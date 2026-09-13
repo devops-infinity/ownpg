@@ -434,6 +434,16 @@ fn explain_options(args: &ExplainArgs, server_version_num: i32) -> Result<String
     Ok(options.join(", "))
 }
 
+fn scope_for_class(class: StatementClass) -> &'static str {
+    match class {
+        StatementClass::Read => tool_specs::SCOPE_READ,
+        StatementClass::Write | StatementClass::Procedure => tool_specs::SCOPE_WRITE,
+        StatementClass::Ddl => tool_specs::SCOPE_DDL,
+        StatementClass::Roles => tool_specs::SCOPE_ROLES,
+        StatementClass::Maintenance => tool_specs::SCOPE_MAINTENANCE,
+    }
+}
+
 pub fn explain(call: Call, args: ExplainArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let context = call.context.clone();
@@ -455,11 +465,14 @@ pub fn explain(call: Call, args: ExplainArgs) -> BoxFuture<'static, Outcome> {
         let facts = facts_for(&classification);
         let caps = context.caps(1_000).without_cell_cap();
         let writes = classification.class != StatementClass::Read;
-        if writes && !call.allows(tool_specs::SCOPE_WRITE) {
-            return Err(ToolFailure::from(Error::ScopeInsufficient {
-                scope: tool_specs::SCOPE_WRITE.to_owned(),
-            })
-            .with_facts(facts));
+        if writes {
+            let required_scope = scope_for_class(classification.class);
+            if !call.allows(required_scope) {
+                return Err(ToolFailure::from(Error::ScopeInsufficient {
+                    scope: required_scope.to_owned(),
+                })
+                .with_facts(facts));
+            }
         }
         let result = if writes {
             context.engine.run_and_rollback(&statement, caps).await

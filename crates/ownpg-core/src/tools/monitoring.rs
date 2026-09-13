@@ -81,7 +81,7 @@ fn activity_sql(args: &ActivityArgs) -> String {
 
 fn redacted_query_sql(column: &str, cap: usize) -> String {
     format!(
-        "(CASE WHEN {column} ~* 'password' THEN 'a credential-bearing statement is withheld here' ELSE left({column}, {cap}) END)"
+        "(CASE WHEN {column} ~* 'password|passwd|secret|credential' THEN 'a credential-bearing statement is withheld here' ELSE left({column}, {cap}) END)"
     )
 }
 
@@ -469,9 +469,10 @@ pub fn top_queries(call: Call, args: TopQueriesArgs) -> BoxFuture<'static, Outco
         let sql = format!(
             "SELECT queryid::text, calls, round(total_exec_time::numeric, 2) AS total_exec_time_ms, \
              round(mean_exec_time::numeric, 3) AS mean_exec_time_ms, rows, shared_blks_hit, shared_blks_read, \
-             left(query, 500) AS query \
+             {} AS query \
              FROM {}.pg_stat_statements WHERE dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()) \
              ORDER BY {order}, queryid",
+            redacted_query_sql("query", 500),
             crate::render::quote_ident(&extension_schema)
         );
         let mut classification = verify(&sql, &["SelectStmt"])?;
@@ -580,5 +581,26 @@ mod tests {
             let parsed = verify(&statement, &["SelectStmt"]).unwrap();
             assert!(parsed.refusals.is_empty(), "{statement}");
         }
+    }
+
+    #[test]
+    fn a_credential_bearing_query_is_withheld_from_activity_locks_and_top_queries() {
+        let activity = activity_sql(&ActivityArgs {
+            include_idle: true,
+            min_duration_seconds: 0,
+            row_cap: 0,
+        });
+        assert!(activity.contains("a credential-bearing statement is withheld here"));
+        assert!(activity.contains("~* 'password|passwd|secret|credential'"));
+        let locks = locks_sql();
+        assert!(locks.contains("a credential-bearing statement is withheld here"));
+        assert!(
+            locks
+                .matches("~* 'password|passwd|secret|credential'")
+                .count()
+                == 2
+        );
+        let queries = redacted_query_sql("query", 500);
+        assert!(queries.contains("a credential-bearing statement is withheld here"));
     }
 }
