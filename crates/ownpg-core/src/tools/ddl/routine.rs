@@ -11,7 +11,26 @@ use crate::shape::ResultSet;
 use crate::tool_specs;
 use crate::tools::{Call, Outcome, Route, route};
 
-const ROUTINE_DESCRIPTION: &str = "Create, replace, alter, rename, or drop a function or procedure in the scoped schema. create takes typed arguments, the return type, the language (sql or plpgsql among others), the body, volatility, strictness, parallel safety, and security. A security definer routine gets search_path pinned to the scoped schema and pg_temp. drop is destructive and needs confirm: true or the confirmation prompt.";
+const ROUTINE_DESCRIPTION: &str = "Create, replace, alter, rename, or drop a function or procedure in the scoped schema. create takes typed arguments, the return type, the language (sql or plpgsql, the only two allowed), the body, volatility, strictness, parallel safety, and security. A security definer routine gets search_path pinned to the scoped schema and pg_temp. drop is destructive and needs confirm: true or the confirmation prompt.";
+
+const ALLOWED_LANGUAGES: [&str; 2] = ["sql", "plpgsql"];
+
+fn safe_language(argument: &str, text: &str) -> Result<String> {
+    let trimmed = text.trim();
+    validate_ident(argument, trimmed)?;
+    let lowered = trimmed.to_ascii_lowercase();
+    if !ALLOWED_LANGUAGES.contains(&lowered.as_str()) {
+        return Err(Error::ArgumentInvalid {
+            argument: argument.to_owned(),
+            detail: format!(
+                "`{trimmed}` is not an allowed language; only sql and plpgsql are permitted, \
+                 since any other procedural language runs with the interpreter's own \
+                 capabilities, not the classifier's"
+            ),
+        });
+    }
+    Ok(lowered)
+}
 
 const TRIGGER_DESCRIPTION: &str = "Create, drop, rename, enable, or disable a trigger on a table in the scoped schema, or create and drop an event trigger. create takes the timing, the events, the row or statement level, an optional WHEN condition, transition table names, and the trigger function with its arguments. drop is destructive and needs confirm: true or the confirmation prompt.";
 
@@ -245,7 +264,7 @@ pub fn routine(call: Call, args: RoutineArgs) -> BoxFuture<'static, Outcome> {
                         args.kind == RoutineKind::Procedure || !args.returns.trim().is_empty(),
                     );
                 missing.finish("create")?;
-                validate_ident("language", args.language.trim())?;
+                let language = safe_language("language", &args.language)?;
                 let mut sql = format!(
                     "CREATE{} {word} {}({})",
                     if args.or_replace { " OR REPLACE" } else { "" },
@@ -258,7 +277,7 @@ pub fn routine(call: Call, args: RoutineArgs) -> BoxFuture<'static, Outcome> {
                         returns_type("returns", &args.returns)?
                     ));
                 }
-                sql.push_str(&format!(" LANGUAGE {}", quote_ident(args.language.trim())));
+                sql.push_str(&format!(" LANGUAGE {}", quote_ident(&language)));
                 sql.push_str(match args.volatility {
                     Volatility::Unset => "",
                     Volatility::Volatile => " VOLATILE",
@@ -755,5 +774,17 @@ mod tests {
             argument_list(&arguments, true).unwrap(),
             "\"a\" int, OUT \"b\" text"
         );
+    }
+
+    #[test]
+    fn only_sql_and_plpgsql_are_allowed_languages() {
+        assert_eq!(safe_language("language", "sql").unwrap(), "sql");
+        assert_eq!(safe_language("language", "PlPgSQL").unwrap(), "plpgsql");
+        for unsafe_language in ["plpythonu", "plperlu", "c", "plv8", "sh"] {
+            assert!(
+                safe_language("language", unsafe_language).is_err(),
+                "{unsafe_language} should not be an allowed language"
+            );
+        }
     }
 }

@@ -14,7 +14,28 @@ use crate::tools::{AuditFacts, Call, Outcome, Route, ToolOutput, route, text_row
 
 const TYPE_DESCRIPTION: &str = "Create, alter, rename, or drop a type in the scoped schema: enum (create_enum, add_value, rename_value), composite (create_composite, add_attribute, drop_attribute, alter_attribute), domain (create_domain, set_default, drop_default, set_not_null, drop_not_null, add_check, drop_constraint, validate_constraint), and range (create_range). An enum value added inside a transaction cannot be used until that transaction commits (SQLSTATE 55P04), so add the value in one call and use it in the next. drop is destructive and needs confirm: true or the confirmation prompt.";
 
-const EXTENSION_DESCRIPTION: &str = "Create, update, or drop an extension, or list the extensions available on the server. create installs the extension into the scoped schema unless the extension is not relocatable. drop is destructive and needs confirm: true or the confirmation prompt.";
+const EXTENSION_DESCRIPTION: &str = "Create, update, or drop an extension, or list the extensions available on the server. create installs the extension into the scoped schema unless the extension is not relocatable. A short, fixed list of extensions that grant OS-level or arbitrary-network access is refused. drop is destructive and needs confirm: true or the confirmation prompt.";
+
+const DENIED_EXTENSIONS: [&str; 8] = [
+    "plpythonu",
+    "plpython3u",
+    "plperlu",
+    "pltclu",
+    "dblink",
+    "postgres_fdw",
+    "file_fdw",
+    "adminpack",
+];
+
+fn refuse_dangerous_extension(name: &str) -> Result<()> {
+    if DENIED_EXTENSIONS.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(Error::ArgumentInvalid {
+            argument: "name".to_owned(),
+            detail: format!("`{name}` grants OS-level or arbitrary-network access and is refused"),
+        });
+    }
+    Ok(())
+}
 
 const COMMENT_DESCRIPTION: &str = "Set or remove the comment on an object in the scoped schema: a table, column, index, view, materialized view, sequence, function, procedure, type, domain, constraint, trigger, policy, or the schema itself, and on a role, an extension, or the database.";
 
@@ -520,6 +541,9 @@ pub fn extension(call: Call, args: ExtensionArgs) -> BoxFuture<'static, Outcome>
                 .into());
         }
         validate_ident("name", &args.name)?;
+        if args.operation == ExtensionOperation::Create {
+            refuse_dangerous_extension(&args.name)?;
+        }
         let name = quote_ident(&args.name);
         let version = if args.version.trim().is_empty() {
             String::new()
@@ -754,4 +778,29 @@ pub fn routes() -> Result<Vec<Route>> {
         )?,
         route::<CommentArgs, ResultSet, _>(&tool_specs::PG_COMMENT, COMMENT_DESCRIPTION, comment)?,
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extensions_that_reach_outside_the_database_are_refused() {
+        for denied in DENIED_EXTENSIONS {
+            assert!(
+                refuse_dangerous_extension(denied).is_err(),
+                "{denied} should be refused"
+            );
+            assert!(
+                refuse_dangerous_extension(&denied.to_ascii_uppercase()).is_err(),
+                "{denied} should be refused case-insensitively"
+            );
+        }
+        for allowed in ["pgcrypto", "citext", "hstore", "uuid-ossp", "pg_trgm"] {
+            assert!(
+                refuse_dangerous_extension(allowed).is_ok(),
+                "{allowed} should not be refused"
+            );
+        }
+    }
 }

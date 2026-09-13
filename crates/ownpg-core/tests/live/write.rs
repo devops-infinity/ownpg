@@ -623,3 +623,45 @@ async fn unparsed_statements_run_once_through_parse_only_in_read_write_mode_with
     assert_eq!(structured(&refused)["code"], "statement.unparsable");
     write_only.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_builder_cannot_reach_outside_its_schema_through_a_filter_subquery() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    seed_schema(&scratch).await;
+    let (engine, audit) = engine_and_audit(&scratch, Mode::ReadWrite).await;
+    let rig = rig(engine, audit, "writer", (), ClientLifecycleMode::Initialize).await;
+    let escape = rig
+        .call(
+            "pg_delete",
+            json!({
+                "table": "items",
+                "filter": "id IN (SELECT id FROM other.secrets)",
+                "confirm": true
+            }),
+        )
+        .await;
+    assert_eq!(escape.is_error, Some(true), "{escape:?}");
+    assert_eq!(structured(&escape)["code"], "statement.refused");
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_procedural_body_always_needs_confirmation() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    seed_schema(&scratch).await;
+    let (engine, audit) = engine_and_audit(&scratch, Mode::ReadWrite).await;
+    let rig = rig(engine, audit, "writer", (), ClientLifecycleMode::Initialize).await;
+    let unconfirmed = rig
+        .call(
+            "pg_run_write",
+            json!({"sql": "DO $$ BEGIN DELETE FROM app.items; END $$"}),
+        )
+        .await;
+    assert_eq!(unconfirmed.is_error, Some(true), "{unconfirmed:?}");
+    assert_eq!(structured(&unconfirmed)["code"], "confirmation.required");
+    rig.finish().await;
+}
