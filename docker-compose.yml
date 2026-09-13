@@ -1,6 +1,6 @@
 services:
   ownpg:
-    image: ghcr.io/devops-infinity/ownpg:latest
+    build: .
     restart: unless-stopped
     read_only: true
     environment:
