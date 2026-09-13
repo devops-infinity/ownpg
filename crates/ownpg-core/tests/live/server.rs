@@ -559,6 +559,10 @@ async fn health_and_doctor_report_without_secrets() {
             .unwrap()
             .ends_with(".jsonl")
     );
+    assert!(
+        structured.get("audit_warning").is_none(),
+        "a healthy audit log reports no warning: {structured}"
+    );
     assert_eq!(structured["features"]["pg_stat_io"], true);
     let password = structured["settings"]
         .as_array()

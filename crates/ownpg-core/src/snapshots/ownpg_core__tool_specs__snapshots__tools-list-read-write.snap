@@ -1349,7 +1349,7 @@ expression: tools
   {
     "name": "pg_doctor",
     "title": "Report the connection and its settings",
-    "description": "Report how this server is connected and configured: the target and transport, TLS state, server version, connected role and its attributes, database, schema, access mode, loaded tool groups, effective limits, audit log path, open cursor handles, the feature map for this server version, and the absolute path and version of each PostgreSQL host program (pg_dump, pg_dumpall, pg_restore, pg_basebackup, pg_upgrade) or that it was not found. Secrets are never included.",
+    "description": "Report how this server is connected and configured: the target and transport, TLS state, server version, connected role and its attributes, database, schema, access mode, loaded tool groups, effective limits, the audit log path and a warning when an entry could not be written, open cursor handles, the feature map for this server version, and the absolute path and version of each PostgreSQL host program (pg_dump, pg_dumpall, pg_restore, pg_basebackup, pg_upgrade) or that it was not found. Secrets are never included.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -1428,6 +1428,12 @@ expression: tools
           "type": "array"
         },
         "audit_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "audit_warning": {
           "type": [
             "string",
             "null"
@@ -2247,7 +2253,7 @@ expression: tools
   {
     "name": "pg_run_write",
     "title": "Run one write statement",
-    "description": "Run one write statement written in SQL: INSERT, UPDATE, DELETE, MERGE, COPY ... FROM STDIN is refused here (use pg_copy), DO, or CALL. Exactly one statement per call. The statement is parsed and classified first: reads are refused (use pg_run_query), schema changes are refused (use the DDL tools), and destructive shapes (a DELETE or UPDATE without a narrowing WHERE) need confirm: true or the confirmation prompt. dry_run returns the classification without running anything. A statement the parser cannot read is refused in read-only and write-only modes; in read-write mode it runs with confirm: true through the extended query protocol, which lets PostgreSQL itself refuse a batch, and the audit record carries the decision unparsed.",
+    "description": "Run one write statement written in SQL: INSERT, UPDATE, DELETE, MERGE, COPY ... FROM STDIN is refused here (use pg_copy), DO, or CALL. Exactly one statement per call. The statement is parsed and classified first: reads are refused (use pg_run_query), schema changes are refused (use the DDL tools), and destructive shapes (a DELETE or UPDATE without a narrowing WHERE) need confirm: true or the confirmation prompt. dry_run returns the classification without running anything. A statement the parser cannot read is refused in every mode and never runs, because a statement without a class cannot be held to the access mode or the scoped schema; dry_run still reports it, with the kind unparsed and the class unknown.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,

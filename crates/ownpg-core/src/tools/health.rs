@@ -15,7 +15,7 @@ use crate::tool_specs;
 
 const HEALTH_DESCRIPTION: &str = "Summarize the health of the connected server and database: connection use against max_connections, the buffer cache hit ratio, the transaction ID age of the database against autovacuum_freeze_max_age, the longest running transaction, sessions idle in a transaction, invalid and unused indexes in the scoped schema, estimated bloat in the scoped schema, replication lag and inactive slots, and the database size. Each check carries a status of ok, warning, or critical with the measured value and a short explanation. Checks are listed in that fixed order.";
 
-const DOCTOR_DESCRIPTION: &str = "Report how this server is connected and configured: the target and transport, TLS state, server version, connected role and its attributes, database, schema, access mode, loaded tool groups, effective limits, audit log path, open cursor handles, the feature map for this server version, and the absolute path and version of each PostgreSQL host program (pg_dump, pg_dumpall, pg_restore, pg_basebackup, pg_upgrade) or that it was not found. Secrets are never included.";
+const DOCTOR_DESCRIPTION: &str = "Report how this server is connected and configured: the target and transport, TLS state, server version, connected role and its attributes, database, schema, access mode, loaded tool groups, effective limits, the audit log path and a warning when an entry could not be written, open cursor handles, the feature map for this server version, and the absolute path and version of each PostgreSQL host program (pg_dump, pg_dumpall, pg_restore, pg_basebackup, pg_upgrade) or that it was not found. Secrets are never included.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -443,6 +443,8 @@ pub struct DoctorReport {
     pub attempts: Vec<AttemptLine>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_warning: Option<String>,
     pub open_cursors: usize,
     pub features: BTreeMap<String, bool>,
     pub host_programs: Vec<super::host::HostProgram>,
@@ -452,6 +454,7 @@ pub struct DoctorReport {
 pub async fn doctor_report(
     engine: &Engine,
     audit_path: Option<&std::path::Path>,
+    audit_warning: Option<String>,
 ) -> Result<DoctorReport> {
     let info = engine.info().await;
     let settings = engine.settings();
@@ -522,6 +525,7 @@ pub async fn doctor_report(
         settings: setting_lines,
         attempts,
         audit_path: audit_path.map(|path| path.display().to_string()),
+        audit_warning,
         open_cursors: engine.open_cursors().await.len(),
         features: engine
             .features()
@@ -537,7 +541,12 @@ pub async fn doctor_report(
 pub fn doctor(call: Call, _args: NoArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let context = call.context.clone();
-        let report = doctor_report(&context.engine, context.audit_path.as_deref()).await?;
+        let report = doctor_report(
+            &context.engine,
+            context.audit.path(),
+            context.audit.warning(),
+        )
+        .await?;
         let text = render_doctor(&report);
         Ok(ToolOutput::structured(&report, text)?
             .with_facts(AuditFacts {
@@ -603,6 +612,9 @@ pub fn render_doctor(report: &DoctorReport) -> String {
         Some(path) => text.push_str(&format!("audit: {path}\n")),
         None => text.push_str("audit: off\n"),
     }
+    if let Some(warning) = &report.audit_warning {
+        text.push_str(&format!("warning: {warning}\n"));
+    }
     text.push_str(&format!("open cursors: {}\n", report.open_cursors));
     let features: Vec<String> = report
         .features
@@ -645,6 +657,53 @@ mod tests {
             value: String::new(),
             detail: String::new(),
         }
+    }
+
+    fn report(audit_warning: Option<String>) -> DoctorReport {
+        DoctorReport {
+            target: "127.0.0.1:5432".to_owned(),
+            via: "tcp".to_owned(),
+            tls: "not applicable (socket)".to_owned(),
+            tls_warning: None,
+            server_version: "18.6".to_owned(),
+            role: "app".to_owned(),
+            role_attributes: Vec::new(),
+            role_warning: None,
+            database: "app".to_owned(),
+            schema: "app".to_owned(),
+            search_path: "app".to_owned(),
+            pooled: false,
+            mode: "read-only".to_owned(),
+            loaded_groups: Vec::new(),
+            tools: Vec::new(),
+            settings: Vec::new(),
+            attempts: Vec::new(),
+            audit_path: Some("/tmp/audit.jsonl".to_owned()),
+            audit_warning,
+            open_cursors: 0,
+            features: BTreeMap::new(),
+            host_programs: Vec::new(),
+            version: "0.1.0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_degraded_audit_log_is_reported_next_to_the_audit_path() {
+        let healthy = render_doctor(&report(None));
+        assert!(healthy.contains("audit: /tmp/audit.jsonl\n"), "{healthy}");
+        assert!(!healthy.contains("warning:"), "{healthy}");
+        let json = serde_json::to_value(report(None)).unwrap();
+        assert!(json.get("audit_warning").is_none(), "{json}");
+
+        let degraded = render_doctor(&report(Some(
+            "the audit log is degraded: 2 entries could not be written".to_owned(),
+        )));
+        assert!(
+            degraded.contains(
+                "audit: /tmp/audit.jsonl\nwarning: the audit log is degraded: 2 entries could not be written\n"
+            ),
+            "{degraded}"
+        );
     }
 
     #[test]

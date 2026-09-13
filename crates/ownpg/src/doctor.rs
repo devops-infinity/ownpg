@@ -370,7 +370,7 @@ async fn run_connected_checks(
             None
         }
     };
-    match doctor_report(engine, audit_path.as_deref()).await {
+    match doctor_report(engine, audit_path.as_deref(), None).await {
         Ok(report) => {
             checks.push(check(
                 "tools",

@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -130,6 +131,8 @@ pub struct Sink {
     keep_files: u32,
     base: PathBuf,
     enabled: bool,
+    dropped: AtomicU64,
+    last_failure: Mutex<Option<String>>,
 }
 
 #[must_use]
@@ -176,6 +179,8 @@ impl Sink {
             keep_files: 0,
             base: PathBuf::new(),
             enabled: false,
+            dropped: AtomicU64::new(0),
+            last_failure: Mutex::new(None),
         }
     }
 
@@ -194,6 +199,8 @@ impl Sink {
             keep_files: settings.keep_files.value,
             base,
             enabled: true,
+            dropped: AtomicU64::new(0),
+            last_failure: Mutex::new(None),
         })
     }
 
@@ -249,6 +256,41 @@ impl Sink {
     }
 
     pub fn record(&self, entry: &Entry) -> Result<()> {
+        self.write(entry)
+            .inspect_err(|error| self.note_failure(error))
+    }
+
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn warning(&self) -> Option<String> {
+        let dropped = self.dropped();
+        if dropped == 0 {
+            return None;
+        }
+        let last = self
+            .last_failure
+            .lock()
+            .ok()
+            .and_then(|held| held.clone())
+            .unwrap_or_else(|| "the reason was not kept".to_owned());
+        let entries = if dropped == 1 { "entry" } else { "entries" };
+        Some(format!(
+            "the audit log is degraded: {dropped} {entries} could not be written since this server started; the last failure was: {last}"
+        ))
+    }
+
+    fn note_failure(&self, error: &Error) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut held) = self.last_failure.lock() {
+            *held = Some(error.to_string());
+        }
+    }
+
+    fn write(&self, entry: &Entry) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
@@ -678,6 +720,28 @@ mod tests {
         assert!(!sink.is_enabled());
         assert!(sink.path().is_none());
         sink.record(&entry("x")).unwrap();
+        assert_eq!(sink.dropped(), 0);
+        assert!(sink.warning().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_cannot_be_written_is_counted_and_surfaced_as_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("data");
+        let sink = Sink::open(&settings(&nested, 1), &nested, None).unwrap();
+        sink.record(&entry("pg_run_query")).unwrap();
+        assert_eq!(sink.dropped(), 0);
+        assert!(sink.warning().is_none());
+        fs::remove_dir_all(&nested).unwrap();
+        for expected in 1..=2 {
+            let error = sink.record(&entry("pg_run_query")).unwrap_err();
+            assert_eq!(error.id().as_str(), "audit.unwritable");
+            assert_eq!(sink.dropped(), expected);
+        }
+        let warning = sink.warning().unwrap();
+        assert!(warning.contains("2 entries"), "{warning}");
+        assert!(warning.contains("the audit log is degraded"), "{warning}");
     }
 
     #[test]

@@ -156,7 +156,7 @@ impl Server {
         let context = Context {
             engine,
             transport,
-            audit_path: audit.path().map(std::path::Path::to_path_buf),
+            audit: Arc::clone(&audit),
             gate: Arc::new(gate),
         };
         let info = build_info(&settings, &routes, context.engine.features().as_map());
