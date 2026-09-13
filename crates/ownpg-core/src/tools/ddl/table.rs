@@ -743,6 +743,15 @@ fn exclude_element(element: &str) -> Result<String> {
     Ok(format!("{rendered_body} WITH {rendered_operator}"))
 }
 
+fn exclude_method(method: &str) -> Result<String> {
+    let trimmed = method.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    validate_ident("method", trimmed)?;
+    Ok(format!("USING {} ", quote_ident(trimmed)))
+}
+
 fn constraint_body(call: &Call, args: &ConstraintArgs) -> Result<String> {
     let features = call.engine().features();
     let kind = args.kind;
@@ -853,12 +862,7 @@ fn constraint_body(call: &Call, args: &ConstraintArgs) -> Result<String> {
             let mut missing = Missing::new();
             missing.need("elements", !args.elements.is_empty());
             missing.finish("add")?;
-            let method = if args.method.trim().is_empty() {
-                String::new()
-            } else {
-                validate_ident("method", args.method.trim())?;
-                format!("USING {} ", args.method.trim())
-            };
+            let method = exclude_method(&args.method)?;
             let elements: Result<Vec<String>> = args
                 .elements
                 .iter()
@@ -1003,4 +1007,20 @@ pub fn routes() -> Result<Vec<Route>> {
             constraint,
         )?,
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_exclude_access_method_is_quoted_like_every_other_identifier() {
+        assert_eq!(exclude_method("  gist  ").unwrap(), "USING \"gist\" ");
+        assert_eq!(exclude_method("   ").unwrap(), String::new());
+        assert_eq!(
+            exclude_method("gist\" WITH (x=1)) --").unwrap(),
+            "USING \"gist\"\" WITH (x=1)) --\" "
+        );
+        assert!(exclude_method("gist\0").is_err());
+    }
 }
