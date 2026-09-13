@@ -113,6 +113,7 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
         "pg_type",
         "pg_extension",
         "pg_comment",
+        "pg_publication",
         "pg_role",
         "pg_grant",
         "pg_policy",
@@ -272,6 +273,15 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
         json!({"operation": "reindex", "name": "orders_total_idx"}),
     )
     .await;
+
+    let described_index = rig
+        .ok("pg_describe", json!({"name": "orders_status_idx"}))
+        .await;
+    assert_eq!(described_index["kind"], "index");
+    assert_eq!(
+        described_index["relation"]["kind"], "index",
+        "{described_index}"
+    );
 
     rig.ok(
         "pg_view",
@@ -500,6 +510,135 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
         .await;
     assert_eq!(mine["has_schema_usage"], true);
     assert!(!mine["tables"].as_array().unwrap().is_empty());
+
+    let create_sql = rig
+        .dry_run_sql(
+            "pg_publication",
+            json!({"operation": "create", "name": "orders_pub", "tables": ["orders"], "publish": "insert, update"}),
+        )
+        .await;
+    assert!(create_sql.starts_with("CREATE PUBLICATION"), "{create_sql}");
+    assert!(create_sql.contains("insert, update"), "{create_sql}");
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "create", "name": "orders_pub", "tables": ["orders"], "publish": "insert, update"}),
+    )
+    .await;
+    let seen = rig
+        .ok(
+            "pg_run_query",
+            json!({"sql": "SELECT pubname, puballtables FROM pg_publication WHERE pubname = 'orders_pub'"}),
+        )
+        .await;
+    assert_eq!(seen["rows"][0][0], "orders_pub");
+    assert_eq!(seen["rows"][0][1], false);
+    let both_set = rig
+        .failed(
+            "pg_publication",
+            json!({"operation": "create", "name": "bad_pub", "for_all_tables": true, "tables": ["orders"]}),
+        )
+        .await;
+    assert_eq!(both_set["code"], "argument.invalid");
+
+    let add_sql = rig
+        .dry_run_sql(
+            "pg_publication",
+            json!({"operation": "add_tables", "name": "orders_pub", "tables": ["customers"]}),
+        )
+        .await;
+    assert_eq!(
+        add_sql,
+        "ALTER PUBLICATION \"orders_pub\" ADD TABLE \"app\".\"customers\""
+    );
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "add_tables", "name": "orders_pub", "tables": ["customers"]}),
+    )
+    .await;
+    let two_tables = rig
+        .ok(
+            "pg_run_query",
+            json!({"sql": "SELECT count(*) FROM pg_publication_tables WHERE pubname = 'orders_pub'"}),
+        )
+        .await;
+    assert_eq!(two_tables["rows"][0][0], 2);
+
+    let drop_tables_needs_confirm = rig
+        .failed(
+            "pg_publication",
+            json!({"operation": "drop_tables", "name": "orders_pub", "tables": ["customers"]}),
+        )
+        .await;
+    assert_eq!(drop_tables_needs_confirm["code"], "confirmation.required");
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "drop_tables", "name": "orders_pub", "tables": ["customers"], "confirm": true}),
+    )
+    .await;
+    let back_to_one = rig
+        .ok(
+            "pg_run_query",
+            json!({"sql": "SELECT count(*) FROM pg_publication_tables WHERE pubname = 'orders_pub'"}),
+        )
+        .await;
+    assert_eq!(back_to_one["rows"][0][0], 1);
+
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "add_tables", "name": "orders_pub", "tables": ["customers"]}),
+    )
+    .await;
+    let set_tables_needs_confirm = rig
+        .failed(
+            "pg_publication",
+            json!({"operation": "set_tables", "name": "orders_pub", "tables": ["orders"]}),
+        )
+        .await;
+    assert_eq!(set_tables_needs_confirm["code"], "confirmation.required");
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "set_tables", "name": "orders_pub", "tables": ["orders"], "confirm": true}),
+    )
+    .await;
+    let replaced = rig
+        .ok(
+            "pg_run_query",
+            json!({"sql": "SELECT tablename FROM pg_publication_tables WHERE pubname = 'orders_pub'"}),
+        )
+        .await;
+    assert_eq!(replaced["row_count"], 1);
+    assert_eq!(replaced["rows"][0][0], "orders");
+
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "rename", "name": "orders_pub", "new_name": "orders_pub_v2"}),
+    )
+    .await;
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "set_owner", "name": "orders_pub_v2", "owner": scratch.user.clone()}),
+    )
+    .await;
+    let all_tables = rig
+        .failed(
+            "pg_publication",
+            json!({"operation": "create", "name": "everything_pub", "for_all_tables": true}),
+        )
+        .await;
+    assert_eq!(all_tables["code"], "sql.failed");
+    assert_eq!(all_tables["sqlstate"], "42501");
+    let drop_needs_confirm_pub = rig
+        .failed(
+            "pg_publication",
+            json!({"operation": "drop", "name": "orders_pub_v2"}),
+        )
+        .await;
+    assert_eq!(drop_needs_confirm_pub["code"], "confirmation.required");
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "drop", "name": "orders_pub_v2", "confirm": true}),
+    )
+    .await;
 
     let drop_needs_confirm = rig
         .failed(

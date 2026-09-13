@@ -5,6 +5,13 @@ use ownpg_core::config::{AppPaths, Environment, FlagLayer, Settings, Sources, re
 use tokio_postgres::NoTls;
 
 pub(crate) const DSN_VARIABLE: &str = "OWNPG_TEST_DSN";
+pub(crate) const PGBOUNCER_DSN_VARIABLE: &str = "OWNPG_TEST_PGBOUNCER_DSN";
+
+pub(crate) fn pgbouncer_admin_dsn() -> Option<String> {
+    std::env::var(PGBOUNCER_DSN_VARIABLE)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
 
 pub(crate) struct Scratch {
     pub(crate) maintenance_dsn: String,

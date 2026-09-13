@@ -325,37 +325,85 @@ pub struct DescribeArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct ObjectDescription {
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relation: Option<TableDescription>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sequence: Option<SequenceDescription>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub routines: Option<Vec<RoutineDescription>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub type_description: Option<TypeDescription>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<ExtensionDescription>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<RoleDescription>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub privileges: Option<Vec<PrivilegeRow>>,
-    pub notice: &'static str,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObjectDescription {
+    Table {
+        relation: TableDescription,
+        notice: &'static str,
+    },
+    View {
+        relation: TableDescription,
+        notice: &'static str,
+    },
+    MaterializedView {
+        relation: TableDescription,
+        notice: &'static str,
+    },
+    Index {
+        relation: TableDescription,
+        notice: &'static str,
+    },
+    Sequence {
+        sequence: SequenceDescription,
+        notice: &'static str,
+    },
+    Routine {
+        routines: Vec<RoutineDescription>,
+        notice: &'static str,
+    },
+    Type {
+        #[serde(rename = "type")]
+        type_description: TypeDescription,
+        notice: &'static str,
+    },
+    Extension {
+        extension: ExtensionDescription,
+        notice: &'static str,
+    },
+    Role {
+        role: RoleDescription,
+        notice: &'static str,
+    },
+    Privileges {
+        privileges: Vec<PrivilegeRow>,
+        notice: &'static str,
+    },
 }
 
 impl ObjectDescription {
-    fn empty(kind: &str) -> Self {
-        Self {
-            kind: kind.to_owned(),
-            relation: None,
-            sequence: None,
-            routines: None,
-            type_description: None,
-            extension: None,
-            role: None,
-            privileges: None,
-            notice: UNTRUSTED_NOTICE,
+    fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Table { .. } => "table",
+            Self::View { .. } => "view",
+            Self::MaterializedView { .. } => "materialized_view",
+            Self::Index { .. } => "index",
+            Self::Sequence { .. } => "sequence",
+            Self::Routine { .. } => "routine",
+            Self::Type { .. } => "type",
+            Self::Extension { .. } => "extension",
+            Self::Role { .. } => "role",
+            Self::Privileges { .. } => "privileges",
+        }
+    }
+
+    fn relation_variant(kind: ObjectType, relation: TableDescription) -> Self {
+        match kind {
+            ObjectType::View => Self::View {
+                relation,
+                notice: UNTRUSTED_NOTICE,
+            },
+            ObjectType::MaterializedView => Self::MaterializedView {
+                relation,
+                notice: UNTRUSTED_NOTICE,
+            },
+            ObjectType::Index => Self::Index {
+                relation,
+                notice: UNTRUSTED_NOTICE,
+            },
+            _ => Self::Table {
+                relation,
+                notice: UNTRUSTED_NOTICE,
+            },
         }
     }
 }
@@ -375,37 +423,33 @@ pub fn describe(call: Call, args: DescribeArgs) -> BoxFuture<'static, Outcome> {
         let description = match args.target {
             DescribeTarget::Auto => describe_auto(&context, name).await?,
             DescribeTarget::Relation => describe_relation_or_sequence(&context, name).await?,
-            DescribeTarget::Routine => {
-                let mut description = ObjectDescription::empty("routine");
-                description.routines = Some(catalog::describe_routines(engine, name).await?);
-                description
-            }
-            DescribeTarget::Type => {
-                let mut description = ObjectDescription::empty("type");
-                description.type_description = Some(catalog::describe_type(engine, name).await?);
-                description
-            }
-            DescribeTarget::Extension => {
-                let mut description = ObjectDescription::empty("extension");
-                description.extension = Some(catalog::describe_extension(engine, name).await?);
-                description
-            }
-            DescribeTarget::Role => {
-                let mut description = ObjectDescription::empty("role");
-                description.role = Some(catalog::describe_role(engine, name).await?);
-                description
-            }
+            DescribeTarget::Routine => ObjectDescription::Routine {
+                routines: catalog::describe_routines(engine, name).await?,
+                notice: UNTRUSTED_NOTICE,
+            },
+            DescribeTarget::Type => ObjectDescription::Type {
+                type_description: catalog::describe_type(engine, name).await?,
+                notice: UNTRUSTED_NOTICE,
+            },
+            DescribeTarget::Extension => ObjectDescription::Extension {
+                extension: catalog::describe_extension(engine, name).await?,
+                notice: UNTRUSTED_NOTICE,
+            },
+            DescribeTarget::Role => ObjectDescription::Role {
+                role: catalog::describe_role(engine, name).await?,
+                notice: UNTRUSTED_NOTICE,
+            },
             DescribeTarget::Privileges => {
                 let relation = catalog::resolve_relation(engine, name).await?;
-                let mut description = ObjectDescription::empty("privileges");
-                description.privileges =
-                    Some(catalog::describe_privileges(engine, &relation).await?);
-                description
+                ObjectDescription::Privileges {
+                    privileges: catalog::describe_privileges(engine, &relation).await?,
+                    notice: UNTRUSTED_NOTICE,
+                }
             }
         };
         let text = render_description(&description);
         let facts = AuditFacts {
-            operation: Some(description.kind.clone()),
+            operation: Some(description.kind_str().to_owned()),
             ..AuditFacts::default()
         };
         Ok(ToolOutput::structured(&description, text)?
@@ -421,13 +465,17 @@ async fn describe_relation_or_sequence(
     let engine = &context.engine;
     let relation = catalog::resolve_relation(engine, name).await?;
     if relation.kind == ObjectType::Sequence {
-        let mut description = ObjectDescription::empty("sequence");
-        description.sequence = Some(catalog::describe_sequence(engine, &relation).await?);
-        return Ok(description);
+        let sequence = catalog::describe_sequence(engine, &relation).await?;
+        return Ok(ObjectDescription::Sequence {
+            sequence,
+            notice: UNTRUSTED_NOTICE,
+        });
     }
-    let mut description = ObjectDescription::empty(relation.kind.as_str());
-    description.relation = Some(catalog::describe_relation(engine, &relation).await?);
-    Ok(description)
+    let described = catalog::describe_relation(engine, &relation).await?;
+    Ok(ObjectDescription::relation_variant(
+        relation.kind,
+        described,
+    ))
 }
 
 async fn describe_auto(context: &Context, name: &str) -> Result<ObjectDescription, Error> {
@@ -439,28 +487,29 @@ async fn describe_auto(context: &Context, name: &str) -> Result<ObjectDescriptio
     }
     match catalog::describe_routines(engine, name).await {
         Ok(routines) => {
-            let mut description = ObjectDescription::empty("routine");
-            description.routines = Some(routines);
-            return Ok(description);
+            return Ok(ObjectDescription::Routine {
+                routines,
+                notice: UNTRUSTED_NOTICE,
+            });
         }
         Err(Error::ArgumentInvalid { .. }) => {}
         Err(error) => return Err(error),
     }
     match catalog::describe_type(engine, name).await {
         Ok(type_description) => {
-            let mut description = ObjectDescription::empty("type");
-            description.type_description = Some(type_description);
-            return Ok(description);
+            return Ok(ObjectDescription::Type {
+                type_description,
+                notice: UNTRUSTED_NOTICE,
+            });
         }
         Err(Error::ArgumentInvalid { .. }) => {}
         Err(error) => return Err(error),
     }
     match catalog::describe_extension(engine, name).await {
-        Ok(extension) => {
-            let mut description = ObjectDescription::empty("extension");
-            description.extension = Some(extension);
-            Ok(description)
-        }
+        Ok(extension) => Ok(ObjectDescription::Extension {
+            extension,
+            notice: UNTRUSTED_NOTICE,
+        }),
         Err(Error::ExtensionMissing { .. }) => Err(Error::ArgumentInvalid {
             argument: "name".to_owned(),
             detail: format!(
@@ -476,261 +525,265 @@ fn render_description(description: &ObjectDescription) -> String {
     let mut out = String::new();
     out.push_str(UNTRUSTED_NOTICE);
     out.push('\n');
-    if let Some(relation) = &description.relation {
-        out.push_str(&format!(
-            "{} {}.{} ({}, {}, {} bytes total)\n",
-            relation.kind.as_str(),
-            relation.schema,
-            relation.name,
-            relation.persistence,
-            relation.estimated_rows.map_or_else(
-                || "row count not yet analyzed".to_owned(),
-                |rows| format!("about {rows} rows")
-            ),
-            relation.total_size_bytes
-        ));
-        if let Some(comment) = &relation.comment {
-            out.push_str(&format!("comment: {comment}\n"));
-        }
-        for column in &relation.columns {
-            let mut line = format!("  column {} {}", column.name, column.data_type);
-            if column.not_null {
-                line.push_str(" not null");
-            }
-            if let Some(default) = &column.default {
-                line.push_str(&format!(" default {default}"));
-            }
-            if let Some(identity) = &column.identity {
-                line.push_str(&format!(" identity {identity}"));
-            }
-            if let Some(generated) = &column.generated {
-                line.push_str(&format!(" generated {generated}"));
-            }
-            if let Some(comment) = &column.comment {
-                line.push_str(&format!(" ({comment})"));
-            }
-            out.push_str(&line);
-            out.push('\n');
-        }
-        for constraint in &relation.constraints {
+    match description {
+        ObjectDescription::Table { relation, .. }
+        | ObjectDescription::View { relation, .. }
+        | ObjectDescription::MaterializedView { relation, .. }
+        | ObjectDescription::Index { relation, .. } => {
             out.push_str(&format!(
-                "  constraint {} {}: {}{}\n",
-                constraint.name,
-                constraint.kind,
-                constraint.definition,
-                if constraint.validated {
-                    ""
-                } else {
-                    " (not validated)"
+                "{} {}.{} ({}, {}, {} bytes total)\n",
+                relation.kind.as_str(),
+                relation.schema,
+                relation.name,
+                relation.persistence,
+                relation.estimated_rows.map_or_else(
+                    || "row count not yet analyzed".to_owned(),
+                    |rows| format!("about {rows} rows")
+                ),
+                relation.total_size_bytes
+            ));
+            if let Some(comment) = &relation.comment {
+                out.push_str(&format!("comment: {comment}\n"));
+            }
+            for column in &relation.columns {
+                let mut line = format!("  column {} {}", column.name, column.data_type);
+                if column.not_null {
+                    line.push_str(" not null");
                 }
-            ));
-        }
-        for index in &relation.indexes {
-            out.push_str(&format!(
-                "  index {} ({} bytes){}: {}\n",
-                index.name,
-                index.size_bytes,
-                if index.valid { "" } else { " INVALID" },
-                index.definition
-            ));
-        }
-        for trigger in &relation.triggers {
-            out.push_str(&format!(
-                "  trigger {} [{}]: {}\n",
-                trigger.name, trigger.enable_mode, trigger.definition
-            ));
-        }
-        for policy in &relation.policies {
-            out.push_str(&format!(
-                "  policy {} for {} ({}) roles {}\n",
-                policy.name,
-                policy.command,
-                if policy.permissive {
-                    "permissive"
-                } else {
-                    "restrictive"
-                },
-                if policy.roles.is_empty() {
-                    "public".to_owned()
-                } else {
-                    policy.roles.join(", ")
+                if let Some(default) = &column.default {
+                    line.push_str(&format!(" default {default}"));
                 }
-            ));
-        }
-        if let Some(key) = &relation.partition_key {
-            out.push_str(&format!("  partition key: {key}\n"));
-            for partition in &relation.partitions {
+                if let Some(identity) = &column.identity {
+                    line.push_str(&format!(" identity {identity}"));
+                }
+                if let Some(generated) = &column.generated {
+                    line.push_str(&format!(" generated {generated}"));
+                }
+                if let Some(comment) = &column.comment {
+                    line.push_str(&format!(" ({comment})"));
+                }
+                out.push_str(&line);
+                out.push('\n');
+            }
+            for constraint in &relation.constraints {
                 out.push_str(&format!(
-                    "  partition {}: {}\n",
-                    partition.name,
-                    partition.bound.as_deref().unwrap_or("default")
+                    "  constraint {} {}: {}{}\n",
+                    constraint.name,
+                    constraint.kind,
+                    constraint.definition,
+                    if constraint.validated {
+                        ""
+                    } else {
+                        " (not validated)"
+                    }
                 ));
             }
-        }
-        if let Some(definition) = &relation.view_definition {
-            out.push_str("  definition:\n");
-            out.push_str(definition);
-            out.push('\n');
-        }
-        if let Some(populated) = relation.populated {
-            out.push_str(&format!("  populated: {populated}\n"));
-        }
-        return out;
-    }
-    if let Some(sequence) = &description.sequence {
-        out.push_str(&format!(
-            "sequence {}.{} {} start {} min {} max {} increment {} cache {}{}\n",
-            sequence.schema,
-            sequence.name,
-            sequence.data_type,
-            sequence.start,
-            sequence.min_value,
-            sequence.max_value,
-            sequence.increment,
-            sequence.cache,
-            if sequence.cycle { " cycle" } else { "" }
-        ));
-        if let Some(last) = sequence.last_value {
-            out.push_str(&format!("  last value: {last}\n"));
-        }
-        if let Some(owner) = &sequence.owned_by {
-            out.push_str(&format!("  owned by: {owner}\n"));
-        }
-        return out;
-    }
-    if let Some(routines) = &description.routines {
-        for routine in routines {
-            out.push_str(&format!(
-                "{} {} language {}{}{}\n",
-                routine.kind,
-                routine.signature,
-                routine.language,
-                routine
-                    .returns
-                    .as_ref()
-                    .map_or(String::new(), |returns| format!(" returns {returns}")),
-                if routine.security_definer {
-                    " security definer"
-                } else {
-                    ""
+            for index in &relation.indexes {
+                out.push_str(&format!(
+                    "  index {} ({} bytes){}: {}\n",
+                    index.name,
+                    index.size_bytes,
+                    if index.valid { "" } else { " INVALID" },
+                    index.definition
+                ));
+            }
+            for trigger in &relation.triggers {
+                out.push_str(&format!(
+                    "  trigger {} [{}]: {}\n",
+                    trigger.name, trigger.enable_mode, trigger.definition
+                ));
+            }
+            for policy in &relation.policies {
+                out.push_str(&format!(
+                    "  policy {} for {} ({}) roles {}\n",
+                    policy.name,
+                    policy.command,
+                    if policy.permissive {
+                        "permissive"
+                    } else {
+                        "restrictive"
+                    },
+                    if policy.roles.is_empty() {
+                        "public".to_owned()
+                    } else {
+                        policy.roles.join(", ")
+                    }
+                ));
+            }
+            if let Some(key) = &relation.partition_key {
+                out.push_str(&format!("  partition key: {key}\n"));
+                for partition in &relation.partitions {
+                    out.push_str(&format!(
+                        "  partition {}: {}\n",
+                        partition.name,
+                        partition.bound.as_deref().unwrap_or("default")
+                    ));
                 }
+            }
+            if let Some(definition) = &relation.view_definition {
+                out.push_str("  definition:\n");
+                out.push_str(definition);
+                out.push('\n');
+            }
+            if let Some(populated) = relation.populated {
+                out.push_str(&format!("  populated: {populated}\n"));
+            }
+        }
+        ObjectDescription::Sequence { sequence, .. } => {
+            out.push_str(&format!(
+                "sequence {}.{} {} start {} min {} max {} increment {} cache {}{}\n",
+                sequence.schema,
+                sequence.name,
+                sequence.data_type,
+                sequence.start,
+                sequence.min_value,
+                sequence.max_value,
+                sequence.increment,
+                sequence.cache,
+                if sequence.cycle { " cycle" } else { "" }
             ));
-            if let Some(comment) = &routine.comment {
+            if let Some(last) = sequence.last_value {
+                out.push_str(&format!("  last value: {last}\n"));
+            }
+            if let Some(owner) = &sequence.owned_by {
+                out.push_str(&format!("  owned by: {owner}\n"));
+            }
+        }
+        ObjectDescription::Routine { routines, .. } => {
+            for routine in routines {
+                out.push_str(&format!(
+                    "{} {} language {}{}{}\n",
+                    routine.kind,
+                    routine.signature,
+                    routine.language,
+                    routine
+                        .returns
+                        .as_ref()
+                        .map_or(String::new(), |returns| format!(" returns {returns}")),
+                    if routine.security_definer {
+                        " security definer"
+                    } else {
+                        ""
+                    }
+                ));
+                if let Some(comment) = &routine.comment {
+                    out.push_str(&format!("  comment: {comment}\n"));
+                }
+                for setting in &routine.config {
+                    out.push_str(&format!("  set {setting}\n"));
+                }
+                if let Some(definition) = &routine.definition {
+                    out.push_str(definition);
+                    if !definition.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        ObjectDescription::Type {
+            type_description, ..
+        } => {
+            out.push_str(&format!(
+                "type {}.{} ({})\n",
+                type_description.schema, type_description.name, type_description.kind
+            ));
+            if let Some(comment) = &type_description.comment {
                 out.push_str(&format!("  comment: {comment}\n"));
             }
-            for setting in &routine.config {
-                out.push_str(&format!("  set {setting}\n"));
+            if !type_description.enum_labels.is_empty() {
+                out.push_str(&format!(
+                    "  labels: {}\n",
+                    type_description.enum_labels.join(", ")
+                ));
             }
-            if let Some(definition) = &routine.definition {
-                out.push_str(definition);
-                if !definition.ends_with('\n') {
-                    out.push('\n');
-                }
+            for attribute in &type_description.attributes {
+                out.push_str(&format!(
+                    "  attribute {} {}\n",
+                    attribute.name, attribute.data_type
+                ));
+            }
+            if let Some(base) = &type_description.base_type {
+                out.push_str(&format!("  base type: {base}\n"));
+            }
+            for constraint in &type_description.constraints {
+                out.push_str(&format!("  constraint: {constraint}\n"));
+            }
+            if let Some(subtype) = &type_description.range_subtype {
+                out.push_str(&format!("  range of: {subtype}\n"));
             }
         }
-        return out;
-    }
-    if let Some(type_description) = &description.type_description {
-        out.push_str(&format!(
-            "type {}.{} ({})\n",
-            type_description.schema, type_description.name, type_description.kind
-        ));
-        if let Some(comment) = &type_description.comment {
-            out.push_str(&format!("  comment: {comment}\n"));
-        }
-        if !type_description.enum_labels.is_empty() {
+        ObjectDescription::Extension { extension, .. } => {
             out.push_str(&format!(
-                "  labels: {}\n",
-                type_description.enum_labels.join(", ")
-            ));
-        }
-        for attribute in &type_description.attributes {
-            out.push_str(&format!(
-                "  attribute {} {}\n",
-                attribute.name, attribute.data_type
-            ));
-        }
-        if let Some(base) = &type_description.base_type {
-            out.push_str(&format!("  base type: {base}\n"));
-        }
-        for constraint in &type_description.constraints {
-            out.push_str(&format!("  constraint: {constraint}\n"));
-        }
-        if let Some(subtype) = &type_description.range_subtype {
-            out.push_str(&format!("  range of: {subtype}\n"));
-        }
-        return out;
-    }
-    if let Some(extension) = &description.extension {
-        out.push_str(&format!(
-            "extension {} version {} in schema {}{}\n",
-            extension.name,
-            extension.version,
-            extension.schema,
-            if extension.relocatable {
-                " (relocatable)"
-            } else {
-                ""
-            }
-        ));
-        if let Some(comment) = &extension.comment {
-            out.push_str(&format!("  comment: {comment}\n"));
-        }
-        return out;
-    }
-    if let Some(role) = &description.role {
-        let mut attributes = Vec::new();
-        if role.superuser {
-            attributes.push("superuser");
-        }
-        if role.create_db {
-            attributes.push("createdb");
-        }
-        if role.create_role {
-            attributes.push("createrole");
-        }
-        if role.can_login {
-            attributes.push("login");
-        }
-        if role.replication {
-            attributes.push("replication");
-        }
-        if role.bypass_rls {
-            attributes.push("bypassrls");
-        }
-        if !role.inherit {
-            attributes.push("noinherit");
-        }
-        out.push_str(&format!(
-            "role {} [{}] connection limit {}\n",
-            role.name,
-            attributes.join(", "),
-            role.connection_limit
-        ));
-        if let Some(until) = &role.valid_until {
-            out.push_str(&format!("  valid until: {until}\n"));
-        }
-        if !role.member_of.is_empty() {
-            out.push_str(&format!("  member of: {}\n", role.member_of.join(", ")));
-        }
-        for setting in &role.config {
-            out.push_str(&format!("  set {setting}\n"));
-        }
-        return out;
-    }
-    if let Some(privileges) = &description.privileges {
-        for grant in privileges {
-            out.push_str(&format!(
-                "  {} has {}{} (granted by {})\n",
-                grant.grantee,
-                grant.privilege,
-                if grant.grantable {
-                    " with grant option"
+                "extension {} version {} in schema {}{}\n",
+                extension.name,
+                extension.version,
+                extension.schema,
+                if extension.relocatable {
+                    " (relocatable)"
                 } else {
                     ""
-                },
-                grant.grantor
+                }
             ));
+            if let Some(comment) = &extension.comment {
+                out.push_str(&format!("  comment: {comment}\n"));
+            }
+        }
+        ObjectDescription::Role { role, .. } => {
+            let mut attributes = Vec::new();
+            if role.superuser {
+                attributes.push("superuser");
+            }
+            if role.create_db {
+                attributes.push("createdb");
+            }
+            if role.create_role {
+                attributes.push("createrole");
+            }
+            if role.can_login {
+                attributes.push("login");
+            }
+            if role.replication {
+                attributes.push("replication");
+            }
+            if role.bypass_rls {
+                attributes.push("bypassrls");
+            }
+            if !role.inherit {
+                attributes.push("noinherit");
+            }
+            out.push_str(&format!(
+                "role {} [{}] connection limit {}\n",
+                role.name,
+                attributes.join(", "),
+                role.connection_limit
+            ));
+            if let Some(until) = &role.valid_until {
+                out.push_str(&format!("  valid until: {until}\n"));
+            }
+            if !role.member_of.is_empty() {
+                out.push_str(&format!("  member of: {}\n", role.member_of.join(", ")));
+            }
+            for setting in &role.config {
+                out.push_str(&format!("  set {setting}\n"));
+            }
+        }
+        ObjectDescription::Privileges { privileges, .. } => {
+            if privileges.is_empty() {
+                out.push_str("  no privileges are granted on this object\n");
+            }
+            for grant in privileges {
+                out.push_str(&format!(
+                    "  {} has {}{} (granted by {})\n",
+                    grant.grantee,
+                    grant.privilege,
+                    if grant.grantable {
+                        " with grant option"
+                    } else {
+                        ""
+                    },
+                    grant.grantor
+                ));
+            }
         }
     }
     out

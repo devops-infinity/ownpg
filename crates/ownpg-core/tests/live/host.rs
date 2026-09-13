@@ -334,7 +334,7 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
     let count = rig
         .ok("pg_run_query", json!({"sql": "SELECT count(*) FROM items"}))
         .await;
-    assert_eq!(count["rows"][0][0], "3");
+    assert_eq!(count["rows"][0][0], 3);
 
     let needs_confirm = rig
         .failed("pg_restore", json!({"file": "app.dump", "clean": true}))

@@ -678,6 +678,17 @@ fn walk(value: &Value, found: &mut Findings) {
                             note_destructive(found, reason);
                         }
                     }
+                    "AlterPublicationStmt" => match child.get("action").and_then(Value::as_i64) {
+                        Some(2) => note_destructive(
+                            found,
+                            "ALTER PUBLICATION DROP TABLE stops replicating the named tables",
+                        ),
+                        Some(3) => note_destructive(
+                            found,
+                            "ALTER PUBLICATION SET TABLE replaces the whole table list; any table left out stops replicating",
+                        ),
+                        _ => {}
+                    },
                     "IndexStmt" | "ReindexStmt" => {
                         if child
                             .get("concurrent")
