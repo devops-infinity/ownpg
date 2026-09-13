@@ -15,6 +15,7 @@ mod engine;
 mod host;
 mod http;
 mod ops;
+mod pooler;
 mod resources;
 mod server;
 mod ssh;

@@ -2368,7 +2368,7 @@ async fn fetch_rows(
         .map_err(|error| describe_sqlstate(&error))
 }
 
-fn collect_messages(messages: Vec<SimpleQueryMessage>, caps: Caps) -> ResultSet {
+pub(crate) fn collect_messages(messages: Vec<SimpleQueryMessage>, caps: Caps) -> ResultSet {
     let mut columns: Vec<Column> = Vec::new();
     let mut collector: Option<Collector> = None;
     let mut affected = None;

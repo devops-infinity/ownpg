@@ -288,7 +288,7 @@ async fn the_typed_write_tools_insert_update_delete_merge_and_copy() {
     let count = rig
         .call("pg_run_query", json!({"sql": "SELECT count(*) FROM items"}))
         .await;
-    assert_eq!(structured(&count)["rows"][0][0], "8");
+    assert_eq!(structured(&count)["rows"][0][0], 8);
     rig.finish().await;
 }
 
@@ -422,7 +422,7 @@ async fn transaction_handles_commit_roll_back_and_refuse_other_principals() {
             json!({"sql": "SELECT count(*) FROM items WHERE id = 50"}),
         )
         .await;
-    assert_eq!(structured(&invisible)["rows"][0][0], "0");
+    assert_eq!(structured(&invisible)["rows"][0][0], 0);
 
     let without_handle = alice
         .call(
@@ -490,7 +490,7 @@ async fn transaction_handles_commit_roll_back_and_refuse_other_principals() {
         .await;
     let body = structured(&visible);
     assert_eq!(body["row_count"], 1);
-    assert_eq!(body["rows"][0][0], "50");
+    assert_eq!(body["rows"][0][0], 50);
 
     let again = alice
         .call(
@@ -536,7 +536,7 @@ async fn transaction_handles_commit_roll_back_and_refuse_other_principals() {
             json!({"sql": "SELECT count(*) FROM items WHERE id = 50"}),
         )
         .await;
-    assert_eq!(structured(&still_there)["rows"][0][0], "1");
+    assert_eq!(structured(&still_there)["rows"][0][0], 1);
     alice.finish().await;
     bob.finish().await;
 }
@@ -604,8 +604,8 @@ async fn an_unparsed_statement_is_reported_by_a_dry_run_and_never_runs_in_any_mo
             json!({"sql": "SELECT count(*), sum(qty) FROM items"}),
         )
         .await;
-    assert_eq!(structured(&untouched)["rows"][0][0], "3");
-    assert_eq!(structured(&untouched)["rows"][0][1], "6");
+    assert_eq!(structured(&untouched)["rows"][0][0], 3);
+    assert_eq!(structured(&untouched)["rows"][0][1], 6);
     let data_dir = read_write.data_dir.clone();
     read_write.finish().await;
     let audit_file = std::fs::read_dir(&data_dir)
@@ -680,7 +680,7 @@ async fn an_unparsed_statement_cannot_smuggle_ddl_through_the_write_tool() {
             }),
         )
         .await;
-    assert_eq!(structured(&created)["rows"][0][0], "0");
+    assert_eq!(structured(&created)["rows"][0][0], 0);
     rig.finish().await;
 }
 

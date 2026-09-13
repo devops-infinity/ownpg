@@ -209,7 +209,7 @@ async fn maintenance_tools_vacuum_analyze_reindex_and_refresh_with_progress() {
     let counted = rig
         .ok("pg_run_query", json!({"sql": "SELECT n FROM event_counts"}))
         .await;
-    assert_eq!(counted["rows"][0][0], "10000");
+    assert_eq!(counted["rows"][0][0], 10000);
 
     let health = rig.ok("pg_indexes_health", json!({})).await;
     let problems: Vec<String> = health["rows"]

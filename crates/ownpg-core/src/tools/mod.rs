@@ -6,6 +6,7 @@ pub mod host;
 pub mod maintenance;
 pub mod monitoring;
 pub mod objects;
+pub mod pooler;
 pub mod read;
 pub mod roles;
 pub mod transaction;
@@ -385,6 +386,7 @@ pub fn all_routes() -> Result<Vec<Route>, Error> {
     routes.extend(maintenance::routes()?);
     routes.extend(host::routes()?);
     routes.extend(monitoring::routes()?);
+    routes.extend(pooler::routes()?);
     Ok(routes)
 }
 

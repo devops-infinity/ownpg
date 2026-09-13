@@ -6,7 +6,7 @@ use ownpg_core::ErrorId;
 use ownpg_core::config::FlagLayer;
 use ownpg_core::connect::ssh::Hints;
 use ownpg_core::engine::Engine;
-use ownpg_core::shape::{Caps, Truncation};
+use ownpg_core::shape::{Caps, Cell, Truncation};
 
 async fn engine_with_rows(scratch: &support::Scratch, rows: i32) -> Engine {
     let client = scratch.client().await;
@@ -45,14 +45,23 @@ async fn a_large_select_is_paged_through_a_cursor_in_order() {
     assert_eq!(first.truncated_by, Some(Truncation::Rows));
     assert_eq!(first.columns[0].type_name, "int4");
     assert_eq!(first.columns[1].type_name, "text");
-    assert_eq!(first.rows[0][0].as_deref(), Some("1"));
-    assert_eq!(first.rows[99][0].as_deref(), Some("100"));
+    assert_eq!(
+        first.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        first.rows[99][0].as_ref().map(Cell::text).as_deref(),
+        Some("100")
+    );
     assert!(first.estimate.is_some());
     let cursor = first.cursor.clone().expect("a cursor handle");
     assert_eq!(engine.open_cursors().await.len(), 1);
 
     let second = engine.fetch(&cursor, caps, "tester").await.unwrap();
-    assert_eq!(second.rows[0][0].as_deref(), Some("101"));
+    assert_eq!(
+        second.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("101")
+    );
     assert_eq!(second.row_count, 100);
     assert_eq!(second.cursor.as_deref(), Some(cursor.as_str()));
 
@@ -82,14 +91,20 @@ async fn a_small_select_leaves_no_cursor_and_the_transaction_ends() {
         .await
         .unwrap();
     assert_eq!(result.row_count, 1);
-    assert_eq!(result.rows[0][0].as_deref(), Some("5"));
+    assert_eq!(
+        result.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("5")
+    );
     assert!(result.cursor.is_none());
     assert!(engine.open_cursors().await.is_empty());
     let state = engine
         .run_read("SHOW transaction_read_only", caps)
         .await
         .unwrap();
-    assert_eq!(state.rows[0][0].as_deref(), Some("on"));
+    assert_eq!(
+        state.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("on")
+    );
 }
 
 #[tokio::test]
@@ -110,7 +125,10 @@ async fn a_write_that_slips_past_the_classifier_is_stopped_by_the_read_only_tran
         .run_read_paged("SELECT count(*) FROM big", true, caps, "tester")
         .await
         .unwrap();
-    assert_eq!(after.rows[0][0].as_deref(), Some("3"));
+    assert_eq!(
+        after.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("3")
+    );
 }
 
 #[tokio::test]
@@ -143,7 +161,10 @@ async fn a_lost_connection_is_reconnected_once_and_cursors_are_gone() {
         .run_read_paged("SELECT 1", true, caps, "tester")
         .await
         .expect("the engine reconnects once");
-    assert_eq!(again.rows[0][0].as_deref(), Some("1"));
+    assert_eq!(
+        again.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("1")
+    );
     let gone = engine.fetch(&cursor, caps, "tester").await.unwrap_err();
     assert_eq!(gone.id(), ErrorId::HandleState);
     assert_eq!(info.database, scratch.database);
@@ -254,14 +275,23 @@ async fn pooled_mode_pins_every_setting_per_transaction_with_set_local() {
         cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
     };
     let search_path = engine.run_read("SHOW search_path", caps).await.unwrap();
-    assert_eq!(search_path.rows[0][0].as_deref(), Some(r#""""#));
+    assert_eq!(
+        search_path.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some(r#""""#)
+    );
     let timeout = engine
         .run_read("SHOW statement_timeout", caps)
         .await
         .unwrap();
-    assert_eq!(timeout.rows[0][0].as_deref(), Some("7s"));
+    assert_eq!(
+        timeout.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("7s")
+    );
     let encoding = engine.run_read("SHOW client_encoding", caps).await.unwrap();
-    assert_eq!(encoding.rows[0][0].as_deref(), Some("UTF8"));
+    assert_eq!(
+        encoding.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("UTF8")
+    );
     let inserted = engine
         .run_write(
             "INSERT INTO app.big (id, name) VALUES (1, 'one') RETURNING id",
@@ -272,7 +302,10 @@ async fn pooled_mode_pins_every_setting_per_transaction_with_set_local() {
         )
         .await
         .unwrap();
-    assert_eq!(inserted.rows[0][0].as_deref(), Some("1"));
+    assert_eq!(
+        inserted.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("1")
+    );
     let handle = engine.begin_transaction("tester").await.unwrap();
     let inside = engine
         .run_write(
@@ -284,7 +317,10 @@ async fn pooled_mode_pins_every_setting_per_transaction_with_set_local() {
         )
         .await
         .unwrap();
-    assert_eq!(inside.rows[0][0].as_deref(), Some("7s"));
+    assert_eq!(
+        inside.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("7s")
+    );
     engine.commit(&handle.id, "tester").await.unwrap();
     let outside: String = scratch
         .client()
@@ -353,12 +389,18 @@ async fn pooled_handles_give_each_principal_its_own_connection() {
         )
         .await
         .unwrap();
-    assert_eq!(plain.rows[0][0].as_deref(), Some("2"));
+    assert_eq!(
+        plain.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("2")
+    );
     let unseen = engine
         .run_read("SELECT count(*) FROM big", caps)
         .await
         .unwrap();
-    assert_eq!(unseen.rows[0][0].as_deref(), Some("1"));
+    assert_eq!(
+        unseen.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("1")
+    );
     let saved = engine.savepoint(&alice.id, "alice", "s1").await.unwrap();
     assert_eq!(saved.savepoints, ["s1"]);
     engine.rollback_to(&alice.id, "alice", "s1").await.unwrap();
@@ -373,7 +415,10 @@ async fn pooled_handles_give_each_principal_its_own_connection() {
         .run_read("SELECT count(*) FROM big", caps)
         .await
         .unwrap();
-    assert_eq!(seen.rows[0][0].as_deref(), Some("2"));
+    assert_eq!(
+        seen.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("2")
+    );
     engine.release_everything().await.unwrap();
 }
 
@@ -405,7 +450,10 @@ async fn the_second_local_connection_closes_with_the_handle() {
         .run_read("SELECT count(*) FROM big", caps)
         .await
         .unwrap();
-    assert_eq!(read.rows[0][0].as_deref(), Some("5"));
+    assert_eq!(
+        read.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("5")
+    );
     assert_eq!(count().await, 2, "the read opened the second connection");
     engine.commit(&handle.id, "tester").await.unwrap();
     for _ in 0..50 {
@@ -490,14 +538,20 @@ async fn a_failed_copy_inside_a_handle_leaves_the_handle_usable_and_committable(
         )
         .await
         .expect("the handle is still usable after the failed COPY");
-    assert_eq!(inserted.rows[0][0].as_deref(), Some("10"));
+    assert_eq!(
+        inserted.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("10")
+    );
     let committed = engine.commit(&handle.id, "tester").await.unwrap();
     assert_eq!(committed.state.as_str(), "committed");
     let seen = engine
         .run_read("SELECT count(*) FROM big", caps)
         .await
         .unwrap();
-    assert_eq!(seen.rows[0][0].as_deref(), Some("4"));
+    assert_eq!(
+        seen.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("4")
+    );
 }
 
 #[tokio::test]
@@ -560,7 +614,10 @@ async fn the_cursor_cap_is_refused_rather_than_silently_downgraded() {
         .run_read("SELECT count(*) FROM big", caps)
         .await
         .expect("reads without a cursor still run");
-    assert_eq!(plain.rows[0][0].as_deref(), Some("30"));
+    assert_eq!(
+        plain.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("30")
+    );
     for cursor in cursors {
         engine.close_cursor(&cursor, "tester").await.unwrap();
     }

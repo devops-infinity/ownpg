@@ -210,6 +210,10 @@ pub const PG_TRIGGER: ToolSpec = ddl_tool("pg_trigger", "Create, drop, or toggle
 pub const PG_TYPE: ToolSpec = ddl_tool("pg_type", "Create, alter, or drop a type");
 pub const PG_EXTENSION: ToolSpec =
     ddl_tool("pg_extension", "Install, update, or drop an extension");
+pub const PG_PUBLICATION: ToolSpec = ddl_tool(
+    "pg_publication",
+    "Create, alter, rename, or drop a publication",
+);
 pub const PG_COMMENT: ToolSpec = write_tool(
     "pg_comment",
     "Set or remove a comment",
@@ -270,18 +274,8 @@ pub const PG_ANALYZE: ToolSpec = maintenance_tool("pg_analyze", "Run ANALYZE", f
 pub const PG_REINDEX: ToolSpec = maintenance_tool("pg_reindex", "Rebuild indexes", false);
 pub const PG_REFRESH: ToolSpec =
     maintenance_tool("pg_refresh", "Refresh a materialized view", false);
-pub const PG_VACUUM_NEEDS: ToolSpec = ToolSpec {
-    name: "pg_vacuum_needs",
-    title: "Report tables that need a vacuum",
-    group: Some(ToolGroup::Maintenance),
-    modes: WRITE_MODES,
-    scope: SCOPE_MAINTENANCE,
-    read_only: true,
-    destructive: false,
-    idempotent: true,
-    program: None,
-    deprecated: None,
-};
+pub const PG_VACUUM_NEEDS: ToolSpec =
+    monitoring_tool("pg_vacuum_needs", "Report tables that need a vacuum");
 pub const PG_BACKEND: ToolSpec =
     maintenance_tool("pg_backend", "Cancel or terminate a backend", true);
 pub const PG_ACTIVITY: ToolSpec = monitoring_tool("pg_activity", "List running sessions");
@@ -296,6 +290,8 @@ pub const PG_BLOAT: ToolSpec = monitoring_tool("pg_bloat", "Estimate table and i
 pub const PG_SETTINGS: ToolSpec = monitoring_tool("pg_settings", "List server settings");
 pub const PG_TOP_QUERIES: ToolSpec =
     monitoring_tool("pg_top_queries", "List the most expensive statements");
+pub const PG_POOL_STATUS: ToolSpec =
+    monitoring_tool("pg_pool_status", "Report PgBouncer connection-pool status");
 
 const fn host_tool(
     name: &'static str,
@@ -385,6 +381,7 @@ pub const TOOLS: &[ToolSpec] = &[
     PG_TRIGGER,
     PG_TYPE,
     PG_EXTENSION,
+    PG_PUBLICATION,
     PG_COMMENT,
     PG_ROLE,
     PG_GRANT,
@@ -404,6 +401,7 @@ pub const TOOLS: &[ToolSpec] = &[
     PG_BLOAT,
     PG_SETTINGS,
     PG_TOP_QUERIES,
+    PG_POOL_STATUS,
     PG_DUMP,
     PG_DUMPALL_GLOBALS,
     PG_RESTORE,

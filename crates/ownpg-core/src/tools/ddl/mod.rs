@@ -1,4 +1,5 @@
 pub mod index;
+pub mod publication;
 pub mod routine;
 pub mod table;
 pub mod types;
@@ -197,6 +198,7 @@ pub fn routes() -> Result<Vec<Route>> {
     routes.extend(index::routes()?);
     routes.extend(routine::routes()?);
     routes.extend(types::routes()?);
+    routes.extend(publication::routes()?);
     Ok(routes)
 }
 

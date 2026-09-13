@@ -9,6 +9,7 @@ use ownpg_core::config::profile::{ProfileEntry, ProfileFile, SshEntry};
 use ownpg_core::config::{Environment, FlagLayer, Sources, resolve};
 use ownpg_core::connect::ssh::Hints;
 use ownpg_core::connect::{Connector, Via};
+use ownpg_core::shape::Cell;
 use russh::keys::known_hosts::learn_known_hosts_path;
 use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
@@ -532,7 +533,8 @@ async fn a_pooled_engine_opens_one_tunnel_per_pooled_connection() {
         .await
         .unwrap();
     let count: i64 = distinct_pids.rows[0][0]
-        .as_deref()
+        .as_ref()
+        .map(Cell::text)
         .unwrap()
         .parse()
         .unwrap();

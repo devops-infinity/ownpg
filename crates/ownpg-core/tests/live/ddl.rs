@@ -113,6 +113,7 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
         "pg_type",
         "pg_extension",
         "pg_comment",
+        "pg_publication",
         "pg_role",
         "pg_grant",
         "pg_policy",
@@ -500,6 +501,62 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
         .await;
     assert_eq!(mine["has_schema_usage"], true);
     assert!(!mine["tables"].as_array().unwrap().is_empty());
+
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "create", "name": "orders_pub", "tables": ["orders"], "publish": "insert, update"}),
+    )
+    .await;
+    let seen = rig
+        .ok(
+            "pg_run_query",
+            json!({"sql": "SELECT pubname, puballtables FROM pg_publication WHERE pubname = 'orders_pub'"}),
+        )
+        .await;
+    assert_eq!(seen["rows"][0][0], "orders_pub");
+    assert_eq!(seen["rows"][0][1], false);
+    let both_set = rig
+        .failed(
+            "pg_publication",
+            json!({"operation": "create", "name": "bad_pub", "for_all_tables": true, "tables": ["orders"]}),
+        )
+        .await;
+    assert_eq!(both_set["code"], "argument.invalid");
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "set_tables", "name": "orders_pub", "tables": ["orders"]}),
+    )
+    .await;
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "rename", "name": "orders_pub", "new_name": "orders_pub_v2"}),
+    )
+    .await;
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "set_owner", "name": "orders_pub_v2", "owner": scratch.user.clone()}),
+    )
+    .await;
+    let all_tables = rig
+        .failed(
+            "pg_publication",
+            json!({"operation": "create", "name": "everything_pub", "for_all_tables": true}),
+        )
+        .await;
+    assert_eq!(all_tables["code"], "sql.failed");
+    assert_eq!(all_tables["sqlstate"], "42501");
+    let drop_needs_confirm_pub = rig
+        .failed(
+            "pg_publication",
+            json!({"operation": "drop", "name": "orders_pub_v2"}),
+        )
+        .await;
+    assert_eq!(drop_needs_confirm_pub["code"], "confirmation.required");
+    rig.ok(
+        "pg_publication",
+        json!({"operation": "drop", "name": "orders_pub_v2", "confirm": true}),
+    )
+    .await;
 
     let drop_needs_confirm = rig
         .failed(
