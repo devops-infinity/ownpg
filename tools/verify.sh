@@ -66,6 +66,7 @@ fi
 hits=$(git ls-files -- crates tools ':(top,glob)*.md' ':(exclude)**/LICENSE-*' |
 	xargs grep -nIE 'legacy|backward.compat|inspired by|based on|ported from|fork of' 2>/dev/null |
 	grep -v '^tools/release\.sh:' |
+	grep -v '^tools/verify\.sh:' |
 	grep -v 'with_legacy_session_mode' || true)
 if [[ -n "$hits" ]]; then
 	printf '%s\n' "$hits"
