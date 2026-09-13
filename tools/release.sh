@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+source "$REPO/tools/lib.sh"
 LIB_CRATE="ownpg-core"
 BIN_CRATE="ownpg"
 ROOT_MANIFEST="Cargo.toml"
@@ -17,7 +18,7 @@ BRANCH="main"
 REMOTE="origin"
 PUBLIC_RELEASE_REPO="devops-infinity/ownpg-releases"
 RELEASE_URL_BASE="https://github.com/devops-infinity/ownpg-releases/releases/tag"
-REGISTRY_API="https://crates.io/api/v1/crates"
+CRATES_API="https://crates.io/api/v1/crates"
 USER_AGENT="ownpg-release-script (+https://github.com/devops-infinity/ownpg-releases)"
 MINISIGN_KEY="${OWNPG_MINISIGN_KEY:-$HOME/.minisign/minisign.key}"
 AUDIT_EXEMPT=" release.sh "
@@ -32,6 +33,7 @@ ASSUME_YES=0
 STEP="startup"
 STEP_NO=0
 WORK_DIR=""
+LOCK_DIR=""
 MUTATED=0
 IRREVERSIBLE=0
 UPLOADED=0
@@ -70,6 +72,7 @@ formula, the npm package, and cargo-binstall actually resolve against.
 
 Environment:
   OWNPG_MINISIGN_KEY        the minisign secret key (default ~/.minisign/minisign.key)
+  OWNPG_MINISIGN_PUB        the minisign public key file name (default minisign.pub)
   OWNPG_CODESIGN_IDENTITY   Developer ID Application identity for the macOS binaries
   OWNPG_NOTARY_PROFILE      notarytool keychain profile; unset skips signing with a warning
   OWNPG_WINDOWS_SIGN_CERT   PKCS#12 certificate for the Windows binaries, signed with osslsigncode
@@ -77,13 +80,8 @@ Environment:
   OWNPG_HOMEBREW_TAP        the tap repository (default devops-infinity/homebrew-tap)
   OWNPG_SKIP_TAP            set to 1 to leave the formula in target/distrib instead of pushing it
   OWNPG_SKIP_NPM            set to 1 to leave the npm package in target/distrib instead of publishing it
+  OWNPG_ALLOW_PARTIAL       set to 1 to continue past a missing cross toolchain instead of stopping
 USAGE
-}
-
-say() { printf '[%s] %s\n' "$1" "$2"; }
-die() {
-	say FAILED "$1"
-	exit 1
 }
 
 step() {
@@ -115,6 +113,7 @@ print_manual_finish() {
 }
 
 cleanup() {
+	local status=$?
 	if [[ $MUTATED -eq 1 ]]; then
 		if [[ $IRREVERSIBLE -eq 0 ]]; then
 			restore_tree
@@ -128,7 +127,14 @@ cleanup() {
 		print_manual_binary_steps
 	fi
 	if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
-		rm -rf -- "$WORK_DIR"
+		if [[ $status -ne 0 ]]; then
+			say INFO "full logs kept at: $WORK_DIR"
+		else
+			rm -rf -- "$WORK_DIR"
+		fi
+	fi
+	if [[ -n "$LOCK_DIR" && -d "$LOCK_DIR" ]]; then
+		rmdir -- "$LOCK_DIR" 2>/dev/null || true
 	fi
 }
 
@@ -148,7 +154,7 @@ run() {
 	"$@" >"$log" 2>&1 || code=$?
 	if [[ $code -ne 0 ]]; then
 		say INFO "last 40 lines of output:"
-		tail -n 40 "$log"
+		tail -n 40 "$log" >&2
 		say FAILED "$label (exit $code)"
 		exit "$code"
 	fi
@@ -245,8 +251,9 @@ version_greater() {
 fetch_crate() {
 	local name="$1"
 	CRATE_BODY_FILE="$WORK_DIR/crate-$name.json"
-	CRATE_HTTP_STATUS="$(curl -sS -A "$USER_AGENT" --max-time 30 -o "$CRATE_BODY_FILE" \
-		-w '%{http_code}' "$REGISTRY_API/$name" 2>/dev/null || printf '000')"
+	CRATE_HTTP_STATUS="$(curl -sS -A "$USER_AGENT" --connect-timeout 10 --max-time 30 \
+		--retry 3 --retry-delay 2 -o "$CRATE_BODY_FILE" \
+		-w '%{http_code}' "$CRATES_API/$name" 2>/dev/null || printf '000')"
 }
 
 crate_has_version() {
@@ -263,6 +270,9 @@ published_already() {
 		;;
 	200)
 		crate_has_version "$VERSION"
+		;;
+	000)
+		die "could not reach crates.io for $name (network error); check the connection and try again"
 		;;
 	*)
 		die "crates.io answered $CRATE_HTTP_STATUS for $name"
@@ -384,7 +394,7 @@ check_deny() {
 	cargo deny check >"$log" 2>&1 || code=$?
 	if [[ $code -ne 0 ]]; then
 		say INFO "last 40 lines of output:"
-		tail -n 40 "$log"
+		tail -n 40 "$log" >&2
 		die "cargo deny check failed: $(deny_reasons "$code")"
 	fi
 	say SUCCESS "cargo deny check"
@@ -422,6 +432,14 @@ restore_tree() {
 	MUTATED=0
 }
 
+replace_atomically() {
+	local target="$1" source="$2" dir temp
+	dir="$(dirname -- "$target")"
+	temp="$(mktemp "$dir/.replace.XXXXXX")" || die "could not create a temp file for $target"
+	cat -- "$source" >"$temp"
+	mv -f -- "$temp" "$target"
+}
+
 rewrite_file() {
 	local target="$1" program="$2"
 	shift 2
@@ -431,7 +449,7 @@ rewrite_file() {
 		rm -f -- "$temp"
 		return "$code"
 	fi
-	cat -- "$temp" >"$target"
+	replace_atomically "$target" "$temp"
 	rm -f -- "$temp"
 }
 
@@ -468,12 +486,12 @@ bump_workspace_version() {
 
 	jq --arg version "$VERSION" '.version = $version' "$MCPB_MANIFEST" >"$WORK_DIR/mcpb-manifest.json" ||
 		die "could not bump $MCPB_MANIFEST"
-	cat -- "$WORK_DIR/mcpb-manifest.json" >"$MCPB_MANIFEST"
+	replace_atomically "$MCPB_MANIFEST" "$WORK_DIR/mcpb-manifest.json"
 	say SUCCESS "$MCPB_MANIFEST version is $VERSION"
 
 	jq --arg version "$VERSION" '.version = $version | .packages |= map(if .registryType == "cargo" then .version = $version else . end)' \
 		"$REGISTRY_MANIFEST" >"$WORK_DIR/registry-manifest.json" || die "could not bump $REGISTRY_MANIFEST"
-	cat -- "$WORK_DIR/registry-manifest.json" >"$REGISTRY_MANIFEST"
+	replace_atomically "$REGISTRY_MANIFEST" "$WORK_DIR/registry-manifest.json"
 	say SUCCESS "$REGISTRY_MANIFEST version is $VERSION"
 }
 
@@ -559,7 +577,7 @@ publish_crate() {
 			say INFO "$name $VERSION did not reach crates.io; nothing was published"
 		fi
 		say INFO "last 40 lines of output:"
-		tail -n 40 "$log"
+		tail -n 40 "$log" >&2
 		die "publishing $name failed (exit $code)"
 	fi
 	UPLOADED=1
@@ -571,7 +589,7 @@ dist_targets() {
 	dist plan --tag="v$VERSION" --output-format=json >"$plan" 2>"$log" || code=$?
 	if [[ $code -ne 0 ]]; then
 		say INFO "last 40 lines of output:"
-		tail -n 40 "$log"
+		tail -n 40 "$log" >&2
 		die "dist plan failed (exit $code) for v$VERSION"
 	fi
 	jq -er '.ci.github.artifacts_matrix.include[].targets[]' "$plan" ||
@@ -626,7 +644,7 @@ build_dist_artifacts() {
 			tail -n 15 "$log" | sed 's/^/    /'
 		else
 			say INFO "last 40 lines of output:"
-			tail -n 40 "$log"
+			tail -n 40 "$log" >&2
 			die "$target failed to build and it does not look like a missing cross toolchain; this may be a real defect, not something safe to skip"
 		fi
 	done
@@ -719,6 +737,7 @@ sign_windows_binaries() {
 	require_tools osslsigncode
 	local pass_file="$WORK_DIR/windows-sign.pass"
 	(umask 077 && printf '%s' "$pass" >"$pass_file") || die "could not stage the signing password"
+	unset OWNPG_WINDOWS_SIGN_PASS pass
 	local target archive stage exe
 	for target in "$@"; do
 		[[ "$target" == *-pc-windows-msvc ]] || continue
@@ -826,7 +845,7 @@ build_mcpb_bundles() {
 	say SUCCESS "built ${#bundles[@]} MCPB bundle(s)"
 }
 
-write_server_json() {
+write_registry_manifest() {
 	local bundle name sha packages
 	packages="$(jq -c --arg version "$VERSION" '.packages | map(select(.registryType == "cargo") | .version = $version)' "$REGISTRY_MANIFEST")"
 	shopt -s nullglob
@@ -944,7 +963,7 @@ publish_github_release() {
 		die "refusing to leave a mismatched release in place on $where; settle it with 'gh release upload v$VERSION \$(find target/distrib -maxdepth 1 -type f) ${repo_flag[*]} --clobber' or delete v$VERSION there and rerun"
 	elif ! grep -qi 'release not found\|not found' "$view_err"; then
 		say INFO "last 40 lines of output:"
-		tail -n 40 "$view_err"
+		tail -n 40 "$view_err" >&2
 		die "could not ask $where whether v$VERSION already exists; not creating a release blind"
 	fi
 
@@ -1013,7 +1032,7 @@ yank_crates() {
 		"${command[@]}" >"$WORK_DIR/$action-$name.log" 2>&1 || code=$?
 		if [[ $code -ne 0 ]]; then
 			say INFO "last 40 lines of output:"
-			tail -n 40 "$WORK_DIR/$action-$name.log"
+			tail -n 40 "$WORK_DIR/$action-$name.log" >&2
 			die "$action of $name $VERSION failed (exit $code)"
 		fi
 		say SUCCESS "$action $name $VERSION"
@@ -1068,6 +1087,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "$REPO"
+
+LOCK_DIR="$REPO/.git/release.lock"
+mkdir "$LOCK_DIR" 2>/dev/null ||
+	die "another release.sh is already running (lock held: $LOCK_DIR); remove it by hand if you are sure none is running"
 
 if [[ -n "$BUMP" && "$MODE" != "release" && "$MODE" != "dry-run" ]]; then
 	die "--$BUMP names a new version, so it cannot be combined with --$MODE"
@@ -1245,7 +1268,7 @@ step "signature"
 sign_checksums
 
 step "registry manifest"
-write_server_json
+write_registry_manifest
 say INFO "publish to the MCP Registry by hand once the release is up: mcp-publisher login github && (cd target/distrib && mcp-publisher publish)"
 
 step "GitHub Release"

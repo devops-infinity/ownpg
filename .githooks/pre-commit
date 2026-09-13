@@ -4,16 +4,16 @@ set -Eeuo pipefail
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
-say() { printf '[%s] %s\n' "$1" "$2"; }
-die() {
-	say FAILED "$1"
-	exit 1
-}
+source "$REPO/tools/lib.sh"
 
 command -v gitleaks >/dev/null 2>&1 ||
 	die "gitleaks is not installed; install it with: brew install gitleaks"
 
 say INFO "scanning staged changes for secrets"
-git diff --staged | gitleaks stdin --redact --no-banner ||
+if ! git diff --staged | gitleaks stdin --redact --no-banner; then
+	if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+		die "git diff --staged failed; nothing was committed"
+	fi
 	die "gitleaks found a secret in the staged changes; nothing was committed"
+fi
 say SUCCESS "no secrets found"

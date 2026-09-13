@@ -76,7 +76,7 @@ ownpg serve --http --auth bearer --bind 127.0.0.1:8765 -d app
 
 ## Connecting a client
 
-The client starts and stops OwnPG for you; nothing runs until the client needs it, and nothing keeps running after the session ends. Register one entry per project database in the client's own MCP server list, the connection given directly, the same way every other database MCP server does it.
+The client starts and stops OwnPG for you; nothing runs until the client needs it, and nothing keeps running after the session ends. Register one entry per project database in the client's own MCP server list, with the connection given directly.
 
 Claude Code reads a `.mcp.json` file in the project root, so each project names its own database:
 
