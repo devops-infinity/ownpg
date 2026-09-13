@@ -334,7 +334,8 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
             "arguments": [{"name": "order_id", "data_type": "bigint"}],
             "returns": "numeric", "language": "sql", "volatility": "stable", "strict": "on",
             "security_definer": "on",
-            "body": "SELECT total FROM app.orders WHERE id = order_id"
+            "body": "SELECT total FROM app.orders WHERE id = order_id",
+            "confirm": true
         }),
     )
     .await;
@@ -342,7 +343,8 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
         "pg_routine",
         json!({
             "operation": "create", "name": "touch_note", "returns": "trigger", "language": "plpgsql",
-            "body": "BEGIN NEW.note := 'touched'; RETURN NEW; END"
+            "body": "BEGIN NEW.note := 'touched'; RETURN NEW; END",
+            "confirm": true
         }),
     )
     .await;

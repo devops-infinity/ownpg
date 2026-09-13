@@ -6,7 +6,7 @@ use super::confirm::{Verdict, ask};
 use super::read::{classify_checked, facts_for};
 use super::{AuditFacts, Call, Outcome, Route, ToolFailure, ToolOutput, route};
 use crate::audit::Decision;
-use crate::classify::{Classification, StatementClass};
+use crate::classify::{self, Classification, SchemaScope, StatementClass};
 use crate::config::Mode;
 use crate::error::Error;
 use crate::render::{QualifiedName, expression, ident_list, quote_ident, quote_literal, verify};
@@ -334,6 +334,14 @@ pub async fn execute(
     confirm: bool,
     transaction: &str,
 ) -> Outcome {
+    let settings = call.settings();
+    let pooled = call.engine().info().await.pooled;
+    let scope = SchemaScope {
+        schema: &settings.schema.value,
+        require_qualified_names: pooled,
+    };
+    classify::authorize(classification, settings.mode.value, &scope)
+        .map_err(|error| ToolFailure::from(error).with_facts(facts_for(classification)))?;
     if dry_run {
         return dry_run_reply(sql, classification);
     }

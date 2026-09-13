@@ -306,6 +306,16 @@ pub fn classify(sql: &str) -> Result<Classification> {
     if classification.destructive_reason.is_none() && classification.class != StatementClass::Read {
         classification.destructive_reason = found.destructive_reason.clone();
     }
+    if classification.destructive_reason.is_none()
+        && matches!(
+            classification.kind.as_str(),
+            "DoStmt" | "CallStmt" | "CreateFunctionStmt"
+        )
+    {
+        classification.destructive_reason = Some(
+            "the body is a procedural language block the classifier cannot see inside".to_owned(),
+        );
+    }
     Ok(classification)
 }
 
@@ -540,6 +550,14 @@ fn walk(value: &Value, found: &mut Findings) {
                 });
             }
             for (key, child) in object {
+                if key == "DefElem"
+                    && matches!(
+                        child.get("defname").and_then(Value::as_str),
+                        Some("set" | "reset")
+                    )
+                {
+                    continue;
+                }
                 match key.as_str() {
                     "FuncCall" => {
                         if let Some(name) = dotted_name(child.get("funcname")) {
@@ -792,6 +810,17 @@ mod tests {
     }
 
     #[test]
+    fn a_security_definer_function_s_own_set_clause_is_not_a_refused_set_statement() {
+        let classification = allowed(
+            "CREATE FUNCTION app.f() RETURNS int LANGUAGE sql SECURITY DEFINER \
+             SET search_path = app, pg_temp AS $$ SELECT 1 $$",
+            Mode::ReadWrite,
+        );
+        assert!(classification.refusals.is_empty(), "{classification:?}");
+        assert_eq!(classification.kind, "CreateFunctionStmt");
+    }
+
+    #[test]
     fn one_statement_counts_as_one() {
         assert_eq!(statement_count("SELECT 1").unwrap(), 1);
         assert_eq!(statement_count("SELECT 1;").unwrap(), 1);
@@ -949,6 +978,21 @@ mod tests {
             assert!(
                 classify_ok(sql).destructive_reason.is_none(),
                 "{sql} was flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_procedural_body_the_classifier_cannot_see_inside_is_always_flagged() {
+        for sql in [
+            "DO $$ BEGIN DELETE FROM other_schema.customers; END $$",
+            "CALL app.some_procedure()",
+            "CREATE FUNCTION app.f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+        ] {
+            let classification = classify_ok(sql);
+            assert!(
+                classification.destructive_reason.is_some(),
+                "{sql} was not flagged even though its body is opaque to the classifier"
             );
         }
     }
