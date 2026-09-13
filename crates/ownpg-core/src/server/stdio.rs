@@ -22,7 +22,7 @@ pin_project_lite::pin_project! {
         #[pin]
         inner: R,
         cap: usize,
-        current: usize,
+        line_length: usize,
     }
 }
 
@@ -31,7 +31,7 @@ impl<R> LineCapReader<R> {
         Self {
             inner,
             cap,
-            current: 0,
+            line_length: 0,
         }
     }
 }
@@ -49,10 +49,10 @@ impl<R: AsyncRead> AsyncRead for LineCapReader<R> {
                 let fresh = buf.filled().get(before..).unwrap_or_default();
                 for byte in fresh {
                     if *byte == b'\n' {
-                        *this.current = 0;
+                        *this.line_length = 0;
                     } else {
-                        *this.current += 1;
-                        if *this.current > *this.cap {
+                        *this.line_length += 1;
+                        if *this.line_length > *this.cap {
                             return Poll::Ready(Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
                                 format!("a single stdin line exceeded the {} byte cap", this.cap),
@@ -74,7 +74,7 @@ pub enum StopReason {
     Interrupt,
 }
 
-async fn wait_for_signal() -> StopReason {
+async fn shutdown_signal() -> StopReason {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -137,7 +137,7 @@ where
         }
     };
     let stop = {
-        let mut signal = std::pin::pin!(wait_for_signal());
+        let mut signal = std::pin::pin!(shutdown_signal());
         let mut waiting = std::pin::pin!(running.waiting());
         tokio::select! {
             quit = &mut waiting => {
@@ -151,7 +151,7 @@ where
                 tracing::info!("stopping; a second signal exits at once");
                 cancel.cancel();
                 let started = Instant::now();
-                let second = std::pin::pin!(wait_for_signal());
+                let second = std::pin::pin!(shutdown_signal());
                 tokio::select! {
                     _ = &mut waiting => {}
                     _ = second => {

@@ -57,7 +57,7 @@ pub async fn classify_checked(call: &Call, sql: &str) -> Result<Classification, 
         schema: &settings.schema.value,
         require_qualified_names: pooled,
     };
-    classify::check(&classification, settings.mode.value, &scope)
+    classify::authorize(&classification, settings.mode.value, &scope)
         .map_err(|error| ToolFailure::from(error).with_facts(facts))?;
     Ok(classification)
 }

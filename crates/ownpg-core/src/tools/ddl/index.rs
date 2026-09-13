@@ -98,7 +98,7 @@ pub struct IndexArgs {
     pub transaction: String,
 }
 
-fn index_element(element: &str) -> Result<String> {
+pub(crate) fn index_element(element: &str) -> Result<String> {
     let trimmed = element.trim();
     let lowered = trimmed.to_ascii_lowercase();
     let suffixes = [

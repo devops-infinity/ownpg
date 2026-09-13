@@ -7,9 +7,12 @@ use super::{
     if_not_exists_clause, run_ddl, scoped_name,
 };
 use crate::error::{Error, Result};
-use crate::render::{expression, ident_list, quote_ident, type_name, validate_ident};
+use crate::render::{
+    expression, ident_list, operator, partition_bound, quote_ident, type_name, validate_ident,
+};
 use crate::shape::ResultSet;
 use crate::tool_specs;
+use crate::tools::ddl::index::index_element;
 use crate::tools::{Call, Outcome, Route, route};
 
 const TABLE_DESCRIPTION: &str = "Create, alter, rename, truncate, or drop a table in the scoped schema, and attach or detach partitions. create takes columns with types, defaults, identity, generated expressions, and inline constraints, plus a composite primary key, partitioning, LIKE, and inheritance. drop, truncate, and detach_partition are destructive and need confirm: true or the confirmation prompt. dry_run returns the rendered SQL.";
@@ -342,7 +345,7 @@ pub fn table(call: Call, args: TableArgs) -> BoxFuture<'static, Outcome> {
                         "ALTER TABLE {} ATTACH PARTITION {} {}",
                         name.sql(),
                         partition.sql(),
-                        args.bound.trim()
+                        partition_bound("bound", &args.bound)?
                     ),
                     &["AlterTableStmt"],
                 )
@@ -724,6 +727,22 @@ pub struct ConstraintArgs {
     pub transaction: String,
 }
 
+fn exclude_element(element: &str) -> Result<String> {
+    let trimmed = element.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    let Some(with_pos) = lowered.rfind(" with ") else {
+        return Err(Error::ArgumentInvalid {
+            argument: "elements".to_owned(),
+            detail: format!("`{trimmed}` needs a WITH operator clause"),
+        });
+    };
+    let body = trimmed[..with_pos].trim();
+    let operator_text = trimmed[with_pos + " with ".len()..].trim();
+    let rendered_body = index_element(body)?;
+    let rendered_operator = operator("elements", operator_text)?;
+    Ok(format!("{rendered_body} WITH {rendered_operator}"))
+}
+
 fn constraint_body(call: &Call, args: &ConstraintArgs) -> Result<String> {
     let features = call.engine().features();
     let kind = args.kind;
@@ -840,7 +859,12 @@ fn constraint_body(call: &Call, args: &ConstraintArgs) -> Result<String> {
                 validate_ident("method", args.method.trim())?;
                 format!("USING {} ", args.method.trim())
             };
-            let mut body = format!("EXCLUDE {method}({})", args.elements.join(", "));
+            let elements: Result<Vec<String>> = args
+                .elements
+                .iter()
+                .map(|element| exclude_element(element))
+                .collect();
+            let mut body = format!("EXCLUDE {method}({})", elements?.join(", "));
             if !args.where_clause.trim().is_empty() {
                 body.push_str(&format!(
                     " WHERE ({})",

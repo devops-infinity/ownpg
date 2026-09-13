@@ -22,7 +22,7 @@ const RELATIONS_SQL: &str = "SELECT c.relname::text, c.relkind::text, pg_catalog
      WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') ORDER BY c.relname LIMIT $2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
+pub enum ResourceTarget {
     Schema,
     Table(String),
 }
@@ -74,7 +74,7 @@ pub fn table_uri(database: &str, schema: &str, table: &str) -> String {
     )
 }
 
-pub fn parse_uri(uri: &str, database: &str, schema: &str) -> Result<Target, ErrorData> {
+pub fn parse_uri(uri: &str, database: &str, schema: &str) -> Result<ResourceTarget, ErrorData> {
     let not_found = |detail: &str| {
         ErrorData::resource_not_found(
             format!("{uri} is not a resource of this server: {detail}"),
@@ -108,9 +108,9 @@ pub fn parse_uri(uri: &str, database: &str, schema: &str) -> Result<Target, Erro
         )));
     }
     match decoded.next() {
-        None => Ok(Target::Schema),
+        None => Ok(ResourceTarget::Schema),
         Some(table) if table.is_empty() => Err(not_found("the table segment is empty")),
-        Some(table) => Ok(Target::Table(table)),
+        Some(table) => Ok(ResourceTarget::Table(table)),
     }
 }
 
@@ -217,7 +217,7 @@ impl Server {
         let target = parse_uri(uri, &settings.database.value, &settings.schema.value)?;
         let call = self.resource_call(principal);
         let outcome = match &target {
-            Target::Schema => {
+            ResourceTarget::Schema => {
                 crate::tools::objects::list_objects(
                     call,
                     ListObjectsArgs {
@@ -229,7 +229,7 @@ impl Server {
                 )
                 .await
             }
-            Target::Table(table) => {
+            ResourceTarget::Table(table) => {
                 describe(
                     call,
                     DescribeArgs {
@@ -331,11 +331,11 @@ mod tests {
         assert_eq!(uri, "postgres://app%20db/sch%2Fema/Order%20Items");
         assert_eq!(
             parse_uri(&uri, "app db", "sch/ema").unwrap(),
-            Target::Table("Order Items".to_owned())
+            ResourceTarget::Table("Order Items".to_owned())
         );
         assert_eq!(
             parse_uri("postgres://app%20db/sch%2Fema", "app db", "sch/ema").unwrap(),
-            Target::Schema
+            ResourceTarget::Schema
         );
     }
 

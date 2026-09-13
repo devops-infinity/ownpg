@@ -309,7 +309,11 @@ pub fn classify(sql: &str) -> Result<Classification> {
     Ok(classification)
 }
 
-pub fn check(classification: &Classification, mode: Mode, scope: &SchemaScope<'_>) -> Result<()> {
+pub fn authorize(
+    classification: &Classification,
+    mode: Mode,
+    scope: &SchemaScope<'_>,
+) -> Result<()> {
     let refuse = |rule: String| Error::StatementRefused {
         rule,
         mode: mode.to_string(),
@@ -352,14 +356,14 @@ struct Findings {
     functions: Vec<String>,
     relations: Vec<RelationName>,
     cte_names: Vec<String>,
-    copies: Vec<CopyShape>,
+    copies: Vec<CopyDetails>,
     destructive_reason: Option<String>,
     returning: bool,
     outside_transaction: bool,
 }
 
 #[derive(Debug)]
-struct CopyShape {
+struct CopyDetails {
     is_program: bool,
     is_from: bool,
     filename: String,
@@ -547,7 +551,7 @@ fn walk(value: &Value, found: &mut Findings) {
                             found.cte_names.push(name.to_owned());
                         }
                     }
-                    "CopyStmt" => found.copies.push(CopyShape {
+                    "CopyStmt" => found.copies.push(CopyDetails {
                         is_program: child
                             .get("is_program")
                             .and_then(Value::as_bool)
@@ -761,7 +765,7 @@ mod tests {
 
     fn refused(sql: &str, mode: Mode) -> String {
         match classify(sql) {
-            Ok(classification) => match check(&classification, mode, &SCOPE) {
+            Ok(classification) => match authorize(&classification, mode, &SCOPE) {
                 Ok(()) => panic!("{sql} was allowed in {mode}"),
                 Err(error) => {
                     assert_eq!(error.exit_class(), crate::error::ExitClass::Refused);
@@ -783,7 +787,7 @@ mod tests {
 
     fn allowed(sql: &str, mode: Mode) -> Classification {
         let classification = classify_ok(sql);
-        check(&classification, mode, &SCOPE).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        authorize(&classification, mode, &SCOPE).unwrap_or_else(|error| panic!("{sql}: {error}"));
         classification
     }
 
@@ -980,12 +984,12 @@ mod tests {
             require_qualified_names: true,
         };
         let bare = classify_ok("SELECT * FROM orders");
-        let error = check(&bare, Mode::ReadOnly, &scope).unwrap_err();
+        let error = authorize(&bare, Mode::ReadOnly, &scope).unwrap_err();
         assert!(error.to_string().contains("schema-qualified"), "{error}");
         let qualified = classify_ok("SELECT * FROM app.orders");
-        check(&qualified, Mode::ReadOnly, &scope).unwrap();
+        authorize(&qualified, Mode::ReadOnly, &scope).unwrap();
         let catalog = classify_ok("SELECT * FROM pg_catalog.pg_class");
-        check(&catalog, Mode::ReadOnly, &scope).unwrap();
+        authorize(&catalog, Mode::ReadOnly, &scope).unwrap();
     }
 
     #[test]
@@ -1019,7 +1023,7 @@ mod tests {
     #[test]
     fn the_refusal_names_the_mode_and_the_rule() {
         let error = classify("DELETE FROM orders WHERE id = 1")
-            .and_then(|classification| check(&classification, Mode::ReadOnly, &SCOPE))
+            .and_then(|classification| authorize(&classification, Mode::ReadOnly, &SCOPE))
             .unwrap_err();
         assert_eq!(error.id(), ErrorId::StatementRefused);
         let text = error.to_string();

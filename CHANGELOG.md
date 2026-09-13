@@ -11,7 +11,7 @@ The format follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/
 - An MCP (Model Context Protocol) server that serves one PostgreSQL database and one schema, over stdio by default or over Streamable HTTP with `--http`.
 - Three access modes: read-only, write-only, and read-write, set with `--mode`.
 - Three HTTP authentication modes: none (loopback only), bearer token, and OAuth, set with `--auth`.
-- Seven optional tool groups beyond the default object, read, and health tools: write, transactions, DDL, roles, maintenance, monitoring, and host programs, loaded with `--tools`.
+- Write and transaction tools that load automatically once the access mode allows writes, plus five optional tool groups beyond the default objects, read, and health tools: DDL, roles, maintenance, monitoring, and host programs, loaded with `--tools`.
 - A strict-role check that refuses to start on a superuser, an rds_superuser member, or a role with `BYPASSRLS`, on by default in HTTP mode, controlled with `--strict-role`.
 - Connectivity to PostgreSQL over TCP, a Unix socket, or an SSH bastion host, with an in-process SSH client or the system `ssh` command selectable with `--ssh-transport`.
 - An append-only, hash-chained audit log, on by default, verified with `ownpg audit verify`, controlled with `--no-audit` and `--audit-path`.

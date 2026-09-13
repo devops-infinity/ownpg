@@ -76,7 +76,7 @@ pub(crate) fn run(global: &GlobalArgs, args: &ServeArgs, process: &Process) -> R
                 )
                 .await?,
             );
-            let gatekeeper = Arc::new(http::gatekeeper(
+            let gatekeeper = Arc::new(http::Gatekeeper::build(
                 Arc::clone(&server),
                 &settings,
                 environment_tokens.as_deref(),

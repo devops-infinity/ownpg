@@ -115,6 +115,102 @@ pub fn type_name(argument: &str, text: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
+pub fn operator(argument: &str, text: &str) -> Result<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(Error::ArgumentInvalid {
+            argument: argument.to_owned(),
+            detail: "an operator is required".to_owned(),
+        });
+    }
+    let probe = format!("SELECT NULL {trimmed} NULL");
+    let parsed = classify::classify(&probe).map_err(|error| Error::ArgumentInvalid {
+        argument: argument.to_owned(),
+        detail: format!("`{trimmed}` is not an operator: {error}"),
+    })?;
+    if parsed.kind != "SelectStmt" || !parsed.relations.is_empty() {
+        return Err(Error::ArgumentInvalid {
+            argument: argument.to_owned(),
+            detail: format!("`{trimmed}` is not a plain operator"),
+        });
+    }
+    if let Some(rule) = parsed.refusals.first() {
+        return Err(Error::StatementRefused {
+            rule: rule.clone(),
+            mode: "any".to_owned(),
+        });
+    }
+    Ok(trimmed.to_owned())
+}
+
+pub fn partition_bound(argument: &str, text: &str) -> Result<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(Error::ArgumentInvalid {
+            argument: argument.to_owned(),
+            detail: "a partition bound is required".to_owned(),
+        });
+    }
+    let probe =
+        format!("ALTER TABLE ownpg_probe_parent ATTACH PARTITION ownpg_probe_child {trimmed}");
+    let parsed = classify::classify(&probe).map_err(|error| Error::ArgumentInvalid {
+        argument: argument.to_owned(),
+        detail: format!("`{trimmed}` is not a partition bound: {error}"),
+    })?;
+    if parsed.kind != "AlterTableStmt" {
+        return Err(Error::ArgumentInvalid {
+            argument: argument.to_owned(),
+            detail: format!("`{trimmed}` is not a plain partition bound"),
+        });
+    }
+    let unexpected = parsed.relations.iter().any(|relation| {
+        relation.name != "ownpg_probe_parent" && relation.name != "ownpg_probe_child"
+    });
+    if unexpected {
+        return Err(Error::ArgumentInvalid {
+            argument: argument.to_owned(),
+            detail: format!("`{trimmed}` names an object; a partition bound may not"),
+        });
+    }
+    if let Some(rule) = parsed.refusals.first() {
+        return Err(Error::StatementRefused {
+            rule: rule.clone(),
+            mode: "any".to_owned(),
+        });
+    }
+    Ok(trimmed.to_owned())
+}
+
+pub fn returns_type(argument: &str, text: &str) -> Result<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(Error::ArgumentInvalid {
+            argument: argument.to_owned(),
+            detail: "a return type is required".to_owned(),
+        });
+    }
+    let probe = format!(
+        "CREATE FUNCTION ownpg_probe_fn() RETURNS {trimmed} LANGUAGE sql AS $$ SELECT 1 $$"
+    );
+    let parsed = classify::classify(&probe).map_err(|error| Error::ArgumentInvalid {
+        argument: argument.to_owned(),
+        detail: format!("`{trimmed}` is not a return type: {error}"),
+    })?;
+    if parsed.kind != "CreateFunctionStmt" {
+        return Err(Error::ArgumentInvalid {
+            argument: argument.to_owned(),
+            detail: format!("`{trimmed}` is not a plain return type"),
+        });
+    }
+    if let Some(rule) = parsed.refusals.first() {
+        return Err(Error::StatementRefused {
+            rule: rule.clone(),
+            mode: "any".to_owned(),
+        });
+    }
+    Ok(trimmed.to_owned())
+}
+
 pub fn expression(argument: &str, text: &str) -> Result<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {

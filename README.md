@@ -2,6 +2,20 @@
 
 PostgreSQL DBA tools for AI clients over the Model Context Protocol, scoped to one database and one schema.
 
+- [What it does](#what-it-does)
+- [Status](#status)
+- [Prerequisites](#prerequisites)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Connecting a client](#connecting-a-client)
+- [Commands](#commands)
+- [Configuration](#configuration)
+- [Tool groups](#tool-groups)
+- [Security](#security)
+- [Support](#support)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## What it does
 
 OwnPG serves one PostgreSQL database and one schema to an MCP client, in read-only, write-only, or read-write mode. Every statement is parsed and classified before it runs, and the access mode decides what is allowed. A destructive statement asks for confirmation before it executes, and an append-only, hash-chained audit log records every call. OwnPG runs over stdio for a local MCP client such as Claude Desktop, or over Streamable HTTP for a remote MCP client, with bearer-token or OAuth authentication.
@@ -46,17 +60,73 @@ Check the connection and settings before serving:
 ownpg doctor -p staging --format json
 ```
 
-Save a connection profile and store its password in the OS keychain:
+Save a connection profile, and store its password in the OS keychain only if the database needs one:
 
 ```
-ownpg config init && ownpg config set-password local
+ownpg config init
+ownpg config set-password local
 ```
 
 Serve over Streamable HTTP with bearer-token authentication:
 
 ```
+OWNPG_BEARER_TOKENS="a-long-random-token read-write client-a" \
 ownpg serve --http --auth bearer --bind 127.0.0.1:8765 -d app
 ```
+
+## Connecting a client
+
+The client starts and stops OwnPG for you; nothing runs until the client needs it, and nothing keeps running after the session ends. Register one entry per project database in the client's own MCP server list, the connection given directly, the same way every other database MCP server does it.
+
+Claude Code reads a `.mcp.json` file in the project root, so each project names its own database:
+
+```json
+{
+  "mcpServers": {
+    "ownpg": {
+      "command": "ownpg",
+      "args": ["serve", "--database", "myproject_db", "--no-input"],
+      "env": {
+        "OWNPG_HOST": "127.0.0.1",
+        "OWNPG_USER": "myproject_role"
+      }
+    }
+  }
+}
+```
+
+Add `"OWNPG_PASSWORD": "..."` to `env` only if the database actually needs one. A local PostgreSQL server using trust or peer authentication, the default for a superuser or your own OS user on a Homebrew or system install, needs no password at all: OwnPG connects the same way `psql` would, nothing to type, nothing to store.
+
+Claude Desktop reads one file covering every project, so name each entry after the project it connects to. The file lives at `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, or `%APPDATA%\Claude\claude_desktop_config.json` on Windows. The same `command`/`args`/`env` block goes under a project-named key:
+
+```json
+{
+  "mcpServers": {
+    "ownpg-myproject": {
+      "command": "ownpg",
+      "args": ["serve", "--database", "myproject_db", "--no-input"],
+      "env": {
+        "OWNPG_HOST": "127.0.0.1",
+        "OWNPG_USER": "myproject_role"
+      }
+    }
+  }
+}
+```
+
+A second project gets a second entry, `ownpg-otherproject`, pointed at a different database; each one launches as its own process, scoped to its own database.
+
+If a password does need to go somewhere more permanent than a client config file, run `ownpg config init` once, then `ownpg config set-password <name>` to store it in the OS keychain, and reference `--profile <name>` instead of the raw connection flags. That's a convenience for a password you'd rather not retype or paste, not a required step; the plain `env` block above works with nothing set up beforehand. This repository also carries `mcpb/manifest.json`, the manifest for Claude Desktop's packaged extension format.
+
+### Connecting over Streamable HTTP
+
+A remote MCP client, or a client that cannot spawn a local process, connects to a running `ownpg serve --http` instance instead of launching its own. Point the client at `http://<bind-address>/mcp` (the path is always `/mcp`, whatever `--bind` address you chose), and set `--auth` to match how the client authenticates:
+
+- `--auth none`: no credential, only usable when `--bind` stays on the loopback interface.
+- `--auth bearer`: the client sends `Authorization: Bearer <token>` on every request, checked against the tokens set with `OWNPG_BEARER_TOKENS` or `OWNPG_BEARER_TOKENS_FILE`.
+- `--auth oauth`: the client sends a JWT issued by an OAuth authorization server, verified against that server's published JSON Web Key Set.
+
+A client that supports MCP's OAuth-protected-resource discovery reads `/.well-known/oauth-protected-resource/mcp` on the same host and port to find the authorization requirements automatically.
 
 ## Commands
 
@@ -81,7 +151,7 @@ Run `ownpg config init --dry-run` or `ownpg man` for the complete list of enviro
 
 ## Tool groups
 
-`objects`, `read`, and `health` load by default. `--tools` (or `OWNPG_TOOLS`) adds any of: `write`, `transactions`, `ddl`, `roles`, `maintenance`, `monitoring`, `host`. A tool group not allowed under the active access mode is refused at startup.
+`objects`, `read`, and `health` load by default. `write` and `transactions` load automatically once the access mode allows writes (`write-only` or `read-write`). `--tools` (or `OWNPG_TOOLS`) adds any of `ddl`, `roles`, `maintenance`, `monitoring`, `host`. A tool group not allowed under the active access mode is refused at startup.
 
 ## Security
 
@@ -90,6 +160,10 @@ A destructive statement runs only after an explicit `confirm: true` argument or 
 ## Support
 
 File an issue at [devops-infinity/ownpg-releases](https://github.com/devops-infinity/ownpg-releases/issues/new).
+
+## Contributing
+
+File an issue at [devops-infinity/ownpg-releases](https://github.com/devops-infinity/ownpg-releases/issues/new) to report a bug or request a change.
 
 ## License
 

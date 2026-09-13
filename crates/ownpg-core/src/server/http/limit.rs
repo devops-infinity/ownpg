@@ -6,7 +6,7 @@ use governor::{DefaultKeyedRateLimiter, Quota};
 
 pub struct Limiter {
     limiter: DefaultKeyedRateLimiter<String>,
-    calls: u32,
+    calls_per_minute: u32,
 }
 
 impl Limiter {
@@ -15,13 +15,13 @@ impl Limiter {
         let burst = NonZeroU32::new(calls_per_minute.max(1)).unwrap_or(NonZeroU32::MIN);
         Self {
             limiter: DefaultKeyedRateLimiter::keyed(Quota::per_minute(burst)),
-            calls: calls_per_minute.max(1),
+            calls_per_minute: calls_per_minute.max(1),
         }
     }
 
     #[must_use]
     pub const fn calls_per_minute(&self) -> u32 {
-        self.calls
+        self.calls_per_minute
     }
 
     pub fn check(&self, key: &str) -> Result<(), Duration> {
@@ -42,7 +42,7 @@ impl Limiter {
 impl std::fmt::Debug for Limiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Limiter")
-            .field("calls_per_minute", &self.calls)
+            .field("calls_per_minute", &self.calls_per_minute)
             .finish_non_exhaustive()
     }
 }
