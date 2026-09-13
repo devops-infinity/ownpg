@@ -194,105 +194,45 @@ impl ProfileFile {
     }
 }
 
-pub const PROFILE_TEMPLATE: &str = r#"# OwnPG profile file. Every key is optional unless the tool says otherwise.
-# Flags win over environment variables, which win over this file.
-format = 1
+pub const PROFILE_TEMPLATE: &str = r#"format = 1
 
 [profiles.local]
-# Mode: read-only, write-only, or read-write. Flag -m, env OWNPG_MODE. Default read-only.
 mode = "read-only"
-# The one database and the one schema this profile serves. Flag -d and -s, env OWNPG_DATABASE (PGDATABASE also applies) and OWNPG_SCHEMA.
 database = "your-database"
 schema = "public"
-# Where the server is. Flag --host and --port, env OWNPG_HOST and OWNPG_PORT (PGHOST and PGPORT also apply).
-# host = "127.0.0.1"
-# port = 5432
-# A numeric address that skips the DNS lookup for host. Env PGHOSTADDR.
-# hostaddr = "127.0.0.1"
-# A libpq connection string or a pg_service.conf service name, as an alternative to host, port, user, and database. Env OWNPG_DSN and PGSERVICE (PGSERVICEFILE and PGSYSCONFDIR locate the service file).
-# dsn = "postgresql://user@host:5432/db"
-# service = "mydb"
-# The role to connect as. Flag -U, env OWNPG_USER (PGUSER also applies). Default: the operating system user.
-# user = "app"
-# How the password is found: a plain value here (the file must be private), the name of an environment variable, or the platform keychain (`ownpg config set-password local`). Env OWNPG_PASSWORD, PGPASSWORD, or a PGPASSFILE that only you can read.
-# password = ""
-# password_env = "APP_DB_PASSWORD"
-# password_keychain = true
-# TLS: disable, allow, prefer, require, verify-ca, or verify-full, plus the certificate files. Flag --sslmode and --sslrootcert, env OWNPG_SSLMODE, OWNPG_SSLROOTCERT, OWNPG_SSLCERT, OWNPG_SSLKEY (PGSSLMODE, PGSSLROOTCERT, PGSSLCERT, PGSSLKEY, PGSSLNEGOTIATION also apply). Default prefer.
-# sslmode = "verify-full"
-# sslrootcert = "/etc/ssl/certs/ca.pem"
-# sslcert = "/home/me/.postgresql/postgresql.crt"
-# sslkey = "/home/me/.postgresql/postgresql.key"
-# SCRAM channel binding: disable, prefer, or require. Env PGCHANNELBINDING. Default prefer.
-# channel_binding = "prefer"
-# Seconds to wait for the connection. Env OWNPG_CONNECT_TIMEOUT or PGCONNECT_TIMEOUT. Default 10.
-# connect_timeout_seconds = 10
-# The application_name PostgreSQL shows in pg_stat_activity. Env PGAPPNAME.
-# application_name = "ownpg"
-# Extra libpq options passed as-is. Env PGOPTIONS.
-# options = "-c work_mem=64MB"
-# true when the target is a transaction pooler such as PgBouncer: settings go per transaction and every name must be schema-qualified. Env OWNPG_POOLED.
-# pooled = false
-# Server-side limits in seconds and result caps. Env OWNPG_STATEMENT_TIMEOUT, OWNPG_LOCK_TIMEOUT, OWNPG_TRANSACTION_TIMEOUT, OWNPG_HANDLE_EXPIRY, OWNPG_CURSOR_EXPIRY, OWNPG_ROW_CAP, OWNPG_BYTE_CAP.
-# statement_timeout_seconds = 30
-# lock_timeout_seconds = 5
-# transaction_timeout_seconds = 300
-# handle_expiry_seconds = 60
-# cursor_expiry_seconds = 30
-# row_cap = 100
-# byte_cap = 262144
-# Refuse to run as a superuser or a role with CREATEROLE, CREATEDB, or BYPASSRLS. Flag --strict-role, env OWNPG_STRICT_ROLE. Default on under --http.
-# strict_role = true
-# Tool groups to load besides the read-only set: write, transactions, ddl, roles, maintenance, monitoring, host. Flag --tools, env OWNPG_TOOLS.
-# tools = ["write", "transactions"]
-# Never prompt; fail instead. Flag --no-input, env OWNPG_NO_INPUT (CI also counts).
-# no_input = false
-# The audit log: on by default, one JSON line per call, rotated at audit_max_bytes, with audit_keep_files rotated files kept (0 keeps all). Flag --no-audit and --audit-path, env OWNPG_AUDIT, OWNPG_AUDIT_PATH, OWNPG_AUDIT_MAX_BYTES, OWNPG_AUDIT_KEEP_FILES.
-# audit = true
-# audit_path = "/var/log/ownpg/audit.jsonl"
-# audit_max_bytes = 52428800
-# audit_keep_files = 0
-# Where pg_dump and friends live, and where their output files go. Flag --pg-bindir and --output-dir, env OWNPG_PG_BINDIR and OWNPG_OUTPUT_DIR. Both must be absolute.
-# pg_bindir = "/usr/lib/postgresql/18/bin"
-# output_dir = "/var/backups/ownpg"
-
-# Reach the database through an SSH bastion. Flag --ssh, --ssh-transport, and --ssh-trust-new-host; env OWNPG_SSH, OWNPG_SSH_TRANSPORT, OWNPG_SSH_TRUST_NEW_HOST. The passphrase can come from the platform keychain (`ownpg config set-ssh-passphrase local`).
-# [profiles.local.ssh]
-# host = "bastion.example"
-# port = 22
-# user = "deploy"
-# key_file = "/home/me/.ssh/id_ed25519"
-# agent = true
-# password_env = "BASTION_PASSPHRASE"
-# passphrase_keychain = true
-# trust_new_host = false
-# transport = "in-process"
-# jump = ["first-hop.example", "second-hop.example"]
-# known_hosts = "/home/me/.ssh/known_hosts"
-# config_file = "/home/me/.ssh/config"
-# connect_timeout_seconds = 10
-
-# Streamable HTTP settings, used with `ownpg serve --http`. Flag --bind and --auth, env OWNPG_BIND, OWNPG_PUBLIC_URL, OWNPG_ALLOWED_HOSTS, OWNPG_ALLOWED_ORIGINS, OWNPG_BODY_CAP_BYTES, OWNPG_RATE_LIMIT_PER_MINUTE, OWNPG_OLDER_CLIENT_SESSIONS, OWNPG_SHUTDOWN_SECONDS, OWNPG_POOL_SIZE, OWNPG_MAX_CONNECTIONS, OWNPG_TRUSTED_PROXIES, OWNPG_AUTH, OWNPG_BEARER_TOKENS_FILE, OWNPG_OAUTH_ISSUER, OWNPG_OAUTH_JWKS_URL, OWNPG_OAUTH_AUDIENCE, OWNPG_STATE_KEY_FILE, OTEL_EXPORTER_OTLP_ENDPOINT.
-# [profiles.local.http]
-# bind = "127.0.0.1:8765"
-# public_url = "https://db.example/mcp"
-# allowed_hosts = ["db.example"]
-# allowed_origins = ["https://app.example"]
-# body_cap_bytes = 1048576
-# rate_limit_per_minute = 60
-# older_client_sessions = false
-# shutdown_seconds = 10
-# pool_size = 4
-# max_connections = 1024
-# trusted_proxies = ["10.0.0.0/8"]
-# auth = "bearer"
-# tokens_file = "/etc/ownpg/tokens"
-# oauth_issuer = "https://issuer.example"
-# oauth_jwks_url = "https://issuer.example/.well-known/jwks.json"
-# oauth_audience = "ownpg"
-# state_key_file = "/etc/ownpg/state.key"
-# otel_endpoint = "http://127.0.0.1:4318"
 "#;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyTable {
+    pub table: &'static str,
+    pub keys: Vec<String>,
+}
+
+#[must_use]
+pub fn key_reference() -> Vec<KeyTable> {
+    let schema = serde_json::to_value(schemars::schema_for!(ProfileFile)).unwrap_or_default();
+    let names = |pointer: &str| -> Vec<String> {
+        schema
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_object)
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    vec![
+        KeyTable {
+            table: "profiles.<name>",
+            keys: names("/$defs/ProfileEntry/properties"),
+        },
+        KeyTable {
+            table: "profiles.<name>.ssh",
+            keys: names("/$defs/SshEntry/properties"),
+        },
+        KeyTable {
+            table: "profiles.<name>.http",
+            keys: names("/$defs/HttpEntry/properties"),
+        },
+    ]
+}
 
 pub fn read_capped(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path).map_err(|source| Error::ConfigUnreadable {
@@ -420,73 +360,46 @@ mod tests {
     }
 
     #[test]
-    fn the_template_loads_and_names_every_key_with_its_uncommented_form_parsing_too() {
+    fn the_starter_template_parses_and_carries_no_comment_lines() {
         let parsed: ProfileFile = toml::from_str(PROFILE_TEMPLATE).unwrap();
         assert_eq!(parsed, ProfileFile::example());
-        let schema = serde_json::to_value(schemars::schema_for!(ProfileFile)).unwrap();
-        for pointer in [
-            "/$defs/ProfileEntry/properties",
-            "/$defs/SshEntry/properties",
-            "/$defs/HttpEntry/properties",
-        ] {
-            for key in property_names(&schema, pointer) {
-                let commented = format!("# {key} = ");
-                let plain = format!("{key} = ");
-                let table = format!("# [profiles.local.{key}]");
-                assert!(
-                    PROFILE_TEMPLATE.contains(&commented)
-                        || PROFILE_TEMPLATE.contains(&plain)
-                        || PROFILE_TEMPLATE.contains(&table),
-                    "the profile template does not show `{key}`"
-                );
-            }
-        }
-        let uncommented: String = PROFILE_TEMPLATE
-            .lines()
-            .map(|line| {
-                line.strip_prefix("# ")
-                    .filter(|rest| rest.contains(" = ") || rest.starts_with('['))
-                    .unwrap_or(line)
-            })
-            .filter(|line| !line.starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let full: ProfileFile = toml::from_str(&uncommented).unwrap();
-        let entry = full.profiles.get("local").unwrap();
-        assert!(entry.ssh.is_some() && entry.http.is_some());
+        assert!(
+            PROFILE_TEMPLATE
+                .lines()
+                .all(|line| !line.trim_start().starts_with('#'))
+        );
     }
 
     #[test]
-    fn the_template_names_every_environment_variable_the_resolver_reads() {
-        let sources = [
-            include_str!("resolve.rs"),
-            include_str!("http.rs"),
-            include_str!("libpq.rs"),
-        ];
-        let mut read_variables = std::collections::BTreeSet::new();
-        for source in sources {
-            for (index, _) in source.match_indices("\"OWNPG_") {
-                let rest = &source[index + 1..];
-                let end = rest.find('"').unwrap_or(rest.len());
-                read_variables.insert(rest[..end].to_owned());
-            }
-            for (index, _) in source.match_indices("(\"PG") {
-                let rest = &source[index + 2..];
-                let end = rest.find('"').unwrap_or(rest.len());
-                read_variables.insert(rest[..end].to_owned());
-            }
+    fn the_key_reference_lists_every_table_with_its_keys() {
+        let reference = key_reference();
+        let tables: Vec<&str> = reference.iter().map(|entry| entry.table).collect();
+        assert_eq!(
+            tables,
+            [
+                "profiles.<name>",
+                "profiles.<name>.ssh",
+                "profiles.<name>.http"
+            ]
+        );
+        let profile = &reference[0].keys;
+        for key in [
+            "mode",
+            "database",
+            "schema",
+            "audit_keep_files",
+            "ssh",
+            "http",
+        ] {
+            assert!(profile.iter().any(|known| known == key), "{key} missing");
         }
-        let exempt = ["OWNPG_PROFILE", "OWNPG_BEARER_TOKENS"];
-        for variable in &read_variables {
-            if exempt.contains(&variable.as_str()) {
-                continue;
-            }
-            assert!(
-                PROFILE_TEMPLATE.contains(variable.as_str()),
-                "the profile template does not mention {variable}"
-            );
-        }
-        assert!(read_variables.len() > 40, "{read_variables:?}");
+        assert!(reference[1].keys.iter().any(|key| key == "host"));
+        assert!(reference[2].keys.iter().any(|key| key == "bind"));
+        let schema = serde_json::to_value(schemars::schema_for!(ProfileFile)).unwrap();
+        assert_eq!(
+            reference[0].keys,
+            property_names(&schema, "/$defs/ProfileEntry/properties")
+        );
     }
 
     #[test]

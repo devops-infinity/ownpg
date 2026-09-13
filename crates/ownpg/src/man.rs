@@ -54,7 +54,11 @@ pub(crate) const ENVIRONMENT: &[(&str, &str)] = &[
     ),
     (
         "OWNPG_SSLMODE, OWNPG_SSLROOTCERT, OWNPG_SSLCERT, OWNPG_SSLKEY",
-        "TLS settings (the PGSSL* forms also apply)",
+        "TLS settings (PGSSLMODE, PGSSLROOTCERT, PGSSLCERT, PGSSLKEY, and PGSSLNEGOTIATION also apply)",
+    ),
+    (
+        "PGAPPNAME, PGOPTIONS, PGCHANNELBINDING, PGCONNECT_TIMEOUT, PGSERVICEFILE, PGSYSCONFDIR",
+        "the libpq settings read with the same meaning libpq gives them",
     ),
     (
         "OWNPG_CONNECT_TIMEOUT, OWNPG_STATEMENT_TIMEOUT, OWNPG_LOCK_TIMEOUT, OWNPG_TRANSACTION_TIMEOUT",
@@ -121,6 +125,7 @@ pub(crate) fn render(command: &clap::Command, output: &mut dyn Write) -> std::io
     }
     render_exit_status(output)?;
     render_environment(output)?;
+    render_profile_file(output)?;
     page.render_version_section(output)?;
     render_bug_reporting(output)
 }
@@ -140,12 +145,26 @@ fn render_environment(output: &mut dyn Write) -> std::io::Result<()> {
     let mut roff = Roff::default();
     roff.control("SH", ["ENVIRONMENT"]);
     roff.text([roman(
-        "Flags win over environment variables, which win over the profile file. `ownpg config init --dry-run` prints every profile key next to its variable.",
+        "Flags win over environment variables, which win over the profile file. The PROFILE FILE section lists every key the file accepts.",
     )]);
     for (names, meaning) in ENVIRONMENT {
         roff.control("TP", []);
         roff.text([bold(*names)]);
         roff.text([roman(*meaning)]);
+    }
+    roff.to_writer(output)
+}
+
+fn render_profile_file(output: &mut dyn Write) -> std::io::Result<()> {
+    let mut roff = Roff::default();
+    roff.control("SH", ["PROFILE FILE"]);
+    roff.text([roman(
+        "A TOML file at the path `ownpg config path` prints; `ownpg config init` writes a starter. Every key is optional. Each key under profiles.<name> maps to the flag and variable of the same name in ENVIRONMENT; the ssh and http tables hold the bastion route and the HTTP listener.",
+    )]);
+    for table in ownpg_core::config::profile::key_reference() {
+        roff.control("TP", []);
+        roff.text([bold(format!("[{}]", table.table))]);
+        roff.text([roman(table.keys.join(", "))]);
     }
     roff.to_writer(output)
 }
@@ -176,6 +195,7 @@ mod tests {
         for heading in [
             "\"EXIT STATUS\"",
             "ENVIRONMENT",
+            "\"PROFILE FILE\"",
             "\"REPORTING BUGS\"",
             "OPTIONS",
             "SUBCOMMANDS",
@@ -187,6 +207,8 @@ mod tests {
         }
         assert!(text.contains("130"));
         assert!(text.contains("OWNPG_DATABASE"));
+        assert!(text.contains("audit_keep_files"));
+        assert!(text.contains("[profiles.<name>.ssh]"));
     }
 
     #[test]
@@ -213,27 +235,33 @@ mod tests {
         let sources = [
             include_str!("../../ownpg-core/src/config/resolve.rs"),
             include_str!("../../ownpg-core/src/config/http.rs"),
+            include_str!("../../ownpg-core/src/config/libpq.rs"),
             include_str!("cli.rs"),
             include_str!("context.rs"),
         ];
         let listed: String = ENVIRONMENT
             .iter()
-            .map(|(names, _)| *names)
+            .map(|(names, meaning)| format!("{names} {meaning}"))
             .collect::<Vec<_>>()
             .join(" ");
+        let mut checked = 0;
         for source in sources {
-            for (index, _) in source.match_indices("\"OWNPG_") {
-                let rest = &source[index + 1..];
-                let end = rest.find('"').unwrap_or(rest.len());
-                let variable = &rest[..end];
-                if variable == "OWNPG_BUILD_COMMIT" || variable == "OWNPG_BUILD_DATE" {
-                    continue;
+            for (marker, skip) in [("\"OWNPG_", 1), ("(\"PG", 2)] {
+                for (index, _) in source.match_indices(marker) {
+                    let rest = &source[index + skip..];
+                    let end = rest.find('"').unwrap_or(rest.len());
+                    let variable = &rest[..end];
+                    if variable == "OWNPG_BUILD_COMMIT" || variable == "OWNPG_BUILD_DATE" {
+                        continue;
+                    }
+                    assert!(
+                        listed.contains(variable),
+                        "{variable} is not in the ENVIRONMENT section"
+                    );
+                    checked += 1;
                 }
-                assert!(
-                    listed.contains(variable),
-                    "{variable} is not in the ENVIRONMENT section"
-                );
             }
         }
+        assert!(checked > 60, "{checked}");
     }
 }

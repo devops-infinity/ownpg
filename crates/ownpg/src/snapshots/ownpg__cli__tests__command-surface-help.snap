@@ -325,7 +325,7 @@ Options:
 
 EXAMPLES:
   ownpg config path
-  ownpg config init --dry-run         print a profile file that names every key
+  ownpg config init --dry-run         print the starter profile file
   ownpg config show -p staging --format json
   ownpg config set-password staging   read the password from the terminal or stdin
 

@@ -113,7 +113,7 @@ pub(crate) const DOCTOR_EXAMPLES: &str = "EXAMPLES:\n  \
 
 pub(crate) const CONFIG_EXAMPLES: &str = "EXAMPLES:\n  \
     ownpg config path\n  \
-    ownpg config init --dry-run         print a profile file that names every key\n  \
+    ownpg config init --dry-run         print the starter profile file\n  \
     ownpg config show -p staging --format json\n  \
     ownpg config set-password staging   read the password from the terminal or stdin";
 
