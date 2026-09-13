@@ -191,10 +191,13 @@ impl BearerTokens {
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
-        crate::config::profile::refuse_open_permissions(path)?;
-        let text = std::fs::read_to_string(path).map_err(|source| Error::ConfigUnreadable {
-            path: path.to_path_buf(),
-            source,
+        let mut file = crate::config::profile::open_private(path)?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text).map_err(|source| {
+            Error::ConfigUnreadable {
+                path: path.to_path_buf(),
+                source,
+            }
         })?;
         Self::parse_labeled(&text, &path.display().to_string(), "file")
     }

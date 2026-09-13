@@ -137,8 +137,7 @@ impl ProfileFile {
         if !path.exists() {
             return Ok(None);
         }
-        refuse_open_permissions(path)?;
-        let text = read_capped(path)?;
+        let text = read_capped_handle(open_private(path)?, path)?;
         let parsed: Self = toml::from_str(&text).map_err(|error| Error::ConfigMalformed {
             path: path.to_path_buf(),
             line: error.span().map(|span| line_of(&text, span.start)),
@@ -234,11 +233,18 @@ pub fn key_reference() -> Vec<KeyTable> {
     ]
 }
 
-pub fn read_capped(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path).map_err(|source| Error::ConfigUnreadable {
+pub fn open_file(path: &Path) -> Result<fs::File> {
+    fs::File::open(path).map_err(|source| Error::ConfigUnreadable {
         path: path.to_path_buf(),
         source,
-    })?;
+    })
+}
+
+pub fn read_capped(path: &Path) -> Result<String> {
+    read_capped_handle(open_file(path)?, path)
+}
+
+pub fn read_capped_handle(mut file: fs::File, path: &Path) -> Result<String> {
     let mut buffer = String::new();
     Read::by_ref(&mut file)
         .take(FILE_CAP_BYTES + 1)
@@ -257,14 +263,19 @@ pub fn read_capped(path: &Path) -> Result<String> {
 }
 
 #[cfg(unix)]
+fn shared_mode(raw: u32) -> Option<u32> {
+    let mode = raw & 0o777;
+    (mode & 0o077 != 0).then_some(mode)
+}
+
+#[cfg(unix)]
 pub fn open_permissions(path: &Path) -> Result<Option<u32>> {
     use std::os::unix::fs::MetadataExt;
     let metadata = fs::metadata(path).map_err(|source| Error::ConfigUnreadable {
         path: path.to_path_buf(),
         source,
     })?;
-    let mode = metadata.mode() & 0o777;
-    Ok((mode & 0o077 != 0).then_some(mode))
+    Ok(shared_mode(metadata.mode()))
 }
 
 #[cfg(not(unix))]
@@ -272,13 +283,29 @@ pub fn open_permissions(_path: &Path) -> Result<Option<u32>> {
     Ok(None)
 }
 
-pub fn refuse_open_permissions(path: &Path) -> Result<()> {
-    match open_permissions(path)? {
+#[cfg(unix)]
+pub fn handle_permissions(file: &fs::File, path: &Path) -> Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata().map_err(|source| Error::ConfigUnreadable {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(shared_mode(metadata.mode()))
+}
+
+#[cfg(not(unix))]
+pub fn handle_permissions(_file: &fs::File, _path: &Path) -> Result<Option<u32>> {
+    Ok(None)
+}
+
+pub fn open_private(path: &Path) -> Result<fs::File> {
+    let file = open_file(path)?;
+    match handle_permissions(&file, path)? {
         Some(mode) => Err(Error::ConfigPermissions {
             path: path.to_path_buf(),
             mode,
         }),
-        None => Ok(()),
+        None => Ok(file),
     }
 }
 
@@ -548,6 +575,40 @@ tokens_file = "/etc/ownpg/tokens"
         assert_eq!(error.id(), ErrorId::ConfigPermissions);
         assert!(error.to_string().contains("644"), "{error}");
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_open_refuses_every_shared_mode_and_accepts_an_owner_only_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = temp_file("secret", "owner only\n");
+        let mut file = open_private(&path).unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "owner only\n");
+        for mode in [0o640, 0o604, 0o644, 0o660, 0o666] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let error = open_private(&path).unwrap_err();
+            assert_eq!(error.id(), ErrorId::ConfigPermissions);
+            assert!(error.to_string().contains(&format!("{mode:o}")), "{error}");
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(open_private(&path).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_open_reads_the_file_it_checked_even_when_the_path_is_swapped() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, path) = temp_file("secret", "owner only\n");
+        let checked = open_private(&path).unwrap();
+        let planted = dir.path().join("planted");
+        fs::write(&planted, "someone else\n").unwrap();
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::rename(&planted, &path).unwrap();
+        assert_eq!(read_capped_handle(checked, &path).unwrap(), "owner only\n");
+        let error = open_private(&path).unwrap_err();
+        assert_eq!(error.id(), ErrorId::ConfigPermissions);
     }
 
     #[test]
