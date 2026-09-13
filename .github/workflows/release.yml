@@ -7,6 +7,15 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Rehearse the build for this version tag; it must match the workspace version"
+        required: true
+        default: "v0.1.0"
+
+env:
+  DIST_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,7 +48,7 @@ jobs:
           if-no-files-found: error
       - id: plan
         run: |
-          dist plan --tag=${{ github.ref_name }} --output-format=json > plan-dist-manifest.json
+          dist plan --tag=${{ env.DIST_TAG }} --output-format=json > plan-dist-manifest.json
           cat plan-dist-manifest.json
           manifest="$(jq -c '.' plan-dist-manifest.json)"
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
@@ -55,6 +64,10 @@ jobs:
     needs:
       - plan
     timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.manifest).ci.github.artifacts_matrix }}
@@ -89,13 +102,19 @@ jobs:
       - name: Install the system packages this target needs
         run: |
           ${{ matrix.packages_install }}
+      - name: Install cargo-about
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-about@0.9.2
       - name: Build artifacts
         shell: bash
         env:
           XWIN_INCLUDE_DEBUG_SYMBOLS: "true"
         run: |
           export RUSTFLAGS="--remap-path-prefix=${{ github.workspace }}=/ownpg --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-          dist build --tag=${{ github.ref_name }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          cargo about generate about.hbs -o THIRD-PARTY.txt
+          dist build --tag=${{ env.DIST_TAG }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
       - id: upload-paths
         name: Collect the upload paths
         shell: bash
@@ -107,6 +126,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_PATH"
+      - name: Attest the build provenance of the local artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: ${{ steps.upload-paths.outputs.paths }}
       - name: Upload the local artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -123,6 +147,10 @@ jobs:
       - build-local-artifacts
     runs-on: "ubuntu-22.04"
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       BUILD_MANIFEST_PATH: target/distrib/global-dist-manifest.json
     steps:
@@ -142,11 +170,17 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      - name: Install cargo-about
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-about@0.9.2
       - id: global-build
         name: dist build --artifacts=global
         shell: bash
         run: |
-          dist build --tag=${{ github.ref_name }} --output-format=json --artifacts=global > dist-manifest.json
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          cargo about generate about.hbs -o THIRD-PARTY.txt
+          dist build --tag=${{ env.DIST_TAG }} --output-format=json --artifacts=global > dist-manifest.json
 
           {
             echo "paths<<EOF"
@@ -155,6 +189,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_PATH"
+      - name: Attest the build provenance of the global artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: ${{ steps.global-build.outputs.paths }}
       - name: Upload the global artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

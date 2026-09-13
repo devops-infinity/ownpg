@@ -1,6 +1,6 @@
 [package]
 name = "ownpg"
-description = "PostgreSQL DBA tools for AI clients over the Model Context Protocol, one database and one schema per run"
+description = "OwnPG serves PostgreSQL DBA tools to AI clients over the Model Context Protocol, one database and one schema per run"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,6 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
@@ -24,11 +23,19 @@ ownpg-core = { path = "../ownpg-core", version = "0.1.0" }
 clap.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true
-
-[build-dependencies]
-clap.workspace = true
-clap_mangen.workspace = true
+etcetera.workspace = true
+keyring.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+rpassword.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
+insta.workspace = true
 predicates.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

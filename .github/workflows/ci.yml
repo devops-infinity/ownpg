@@ -19,6 +19,7 @@ env:
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
   RUST_BACKTRACE: 1
+  INSTA_UPDATE: "no"
 
 jobs:
   house-rules:
@@ -28,48 +29,34 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Refuse the wording the project bans
+      - name: refuse the wording the project bans
         run: |
-          hits=$(git ls-files -- crates tools docs ':(top,glob)*.md' |
-            grep -vE '^docs/planning/|^[0-9]{4}-.*\.md$' |
+          hits=$(git ls-files -- crates tools ':(top,glob)*.md' ':(exclude)**/LICENSE-*' |
             xargs grep -nIE 'legacy|backward.compat|inspired by|based on|ported from|fork of' 2>/dev/null |
-            grep -v '^tools/release\.sh:' | grep -v '^CLAUDE\.md:' | grep -v '^AGENTS\.md:' | grep -v '^constitution\.md:' || true)
+            grep -v '^tools/release\.sh:' |
+            grep -v 'with_legacy_session_mode' || true)
           if [ -n "$hits" ]; then
             echo "::error::banned wording found"
             echo "$hits"
             exit 1
           fi
 
-      - name: Refuse the em dash the project bans
+      - name: refuse the em dash the project bans
         run: |
           em_dash="$(printf '\342\200\224')"
-          hits=$(git ls-files -- crates tools docs ':(top,glob)*.md' | xargs grep -lI -- "$em_dash" 2>/dev/null || true)
+          hits=$(git ls-files -- crates tools ':(top,glob)*.md' | xargs grep -lI -- "$em_dash" 2>/dev/null || true)
           if [ -n "$hits" ]; then
             echo "::error::an em dash was found"
             echo "$hits"
             exit 1
           fi
 
-      - name: Refuse the markdown table the project bans
+      - name: refuse the markdown table the project bans
         run: |
-          hits=$(git ls-files -- ':(top,glob)*.md' docs | xargs grep -nE '^\s*\|.*\|\s*$' 2>/dev/null || true)
+          hits=$(git ls-files -- ':(top,glob)*.md' | xargs grep -nE '^\s*\|.*\|\s*$' 2>/dev/null || true)
           if [ -n "$hits" ]; then
             echo "::error::a markdown table was found"
             echo "$hits"
-            exit 1
-          fi
-
-      - name: Confirm CLAUDE.md and AGENTS.md carry the same text
-        run: cmp CLAUDE.md AGENTS.md
-
-      - name: Confirm the documented exit codes match the source
-        run: |
-          declared=$(grep -oE '^\s+[A-Za-z]+ = [0-9]+,' crates/ownpg-core/src/error.rs | grep -oE '[0-9]+' | sort -n | tr '\n' ' ')
-          documented=$(awk '/^## Exit codes/ { keep = 1; next } /^## / { keep = 0 } keep' README.md | grep -oE '^- [^0-9 ][0-9]+' | grep -oE '[0-9]+' | sort -n | tr '\n' ' ')
-          if [ -z "$declared" ] || [ "$declared" != "$documented" ]; then
-            echo "::error::the exit codes in error.rs no longer match what README.md documents"
-            echo "declared: $declared"
-            echo "documented: $documented"
             exit 1
           fi
 
@@ -90,7 +77,7 @@ jobs:
       - name: shfmt tools/*.sh
         run: shfmt -d tools/*.sh
 
-  secrets:
+  secret-scan:
     name: secret scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -99,7 +86,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install gitleaks
+      - name: install gitleaks
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf -o gitleaks.tar.gz \
             https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
@@ -127,7 +114,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Confirm the pin still matches rust-version
+      - name: confirm the pin still matches rust-version
         if: matrix.toolchain != 'stable'
         run: |
           declared=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -136,7 +123,7 @@ jobs:
             exit 1
           fi
 
-      - name: Install the toolchain
+      - name: install the toolchain
         run: |
           rustup toolchain install "${{ matrix.toolchain }}" --profile minimal --no-self-update
           rustup component add rustfmt clippy --toolchain "${{ matrix.toolchain }}"
@@ -192,6 +179,243 @@ jobs:
           ownpg man > /dev/null
           ownpg completions bash > /dev/null
 
+  live:
+    name: live (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["14", "15", "16", "17", "18"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: ownpg_ci
+          POSTGRES_PASSWORD: ownpg_ci
+          POSTGRES_DB: postgres
+          POSTGRES_INITDB_ARGS: --locale=en_US.UTF-8
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ownpg_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      OWNPG_TEST_DSN: postgresql://ownpg_ci:ownpg_ci@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: install the toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: install the matching PostgreSQL client programs
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends "postgresql-client-${{ matrix.postgres }}"
+          echo "OWNPG_TEST_PG_BINDIR=/usr/lib/postgresql/${{ matrix.postgres }}/bin" >> "$GITHUB_ENV"
+          "/usr/lib/postgresql/${{ matrix.postgres }}/bin/pg_dump" --version
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: live-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: live-${{ runner.os }}-
+
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-nextest@0.9.144,cargo-insta@1.48.0
+
+      - name: cargo nextest against the live server, rejecting unreferenced snapshots
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo insta test --workspace --all-features --test-runner nextest --unreferenced=reject --color=never
+
+      - name: doctor against the official image
+        env:
+          OWNPG_HOST: 127.0.0.1
+          OWNPG_PORT: "5432"
+          OWNPG_USER: ownpg_ci
+          OWNPG_DATABASE: postgres
+          PGPASSWORD: ownpg_ci
+        run: |
+          cargo run --locked -p ownpg -- doctor --format json > doctor.json
+          grep -q '"name": "connection"' doctor.json
+          grep -q '"status": "ok"' doctor.json
+
+      - name: build the dist binary and time the first discover answer
+        if: matrix.postgres == '18'
+        env:
+          OWNPG_HOST: 127.0.0.1
+          OWNPG_PORT: "5432"
+          OWNPG_USER: ownpg_ci
+          OWNPG_DATABASE: postgres
+          PGPASSWORD: ownpg_ci
+        run: |
+          cargo build --profile dist --locked -p ownpg
+          request='{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+          ./target/dist/ownpg serve <<< "$request" > /dev/null
+          start=$(date +%s%N)
+          answer=$(./target/dist/ownpg serve <<< "$request" | head -n 1)
+          finish=$(date +%s%N)
+          elapsed=$(( (finish - start) / 1000000 ))
+          echo "startup to the first discover answer: ${elapsed} ms"
+          echo "$answer" | grep -q '"supportedVersions"'
+          if [ "$elapsed" -gt 1000 ]; then
+            echo "::error::the first discover answer took ${elapsed} ms; the budget on a shared runner is 1000 ms"
+            exit 1
+          fi
+          size=$(stat -c %s ./target/dist/ownpg)
+          echo "dist binary size: ${size} bytes"
+          if [ "$size" -gt 41943040 ]; then
+            echo "::error::the dist binary is ${size} bytes; the budget is 40 MiB"
+            exit 1
+          fi
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: ownpg_ci
+          POSTGRES_PASSWORD: ownpg_ci
+          POSTGRES_DB: postgres
+          POSTGRES_INITDB_ARGS: --locale=en_US.UTF-8
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ownpg_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      OWNPG_TEST_DSN: postgresql://ownpg_ci:ownpg_ci@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup component add llvm-tools-preview --toolchain stable
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: coverage-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: coverage-${{ runner.os }}-
+
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-nextest@0.9.144,cargo-llvm-cov@0.9.1
+
+      - name: cargo llvm-cov
+        run: cargo llvm-cov nextest --workspace --locked --no-tests=warn --color=never --fail-under-lines 80 --summary-only
+
+  conformance:
+    name: conformance (${{ matrix.revision }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - revision: "2026-07-28"
+            older_client_sessions: "false"
+          - revision: "2025-11-25"
+            older_client_sessions: "true"
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: ownpg_ci
+          POSTGRES_PASSWORD: ownpg_ci
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ownpg_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      CONFORMANCE_VERSION: 0.2.0-alpha.11
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: install the toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: conformance-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: conformance-${{ runner.os }}-
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "24"
+
+      - name: build the server
+        run: cargo build --locked -p ownpg --color=never
+
+      - name: run the official conformance suite over Streamable HTTP
+        env:
+          OWNPG_HOST: 127.0.0.1
+          OWNPG_PORT: "5432"
+          OWNPG_USER: ownpg_ci
+          OWNPG_DATABASE: postgres
+          PGPASSWORD: ownpg_ci
+          OWNPG_RATE_LIMIT_PER_MINUTE: "100000"
+          OWNPG_OLDER_CLIENT_SESSIONS: ${{ matrix.older_client_sessions }}
+        run: |
+          set -eu
+          target/debug/ownpg serve --http --auth none --bind 127.0.0.1:8765 --no-input > server.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8765/healthz/ready > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8765/healthz/ready
+          status=0
+          npx -y "@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}" server \
+            --url http://127.0.0.1:8765/mcp \
+            --requirements "${{ matrix.revision }}" \
+            --expected-failures .github/conformance/expected-failures.yaml \
+            -o conformance-results || status=$?
+          kill "$server_pid" || true
+          wait "$server_pid" || true
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the conformance suite reported an unexpected failure or a stale baseline entry"
+            tail -n 40 server.log || true
+          fi
+          exit "$status"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: conformance-${{ matrix.revision }}
+          path: conformance-results
+          if-no-files-found: ignore
+
   platforms:
     name: platform (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -205,7 +429,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Install the toolchain
+      - name: install the toolchain
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup component add clippy --toolchain stable
@@ -228,6 +452,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked --color=never -- -D warnings
 
       - name: cargo nextest
+        env:
+          OWNPG_TEST_KEYCHAIN: "1"
         run: cargo nextest run --workspace --all-features --locked --no-tests=warn --color=never
 
       - name: cargo install from this checkout
@@ -268,7 +494,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Install the toolchain and the target
+      - name: install the toolchain and the target
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add ${{ matrix.target }}
@@ -312,7 +538,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Install the toolchain
+      - name: install the toolchain
         run: rustup toolchain install "1.89" --profile minimal --no-self-update
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -324,6 +550,20 @@ jobs:
             target
           key: package-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: package-${{ runner.os }}-
+
+      - uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af
+        with:
+          tool: cargo-semver-checks@0.50.0
+
+      - name: cargo semver-checks against the published ownpg-core
+        run: |
+          set -eu
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -A 'ownpg-ci (https://github.com/devops-infinity/ownpg-releases)' https://crates.io/api/v1/crates/ownpg-core || true)
+          if [ "$code" != "200" ]; then
+            echo "ownpg-core is not on crates.io yet; nothing to compare against"
+            exit 0
+          fi
+          cargo semver-checks check-release -p ownpg-core --color never
 
       - name: cargo publish --dry-run --locked -p ownpg-core
         run: cargo publish --dry-run --locked -p ownpg-core

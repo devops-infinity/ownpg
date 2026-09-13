@@ -1,0 +1,69 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.devops-infinity/ownpg",
+  "title": "OwnPG",
+  "description": "PostgreSQL DBA tools over MCP, scoped to one database and one schema, with read, write, DDL, role, maintenance, monitoring, and host program tools.",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/devops-infinity/ownpg-releases",
+  "repository": {
+    "url": "https://github.com/devops-infinity/ownpg-releases",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "cargo",
+      "registryBaseUrl": "https://crates.io",
+      "identifier": "ownpg",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--mode",
+          "description": "Access mode: read-only, write-only, or read-write.",
+          "default": "read-only",
+          "isRequired": false
+        },
+        {
+          "type": "named",
+          "name": "--database",
+          "description": "The one database this server manages.",
+          "isRequired": true
+        },
+        {
+          "type": "named",
+          "name": "--schema",
+          "description": "The one schema this server manages.",
+          "default": "public",
+          "isRequired": false
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "OWNPG_HOST",
+          "description": "Host name, address, or Unix socket directory.",
+          "isRequired": false
+        },
+        {
+          "name": "OWNPG_PORT",
+          "description": "PostgreSQL port.",
+          "isRequired": false,
+          "default": "5432"
+        },
+        {
+          "name": "OWNPG_USER",
+          "description": "The PostgreSQL role to connect as.",
+          "isRequired": false
+        },
+        {
+          "name": "OWNPG_PASSWORD",
+          "description": "The role's password.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}

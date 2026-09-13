@@ -1,0 +1,5 @@
+---
+source: crates/ownpg-core/tests/live/ddl.rs
+expression: routine_sql
+---
+CREATE OR REPLACE FUNCTION "app"."order_total"("order_id" bigint) RETURNS numeric LANGUAGE "sql" STABLE STRICT SECURITY DEFINER SET search_path = "app", pg_temp AS $ownpg$SELECT total FROM app.orders WHERE id = order_id$ownpg$

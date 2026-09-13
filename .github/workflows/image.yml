@@ -1,0 +1,99 @@
+name: Image
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - docker-compose.yml
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - .github/workflows/image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build and smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: ownpg_ci
+          POSTGRES_PASSWORD: ownpg_ci
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ownpg_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
+
+      - name: read the commit stamp
+        id: stamp
+        run: |
+          set -eu
+          echo "commit=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+
+      - name: build the amd64 image for the smoke test
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ownpg:smoke
+          build-args: |
+            OWNPG_BUILD_COMMIT=${{ steps.stamp.outputs.commit }}
+            SOURCE_DATE_EPOCH=${{ steps.stamp.outputs.epoch }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: smoke test the image against the service database
+        run: |
+          set -eu
+          docker run --rm --network host \
+            -e OWNPG_HOST=127.0.0.1 -e OWNPG_PORT=5432 -e OWNPG_USER=ownpg_ci \
+            -e OWNPG_DATABASE=postgres -e PGPASSWORD=ownpg_ci \
+            ownpg:smoke doctor --format json > doctor.json
+          grep -q '"name": "connection"' doctor.json
+          grep -q '"status": "ok"' doctor.json
+          docker run --rm ownpg:smoke --version
+          smoke_token="$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
+          docker run -d --name ownpg-smoke --network host \
+            -e OWNPG_HOST=127.0.0.1 -e OWNPG_PORT=5432 -e OWNPG_USER=ownpg_ci \
+            -e OWNPG_DATABASE=postgres -e PGPASSWORD=ownpg_ci \
+            -e OWNPG_BIND=127.0.0.1:8765 -e OWNPG_AUTH=bearer \
+            -e OWNPG_BEARER_TOKENS="$smoke_token read-only smoke" \
+            ownpg:smoke serve --http
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8765/healthz/ready > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8765/healthz/ready
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8765/mcp \
+            -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/list' \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}')
+          test "$status" = "401"
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8765/mcp \
+            -H "Authorization: Bearer $smoke_token" \
+            -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/list' \
+            -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}')
+          test "$status" = "200"
+          docker logs ownpg-smoke
+          docker stop ownpg-smoke

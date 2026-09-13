@@ -1,0 +1,16 @@
+---
+source: crates/ownpg-core/tests/live/ddl.rs
+expression: template
+---
+DO $ownpg_template$
+BEGIN
+    EXECUTE 'GRANT USAGE ON SCHEMA "app" TO "app_reader"';
+    EXECUTE 'GRANT SELECT ON ALL TABLES IN SCHEMA "app" TO "app_reader"';
+    EXECUTE 'GRANT SELECT ON ALL SEQUENCES IN SCHEMA "app" TO "app_reader"';
+    EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA "app" GRANT SELECT ON TABLES TO "app_reader"';
+    EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA "app" GRANT SELECT ON SEQUENCES TO "app_reader"';
+    EXECUTE 'ALTER ROLE "app_reader" SET default_transaction_read_only = on';
+    EXECUTE 'ALTER ROLE "app_reader" SET search_path = ''''';
+    EXECUTE 'GRANT pg_read_all_stats TO "app_reader"';
+END
+$ownpg_template$

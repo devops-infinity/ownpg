@@ -1,14 +1,12 @@
 use clap::CommandFactory;
 use ownpg_core::{Error, ExitClass, Result};
 
-use crate::cli::{Cli, Command, ShellArg};
+use crate::cli::{Cli, Command, ServeArgs, ShellArg};
 use crate::output::{emit, report_error, stdout_error};
+use crate::{audit_cmd, config_cmd, context, doctor, logging, serve};
 
 pub(crate) fn run(args: Cli) -> ExitClass {
-    let outcome = match args.command {
-        Command::Man { command } => show_manual(&command),
-        Command::Completions { shell } => show_completions(shell),
-    };
+    let outcome = dispatch(args);
     match outcome {
         Ok(class) => class,
         Err(error) => {
@@ -18,13 +16,44 @@ pub(crate) fn run(args: Cli) -> ExitClass {
     }
 }
 
+fn dispatch(args: Cli) -> Result<ExitClass> {
+    match &args.command {
+        Some(Command::Man { command }) => return show_manual(command),
+        Some(Command::Completions { shell }) => return show_completions(*shell),
+        _ => {}
+    }
+    let process = context::detect(&args.global)?;
+    let human_output = !matches!(args.command, None | Some(Command::Serve(_)));
+    let _log_guard = logging::init(&args.global, &process.paths, human_output)?;
+    match args.command {
+        None => {
+            let defaults = ServeArgs {
+                connection: crate::cli::ConnectionArgs::default(),
+                no_audit: false,
+                audit_path: None,
+                pg_bindir: None,
+                output_dir: None,
+                http: false,
+                bind: None,
+                auth: None,
+            };
+            serve::run(&args.global, &defaults, &process)
+        }
+        Some(Command::Serve(serve_args)) => serve::run(&args.global, &serve_args, &process),
+        Some(Command::Doctor(doctor_args)) => doctor::run(&args.global, &doctor_args, &process),
+        Some(Command::Config(config)) => config_cmd::run(&args.global, &config, &process),
+        Some(Command::Audit(crate::cli::AuditCommand::Verify { path })) => audit_cmd::verify(&path),
+        Some(Command::Man { .. } | Command::Completions { .. }) => Ok(ExitClass::Success),
+    }
+}
+
 fn show_manual(path: &[String]) -> Result<ExitClass> {
     let root = Cli::command();
-    let mut here = root.clone();
+    let mut current = root.clone();
     let mut walked: Vec<String> = Vec::new();
     for step in path {
-        let Some(found) = here.get_subcommands().find(|sub| sub.get_name() == step) else {
-            let known = here
+        let Some(found) = current.get_subcommands().find(|sub| sub.get_name() == step) else {
+            let known = current
                 .get_subcommands()
                 .map(|sub| sub.get_name().to_owned())
                 .collect();
@@ -34,20 +63,20 @@ fn show_manual(path: &[String]) -> Result<ExitClass> {
             });
         };
         let next = found.clone();
-        here = next;
+        current = next;
         walked.push(step.clone());
     }
 
     let page = if walked.is_empty() {
-        clap_mangen::Man::new(root)
+        root
     } else {
         let titled = format!("ownpg-{}", walked.join("-"));
         let leaked: &'static str = Box::leak(titled.into_boxed_str());
-        clap_mangen::Man::new(here.name(leaked).version(ownpg_core::VERSION))
+        current.name(leaked).version(ownpg_core::VERSION)
     };
 
     let mut rendered = Vec::new();
-    page.render(&mut rendered).map_err(stdout_error)?;
+    crate::man::render(&page, &mut rendered).map_err(stdout_error)?;
     emit(|out| out.write_all(&rendered)).map_err(stdout_error)?;
     Ok(ExitClass::Success)
 }
@@ -78,5 +107,12 @@ mod tests {
         assert_eq!(error.exit_class(), ExitClass::Usage);
         assert!(error.remedy().contains("man"));
         assert!(error.remedy().contains("completions"));
+        assert!(error.remedy().contains("serve"));
+    }
+
+    #[test]
+    fn a_nested_manual_page_renders() {
+        let outcome = show_manual(&["config".to_owned(), "show".to_owned()]);
+        assert!(outcome.is_ok());
     }
 }

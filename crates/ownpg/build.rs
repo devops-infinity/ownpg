@@ -1,54 +1,28 @@
-#![allow(
-    clippy::print_stdout,
-    reason = "cargo directives are written to stdout"
-)]
-#![allow(
-    dead_code,
-    reason = "the command tree is compiled a second time here, where only its clap definition is used"
-)]
-
 use std::env;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use clap::CommandFactory;
-
-#[path = "src/cli.rs"]
-mod cli;
-
-fn main() -> io::Result<()> {
-    println!("cargo::rerun-if-changed=src/cli.rs");
+fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo::rerun-if-env-changed=OWNPG_BUILD_COMMIT");
     for path in git_state_files() {
         println!("cargo::rerun-if-changed={}", path.display());
     }
-    println!("cargo::rustc-env=OWNPG_BUILD_COMMIT={}", commit());
+    println!("cargo::rustc-env=OWNPG_BUILD_COMMIT={}", commit_hash());
     println!("cargo::rustc-env=OWNPG_BUILD_DATE={}", build_date());
+}
 
-    let Some(out_dir) = env::var_os("OUT_DIR").map(PathBuf::from) else {
-        return Ok(());
-    };
-
-    let manuals = out_dir.join("artifacts").join("man");
-    fs::create_dir_all(&manuals)?;
-
-    let mut command = cli::Cli::command();
-    command.build();
-
-    write_manuals(&command, &manuals)?;
-    Ok(())
+fn workspace_root() -> Option<PathBuf> {
+    env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .and_then(|dir| dir.parent()?.parent().map(Path::to_path_buf))
+        .filter(|root| root.join(".git").is_dir())
 }
 
 fn git_state_files() -> Vec<PathBuf> {
-    let Some(git_dir) = env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .and_then(|dir| dir.parent()?.parent().map(Path::to_path_buf))
-        .map(|root| root.join(".git"))
-        .filter(|dir| dir.is_dir())
-    else {
+    let Some(git_dir) = workspace_root().map(|root| root.join(".git")) else {
         return Vec::new();
     };
     let head = git_dir.join("HEAD");
@@ -64,15 +38,46 @@ fn git_state_files() -> Vec<PathBuf> {
     files
 }
 
-fn commit() -> String {
+fn git_output(root: &Path, arguments: &[&str]) -> Option<String> {
     Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
         .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
+}
+
+fn packaged_commit() -> Option<String> {
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from)?;
+    let text = fs::read_to_string(manifest_dir.join(".cargo_vcs_info.json")).ok()?;
+    let marker = "\"sha1\"";
+    let start = text.find(marker)? + marker.len();
+    let rest = text.get(start..)?;
+    let value_start = rest.find('"')? + 1;
+    let hash: String = rest
+        .get(value_start..)?
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .take(12)
+        .collect();
+    (hash.len() == 12).then_some(hash)
+}
+
+fn commit_hash() -> String {
+    if let Some(env_commit) = env::var("OWNPG_BUILD_COMMIT")
+        .ok()
+        .map(|value| value.trim().chars().take(12).collect::<String>())
+        .filter(|value| !value.is_empty())
+    {
+        return env_commit;
+    }
+    workspace_root()
+        .and_then(|root| git_output(&root, &["rev-parse", "--short=12", "HEAD"]))
+        .or_else(packaged_commit)
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
@@ -80,6 +85,11 @@ fn build_date() -> String {
     env::var("SOURCE_DATE_EPOCH")
         .ok()
         .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .or_else(|| {
+            workspace_root()
+                .and_then(|root| git_output(&root, &["log", "-1", "--format=%ct"]))
+                .and_then(|text| text.parse::<i64>().ok())
+        })
         .map(|epoch| {
             let (year, month, day) = civil_from_days(epoch.div_euclid(86_400));
             format!("{year:04}-{month:02}-{day:02}")
@@ -87,9 +97,9 @@ fn build_date() -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-#[allow(
+#[expect(
     clippy::integer_division,
-    reason = "calendar arithmetic on whole days is exact by construction"
+    reason = "the civil date formula works in whole days"
 )]
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
@@ -107,27 +117,4 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     };
     let year = year_of_era + era * 400 + i64::from(month <= 2);
     (year, month, day)
-}
-
-fn write_manuals(command: &clap::Command, target: &Path) -> io::Result<()> {
-    let root = clap_mangen::Man::new(command.clone());
-    let mut buffer = Vec::new();
-    root.render(&mut buffer)?;
-    fs::write(target.join("ownpg.1"), &buffer)?;
-
-    write_nested(command, "ownpg", target)
-}
-
-fn write_nested(command: &clap::Command, prefix: &str, target: &Path) -> io::Result<()> {
-    for sub in command.get_subcommands() {
-        let name = format!("{prefix}-{}", sub.get_name());
-        let file = format!("{name}.1");
-        let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
-        let page = clap_mangen::Man::new(sub.clone().name(leaked));
-        let mut buffer = Vec::new();
-        page.render(&mut buffer)?;
-        fs::write(target.join(file), &buffer)?;
-        write_nested(sub, &name, target)?;
-    }
-    Ok(())
 }

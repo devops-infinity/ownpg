@@ -22,13 +22,21 @@ pub(crate) fn stdout_error(source: io::Error) -> Error {
     }
 }
 
+pub(crate) fn cause_chain(error: &Error) -> Vec<String> {
+    let mut causes = Vec::new();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+    causes
+}
+
 pub(crate) fn report_error(error: &Error) {
     let mut stderr = io::stderr().lock();
     let _ = writeln!(stderr, "error: {error}");
-    let mut source = std::error::Error::source(error);
-    while let Some(cause) = source {
+    for cause in cause_chain(error) {
         let _ = writeln!(stderr, "  caused by: {cause}");
-        source = cause.source();
     }
     let remedy = error.remedy();
     if !remedy.is_empty() {
