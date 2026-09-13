@@ -29,11 +29,13 @@ pub const READY_PATH: &str = "/healthz/ready";
 pub const METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
 pub const HEADER_MCP_METHOD: &str = "mcp-method";
 pub const HEADER_MCP_NAME: &str = "mcp-name";
+const READINESS_CALLS_PER_MINUTE: u32 = u32::MAX;
 
 pub struct Gatekeeper {
     pub server: Arc<Server>,
     pub authenticator: Authenticator,
     pub limiter: Limiter,
+    pub readiness_limiter: Limiter,
     pub anonymous: Principal,
     pub older_client_sessions: bool,
     pub metadata_url: String,
@@ -108,6 +110,45 @@ impl Gatekeeper {
         }
         serde_json::Value::Object(document)
     }
+
+    pub fn build(
+        server: Arc<Server>,
+        settings: &Settings,
+        environment_tokens: Option<&str>,
+        anonymous: Principal,
+    ) -> Result<Self> {
+        let http = &settings.http;
+        if !http.is_loopback() && http.auth.mode() == AuthMode::None {
+            return Err(Error::ConfigInvalid {
+                setting: "bind".to_owned(),
+                value: http.bind.value.to_string(),
+                detail:
+                    "a bind address outside the loopback interface needs --auth bearer or --auth oauth"
+                        .to_owned(),
+            });
+        }
+        let authenticator = Authenticator::build(settings, environment_tokens)?;
+        let authorization_server = match &http.auth {
+            crate::config::AuthSettings::Oauth(oauth) => Some(oauth.issuer.value.clone()),
+            _ => None,
+        };
+        Ok(Self {
+            server,
+            authenticator,
+            limiter: Limiter::new(http.rate_limit_per_minute.value),
+            readiness_limiter: Limiter::new(READINESS_CALLS_PER_MINUTE),
+            anonymous,
+            older_client_sessions: http.older_client_sessions.value,
+            metadata_url: http.metadata_url(),
+            public_url: http.public_url.value.clone(),
+            authorization_server,
+            cancel: CancellationToken::new(),
+            trusted_proxies: http.trusted_proxies.value.clone(),
+            max_connections: usize::try_from(http.max_connections.value).unwrap_or(usize::MAX),
+            header_timeout: crate::config::http::DEFAULT_HEADER_TIMEOUT,
+            body_timeout: crate::config::http::DEFAULT_BODY_TIMEOUT,
+        })
+    }
 }
 
 pub const RATE_LIMITED_CODE: i32 = -32000;
@@ -149,7 +190,7 @@ fn too_many_requests(wait: Duration) -> Response {
         StatusCode::TOO_MANY_REQUESTS,
         axum::Json(serde_json::json!({
             "jsonrpc": "2.0",
-            "id": serde_json::Value::Null,
+            "id": 0,
             "error": {
                 "code": RATE_LIMITED_CODE,
                 "message": format!("rate_limited: the limit of calls per minute was reached; retry after {seconds} seconds"),
@@ -296,7 +337,10 @@ async fn ready(
     headers: axum::http::HeaderMap,
 ) -> Response {
     let client = client_address(peer, &headers, &gatekeeper.trusted_proxies);
-    if let Err(wait) = gatekeeper.limiter.check(&format!("ready:{client}")) {
+    if let Err(wait) = gatekeeper
+        .readiness_limiter
+        .check(&format!("ready:{client}"))
+    {
         return too_many_requests(wait);
     }
     if !gatekeeper.server.engine().is_alive().await {
@@ -341,58 +385,21 @@ pub fn router(gatekeeper: Arc<Gatekeeper>, settings: &Settings) -> Router {
         Arc::new(LocalSessionManager::default()),
         config,
     );
+    let body_timeout = gatekeeper.body_timeout;
     Router::new()
         .route_service(MCP_PATH, mcp)
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&gatekeeper),
             guard,
         ))
-        .route_layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
-            gatekeeper.body_timeout,
-        ))
         .route(LIVE_PATH, get(live))
         .route(READY_PATH, get(ready))
         .route(METADATA_PATH, get(metadata))
         .route(&format!("{METADATA_PATH}{MCP_PATH}"), get(metadata))
+        .layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
+            body_timeout,
+        ))
         .with_state(gatekeeper)
-}
-
-pub fn gatekeeper(
-    server: Arc<Server>,
-    settings: &Settings,
-    environment_tokens: Option<&str>,
-    anonymous: Principal,
-) -> Result<Gatekeeper> {
-    let http = &settings.http;
-    if !http.is_loopback() && http.auth.mode() == AuthMode::None {
-        return Err(Error::ConfigInvalid {
-            setting: "bind".to_owned(),
-            value: http.bind.value.to_string(),
-            detail:
-                "a bind address outside the loopback interface needs --auth bearer or --auth oauth"
-                    .to_owned(),
-        });
-    }
-    let authenticator = Authenticator::build(settings, environment_tokens)?;
-    let authorization_server = match &http.auth {
-        crate::config::AuthSettings::Oauth(oauth) => Some(oauth.issuer.value.clone()),
-        _ => None,
-    };
-    Ok(Gatekeeper {
-        server,
-        authenticator,
-        limiter: Limiter::new(http.rate_limit_per_minute.value),
-        anonymous,
-        older_client_sessions: http.older_client_sessions.value,
-        metadata_url: http.metadata_url(),
-        public_url: http.public_url.value.clone(),
-        authorization_server,
-        cancel: CancellationToken::new(),
-        trusted_proxies: http.trusted_proxies.value.clone(),
-        max_connections: usize::try_from(http.max_connections.value).unwrap_or(usize::MAX),
-        header_timeout: crate::config::http::DEFAULT_HEADER_TIMEOUT,
-        body_timeout: crate::config::http::DEFAULT_BODY_TIMEOUT,
-    })
 }
 
 pub async fn shutdown_signal() -> StopReason {
@@ -465,14 +472,17 @@ pub async fn serve(
         .header_read_timeout(gatekeeper.header_timeout)
         .keep_alive(true);
     let builder = Arc::new(builder);
-    let sweeper = {
-        let limiter_gate = Arc::clone(&gatekeeper);
+    let limiter_sweeper = {
+        let gatekeeper = Arc::clone(&gatekeeper);
         let stop = stop.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tokio::select! {
-                    _ = tick.tick() => limiter_gate.limiter.forget_idle(),
+                    _ = tick.tick() => {
+                        gatekeeper.limiter.forget_idle();
+                        gatekeeper.readiness_limiter.forget_idle();
+                    },
                     () = stop.cancelled() => break,
                 }
             }
@@ -522,7 +532,7 @@ pub async fn serve(
     };
     tracing::info!("stopping; draining in-flight calls (a second signal exits at once)");
     stop.cancel();
-    sweeper.abort();
+    limiter_sweeper.abort();
     drop(listener);
     let drained = tokio::select! {
         drained = tokio::time::timeout(deadline, graceful.shutdown()) => drained.is_ok(),
@@ -546,6 +556,19 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_rate_limited_response_carries_a_schema_valid_id() {
+        use http_body_util::BodyExt;
+        let response = too_many_requests(Duration::from_secs(1));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = &value["id"];
+        assert!(
+            id.is_string() || id.is_i64() || id.is_u64(),
+            "the 2026-07-28 wire schema requires id to be a string or an integer, never null: {id}"
+        );
+    }
 
     #[test]
     fn the_retry_delay_rounds_up_to_whole_seconds() {

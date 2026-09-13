@@ -22,7 +22,7 @@ See `README.md` for what the project does and how to run it, `CHANGELOG.md` for 
 - `cargo llvm-cov nextest --workspace --locked --fail-under-lines 80`: line coverage stays at 80 percent or higher.
 - `cargo audit --deny warnings` and `cargo deny check`: dependency advisories, license, and source checks against `deny.toml`.
 - `cargo semver-checks check-release -p ownpg-core`: the public API of `ownpg-core` stays compatible with the published crate.
-- Every tracked file under `crates/`, `tools/`, and the repository root's markdown files (excluding `LICENSE-*`) is grepped for a short list of words that flag borrowed or superseded code, and for the em-dash character. See the house-rules job in `.github/workflows/ci.yml` for the exact pattern.
+- Every tracked file under `crates/`, `tools/`, and the repository root's markdown files is grepped for the em-dash character, and the same scope excluding `LICENSE-*` is grepped for a short list of words that flag borrowed or superseded code. See the house-rules job in `.github/workflows/ci.yml` for the exact pattern.
 - No markdown table appears in any tracked markdown file at the repository root.
 - Every GitHub Actions step is pinned to a full commit SHA, never a floating tag.
 

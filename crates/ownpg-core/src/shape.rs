@@ -363,4 +363,24 @@ mod tests {
         assert_eq!(json["cursor"], "abc");
         assert_eq!(json["columns"][0]["type"], "text");
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn sanitize_never_leaves_an_invisible_character_behind(text in "\\PC{0,200}") {
+            let cleaned = sanitize(&text);
+            prop_assert!(
+                !cleaned.chars().any(is_invisible),
+                "an invisible character survived sanitize: {cleaned:?}"
+            );
+        }
+
+        #[test]
+        fn sanitize_never_panics_on_arbitrary_unicode(text in ".{0,200}") {
+            let _ = sanitize(&text);
+        }
+    }
 }

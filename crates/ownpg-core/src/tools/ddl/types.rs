@@ -505,16 +505,16 @@ pub fn extension(call: Call, args: ExtensionArgs) -> BoxFuture<'static, Outcome>
                 None,
                 None,
             );
-            let result = AvailableExtensions {
+            let available = AvailableExtensions {
                 row_count: listed.len(),
                 rows: listed,
                 order: "name",
                 notice: crate::shape::UNTRUSTED_NOTICE,
             };
-            return Ok(ToolOutput::structured(&result, text)?
+            return Ok(ToolOutput::structured(&available, text)?
                 .with_facts(AuditFacts {
                     operation: Some("available".to_owned()),
-                    row_count: Some(result.row_count as u64),
+                    row_count: Some(available.row_count as u64),
                     ..AuditFacts::default()
                 })
                 .into());

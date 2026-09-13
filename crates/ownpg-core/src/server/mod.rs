@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CompleteRequestParams, CompleteResult,
-    ErrorData, GetPromptRequestParams, GetPromptResponse, Implementation, InitializeResult,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-    ServerCapabilities, ServerInfo, SubscribeRequestParams, SubscriptionFilter, Tool,
-    UnsubscribeRequestParams,
+    ErrorData, ExtensionCapabilities, GetPromptRequestParams, GetPromptResponse, Implementation,
+    InitializeResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+    ReadResourceResponse, ServerCapabilities, ServerInfo, SubscribeRequestParams,
+    SubscriptionFilter, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::{
     NotificationContext, Peer, RequestContext, SubscriptionContext, SubscriptionSink,
@@ -248,7 +248,7 @@ impl Server {
         let error = crate::error::Error::ScopeInsufficient {
             scope: scope.to_owned(),
         };
-        self.record_request(
+        self.record_protocol_request(
             request,
             request_id.to_owned(),
             started.elapsed(),
@@ -260,7 +260,7 @@ impl Server {
         Err(ErrorData::invalid_request(error.to_string(), None))
     }
 
-    fn record_request(
+    fn record_protocol_request(
         &self,
         request: &str,
         request_id: String,
@@ -295,9 +295,12 @@ impl Server {
             outcome,
             superuser: self.superuser,
         };
-        if let Err(error) = self.audit.record(&entry) {
-            tracing::error!(%error, "the audit line could not be written");
-        }
+        let audit = Arc::clone(&self.audit);
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = audit.record(&entry) {
+                tracing::error!(%error, "the audit line could not be written");
+            }
+        });
         if let Some(metrics) = &self.metrics {
             metrics.record_call(request, decision, rule.as_deref(), duration);
         }
@@ -326,7 +329,7 @@ impl Server {
                 scope: route.spec.scope.to_owned(),
             }
             .into());
-            self.record(name, &outcome, request_id, started.elapsed(), &principal);
+            self.record_tool_call(name, &outcome, request_id, started.elapsed(), &principal);
             return Some(outcome);
         }
         let call = Call {
@@ -350,7 +353,7 @@ impl Server {
                 work.await
             }
         };
-        self.record(name, &outcome, request_id, started.elapsed(), &principal);
+        self.record_tool_call(name, &outcome, request_id, started.elapsed(), &principal);
         self.refresh_handle_gauge().await;
         if let Ok(Reply::Output(output)) = &outcome
             && output.facts.decision != Some(Decision::DryRun)
@@ -501,7 +504,7 @@ impl Server {
         }
     }
 
-    fn record(
+    fn record_tool_call(
         &self,
         tool: &str,
         outcome: &Outcome,
@@ -562,9 +565,12 @@ impl Server {
             outcome: result,
             superuser: self.superuser,
         };
-        if let Err(error) = self.audit.record(&entry) {
-            tracing::error!(%error, "the audit line could not be written");
-        }
+        let audit = Arc::clone(&self.audit);
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = audit.record(&entry) {
+                tracing::error!(%error, "the audit line could not be written");
+            }
+        });
         if let Some(metrics) = &self.metrics {
             metrics.record_call(tool, decision, rule.as_deref(), duration);
         }
@@ -635,6 +641,7 @@ fn build_info(
         .enable_resources_list_changed()
         .enable_prompts()
         .enable_completions()
+        .enable_extensions_with(ExtensionCapabilities::new())
         .build();
     InitializeResult::new(capabilities)
         .with_instructions(instructions)
@@ -760,7 +767,7 @@ impl ServerHandler for Server {
             started,
         )?;
         let result = self.list_resource_items().await;
-        self.record_request(
+        self.record_protocol_request(
             "resources/list",
             request_id,
             started.elapsed(),
@@ -798,7 +805,7 @@ impl ServerHandler for Server {
             started,
         )?;
         let result = self.read_resource_item(&request.uri, &principal).await;
-        self.record_request(
+        self.record_protocol_request(
             "resources/read",
             request_id,
             started.elapsed(),
@@ -853,7 +860,7 @@ impl ServerHandler for Server {
             started,
         )?;
         let result = self.completion(&request).await;
-        self.record_request(
+        self.record_protocol_request(
             "completion/complete",
             request_id,
             started.elapsed(),
@@ -902,7 +909,7 @@ impl ServerHandler for Server {
                 held.push((context.peer.clone(), request.uri.clone()));
             }
         }
-        self.record_request(
+        self.record_protocol_request(
             "resources/subscribe",
             request_id,
             started.elapsed(),
@@ -932,7 +939,7 @@ impl ServerHandler for Server {
         if let Ok(mut held) = self.older_subscriptions.lock() {
             held.retain(|(peer, uri)| !(*uri == request.uri && same_peer(peer, &context.peer)));
         }
-        self.record_request(
+        self.record_protocol_request(
             "resources/unsubscribe",
             request_id,
             started.elapsed(),

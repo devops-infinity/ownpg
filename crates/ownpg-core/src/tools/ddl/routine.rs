@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{Missing, Toggle, cascade_suffix, decimal, if_exists_clause, run_ddl, scoped_name};
 use crate::error::{Error, Result};
-use crate::render::{expression, quote_ident, quote_literal, type_name, validate_ident};
+use crate::render::{
+    expression, quote_ident, quote_literal, returns_type, type_name, validate_ident,
+};
 use crate::shape::ResultSet;
 use crate::tool_specs;
 use crate::tools::{Call, Outcome, Route, route};
@@ -251,7 +253,10 @@ pub fn routine(call: Call, args: RoutineArgs) -> BoxFuture<'static, Outcome> {
                     argument_list(&args.arguments, true)?
                 );
                 if args.kind == RoutineKind::Function {
-                    sql.push_str(&format!(" RETURNS {}", args.returns.trim()));
+                    sql.push_str(&format!(
+                        " RETURNS {}",
+                        returns_type("returns", &args.returns)?
+                    ));
                 }
                 sql.push_str(&format!(" LANGUAGE {}", quote_ident(args.language.trim())));
                 sql.push_str(match args.volatility {

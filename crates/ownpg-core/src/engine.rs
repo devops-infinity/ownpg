@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::shape::{Caps, Collector, Column, ResultSet};
 
 pub const CURSOR_CAP: usize = 8;
-const SAVEPOINT: &str = "ownpg_call";
+const SAVEPOINT_NAME: &str = "ownpg_call";
 
 pub trait CatalogParam: ToSql + Sync {
     fn pg_type(&self) -> Type;
@@ -1360,7 +1360,7 @@ impl Engine {
         let mut hold = self.read_hold().await?;
         let lane = hold.lane()?;
         let _tracked = self.track(lane.conn.session());
-        let result = copy_out_on(lane, self.transaction_prefix(), sql, byte_cap).await;
+        let result = copy_out_on_lane(lane, self.transaction_prefix(), sql, byte_cap).await;
         self.release_hold(hold).await;
         result
     }
@@ -1941,13 +1941,13 @@ where
     Fut: Future<Output = Result<T>>,
 {
     client
-        .batch_execute(&format!("SAVEPOINT {SAVEPOINT}"))
+        .batch_execute(&format!("SAVEPOINT {SAVEPOINT_NAME}"))
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     match run().await {
         Ok(value) => {
             client
-                .batch_execute(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))
+                .batch_execute(&format!("RELEASE SAVEPOINT {SAVEPOINT_NAME}"))
                 .await
                 .map_err(|error| describe_sqlstate(&error))?;
             Ok(value)
@@ -1981,11 +1981,11 @@ async fn autocommit(
         autocommit_statement(client, sql, caps)
     })
     .await;
-    settle_wrapper(client, result.is_ok()).await?;
+    settle_transaction(client, result.is_ok()).await?;
     result
 }
 
-async fn settle_wrapper(client: &tokio_postgres::Client, commit: bool) -> Result<()> {
+async fn settle_transaction(client: &tokio_postgres::Client, commit: bool) -> Result<()> {
     if client.is_closed() {
         return Ok(());
     }
@@ -2015,7 +2015,7 @@ async fn copy_in_on(
     }
     if inside_handle {
         client
-            .batch_execute(&format!("SAVEPOINT {SAVEPOINT}"))
+            .batch_execute(&format!("SAVEPOINT {SAVEPOINT_NAME}"))
             .await
             .map_err(|error| describe_sqlstate(&error))?;
     }
@@ -2036,7 +2036,7 @@ async fn copy_in_on(
     if inside_handle {
         if result.is_ok() {
             client
-                .batch_execute(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))
+                .batch_execute(&format!("RELEASE SAVEPOINT {SAVEPOINT_NAME}"))
                 .await
                 .map_err(|error| describe_sqlstate(&error))?;
         } else {
@@ -2044,12 +2044,12 @@ async fn copy_in_on(
         }
     }
     if wrap.is_some() {
-        settle_wrapper(client, result.is_ok()).await?;
+        settle_transaction(client, result.is_ok()).await?;
     }
     result
 }
 
-async fn copy_out_on(
+async fn copy_out_on_lane(
     lane: &mut Lane,
     transaction_prefix: Option<&str>,
     sql: &str,
@@ -2202,7 +2202,7 @@ async fn read_through_cursor(
 ) -> Result<ResultSet> {
     let client = &lane.conn.client();
     client
-        .batch_execute(&format!("SAVEPOINT {SAVEPOINT}"))
+        .batch_execute(&format!("SAVEPOINT {SAVEPOINT_NAME}"))
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     let prepared = client.prepare(sql).await;
@@ -2249,7 +2249,7 @@ async fn read_through_cursor(
         }
     };
     client
-        .batch_execute(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))
+        .batch_execute(&format!("RELEASE SAVEPOINT {SAVEPOINT_NAME}"))
         .await
         .map_err(|error| describe_sqlstate(&error))?;
     if more {
@@ -2302,7 +2302,7 @@ async fn begin_read(lane: &mut Lane, transaction_prefix: Option<&str>) -> Result
 async fn rollback_savepoint(client: &tokio_postgres::Client) {
     let _ = client
         .batch_execute(&format!(
-            "ROLLBACK TO SAVEPOINT {SAVEPOINT}; RELEASE SAVEPOINT {SAVEPOINT}"
+            "ROLLBACK TO SAVEPOINT {SAVEPOINT_NAME}; RELEASE SAVEPOINT {SAVEPOINT_NAME}"
         ))
         .await;
 }

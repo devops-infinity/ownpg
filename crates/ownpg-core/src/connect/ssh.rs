@@ -391,17 +391,19 @@ async fn load_keys(hops: &[Hop], settings: &SshSettings) -> Result<LoadedKeys> {
         files
             .into_iter()
             .map(|file| {
-                let loaded = match load_secret_key(&file, None) {
-                    Ok(key) => Ok(key),
-                    Err(first) => match passphrase.as_deref() {
-                        Some(phrase) => load_secret_key(&file, Some(phrase)).map_err(|_| first),
-                        None => Err(first),
-                    },
-                };
-                (
-                    file,
-                    loaded.map(Arc::new).map_err(|error| error.to_string()),
-                )
+                let loaded: std::result::Result<PrivateKey, String> =
+                    match crate::config::profile::refuse_open_permissions(&file) {
+                        Err(error) => Err(error.to_string()),
+                        Ok(()) => match load_secret_key(&file, None) {
+                            Ok(key) => Ok(key),
+                            Err(first) => match passphrase.as_deref() {
+                                Some(phrase) => load_secret_key(&file, Some(phrase))
+                                    .map_err(|_| first.to_string()),
+                                None => Err(first.to_string()),
+                            },
+                        },
+                    };
+                (file, loaded.map(Arc::new))
             })
             .collect()
     })
@@ -409,7 +411,7 @@ async fn load_keys(hops: &[Hop], settings: &SshSettings) -> Result<LoadedKeys> {
     .map_err(|error| ssh_error(&host, format!("the key loading task failed: {error}")))
 }
 
-async fn agent_client(
+async fn connect_agent(
     socket: &Path,
 ) -> std::result::Result<AgentClient<AgentStream>, russh::keys::Error> {
     #[cfg(unix)]
@@ -445,7 +447,7 @@ async fn authenticate(
     if settings.agent.value
         && let Some(socket) = &hints.agent_socket
     {
-        match agent_client(socket).await {
+        match connect_agent(socket).await {
             Ok(mut agent) => match agent.request_identities().await {
                 Ok(identities) => {
                     for identity in identities {

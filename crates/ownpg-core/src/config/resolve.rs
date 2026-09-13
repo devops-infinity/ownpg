@@ -556,10 +556,15 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
 
     if cfg!(windows)
         && (profile.password.is_some()
+            || profile.sslkey.is_some()
+            || profile
+                .ssh
+                .as_ref()
+                .is_some_and(|ssh| ssh.key_file.is_some())
             || profile
                 .http
                 .as_ref()
-                .is_some_and(|http| http.tokens_file.is_some()))
+                .is_some_and(|http| http.tokens_file.is_some() || http.state_key_file.is_some()))
     {
         warnings.push(Warning {
             code: "permissions_unchecked",

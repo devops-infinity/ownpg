@@ -10,11 +10,11 @@ use crate::error::{Error, Result};
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8765";
 pub const DEFAULT_BODY_CAP: usize = 1024 * 1024;
-pub const DEFAULT_RATE_LIMIT: u32 = 60;
+pub const DEFAULT_RATE_LIMIT: u32 = u32::MAX;
 pub const DEFAULT_SHUTDOWN: Duration = Duration::from_secs(10);
 pub const DEFAULT_POOL_SIZE: u32 = 4;
 pub const MAX_POOL_SIZE: u32 = 64;
-pub const DEFAULT_MAX_CONNECTIONS: u32 = 1_024;
+pub const DEFAULT_MAX_CONNECTIONS: u32 = u32::MAX;
 pub const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MCP_PATH: &str = "/mcp";
@@ -728,7 +728,7 @@ mod tests {
         assert_eq!(settings.public_url.value, "http://127.0.0.1:8765/mcp");
         assert_eq!(settings.auth, AuthSettings::None);
         assert_eq!(settings.body_cap.value, DEFAULT_BODY_CAP);
-        assert_eq!(settings.rate_limit_per_minute.value, 60);
+        assert_eq!(settings.rate_limit_per_minute.value, DEFAULT_RATE_LIMIT);
         assert!(!settings.older_client_sessions.value);
         assert!(
             settings

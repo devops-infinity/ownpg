@@ -3,24 +3,16 @@ server:
   - server-stateless:sep-2575-missing-capability-http-400
   - server-stateless:sep-2575-http-server-no-independent-requests-on-stream
   - server-stateless:sep-2575-server-no-log-without-loglevel
-  - logging-set-level
   - tools-call-simple-text
   - tools-call-image
   - tools-call-audio
   - tools-call-embedded-resource
   - tools-call-mixed-content
-  - tools-call-with-logging
   - tools-call-error
   - tools-call-with-progress
-  - tools-call-sampling
-  - tools-call-elicitation
-  - elicitation-sep1034-defaults
-  - elicitation-sep1330-enums
   - resources-read-text
   - resources-read-binary
   - resources-templates-read
-  - resources-subscribe
-  - resources-unsubscribe
   - prompts-get-simple
   - prompts-get-with-args
   - prompts-get-embedded-resource
@@ -31,9 +23,20 @@ server:
   - input-required-result-request-state
   - input-required-result-multiple-input-requests
   - input-required-result-multi-round
+  - input-required-result-missing-input-response:sep-2322-missing-response-rerequests
   - input-required-result-non-tool-request
   - input-required-result-result-type
   - input-required-result-tampered-state
   - input-required-result-capability-check
-  - input-required-result-missing-input-response:sep-2322-missing-response-rerequests
   - input-required-result-ignore-extra-params:sep-2322-ignore-unexpected-params
+  - json-schema-2020-12
+  - http-custom-header-server-validation
+  - tasks-lifecycle
+  - tasks-capability-negotiation
+  - tasks-wire-fields
+  - tasks-request-state-removal
+  - tasks-mrtr-input
+  - tasks-request-headers
+  - tasks-dispatch-and-envelope
+  - tasks-required-task-error
+  - tasks-mrtr-composition

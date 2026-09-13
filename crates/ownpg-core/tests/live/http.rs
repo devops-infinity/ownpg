@@ -63,7 +63,7 @@ async fn remote(
         .find(|(name, _)| *name == "OWNPG_BEARER_TOKENS")
         .map(|(_, value)| (*value).to_owned());
     let gatekeeper = Arc::new(
-        http::gatekeeper(
+        http::Gatekeeper::build(
             Arc::clone(&server),
             &settings,
             environment_tokens.as_deref(),
@@ -166,7 +166,7 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
         .batch_execute("CREATE SCHEMA app; CREATE TABLE app.t (id int)")
         .await
         .unwrap();
-    let remote = remote(&scratch, None, &[]).await;
+    let remote = remote(&scratch, None, &[("OWNPG_RATE_LIMIT_PER_MINUTE", "60")]).await;
 
     let live = remote
         .client
@@ -333,6 +333,50 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn older_client_sessions_are_accepted_instead_of_refused() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app; CREATE TABLE app.t (id int)")
+        .await
+        .unwrap();
+    let remote = remote(&scratch, None, &[("OWNPG_OLDER_CLIENT_SESSIONS", "true")]).await;
+
+    let get = remote
+        .client
+        .get(format!("{}/mcp", remote.base_url))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        get.status(),
+        405,
+        "a GET must not be refused once older_client_sessions is on"
+    );
+    let delete = remote
+        .client
+        .delete(format!("{}/mcp", remote.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        delete.status(),
+        405,
+        "a DELETE must not be refused once older_client_sessions is on"
+    );
+
+    let (status, body, _) = remote.call_tool("pg_health", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_ne!(result_of(&body)["isError"], true, "{body}");
+
+    remote.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     let Some(scratch) = support::scratch().await else {
         return;
@@ -349,7 +393,10 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     let remote = remote(
         &scratch,
         Some(AuthMode::Bearer),
-        &[("OWNPG_BEARER_TOKENS", tokens.as_str())],
+        &[
+            ("OWNPG_BEARER_TOKENS", tokens.as_str()),
+            ("OWNPG_RATE_LIMIT_PER_MINUTE", "60"),
+        ],
     )
     .await;
 
@@ -571,6 +618,7 @@ async fn forwarded_addresses_count_only_behind_a_trusted_proxy() {
         &[
             ("OWNPG_BEARER_TOKENS", tokens.as_str()),
             ("OWNPG_TRUSTED_PROXIES", "127.0.0.1"),
+            ("OWNPG_RATE_LIMIT_PER_MINUTE", "60"),
         ],
     )
     .await;
@@ -590,7 +638,10 @@ async fn forwarded_addresses_count_only_behind_a_trusted_proxy() {
     let exposed = remote(
         &scratch,
         Some(AuthMode::Bearer),
-        &[("OWNPG_BEARER_TOKENS", tokens.as_str())],
+        &[
+            ("OWNPG_BEARER_TOKENS", tokens.as_str()),
+            ("OWNPG_RATE_LIMIT_PER_MINUTE", "60"),
+        ],
     )
     .await;
     assert_eq!(

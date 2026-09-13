@@ -109,6 +109,50 @@ impl Gate {
             })
     }
 
+    fn ask(
+        &self,
+        call: &Call,
+        tool: &str,
+        classification: &Classification,
+        rule: &str,
+    ) -> Result<Verdict, ToolFailure> {
+        let sealed = self.seal(&Pending {
+            tool: tool.to_owned(),
+            sql_sha256: classification.sql_sha256.clone(),
+            principal: call.principal.clone(),
+            nonce: rand::random(),
+        })?;
+        let message = format!(
+            "This {} statement is destructive: {rule}. Statement: {}. Run it?",
+            classification.kind,
+            short_statement(&classification.normalized)
+        );
+        let schema = ElicitationSchema::builder()
+            .required_property(
+                "proceed",
+                PrimitiveSchemaDefinition::Boolean(
+                    BooleanSchema::new()
+                        .title("Run the statement")
+                        .description("true runs it now; false leaves the database untouched"),
+                ),
+            )
+            .build()
+            .map_err(|reason| Error::ProtocolFailed {
+                detail: format!("the confirmation form is invalid: {reason}"),
+            })?;
+        let request = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
+            meta: None,
+            message,
+            requested_schema: schema,
+        });
+        let mut requests = BTreeMap::new();
+        requests.insert(REQUEST_KEY.to_owned(), InputRequest::Elicitation(request));
+        Ok(Verdict::Ask(Box::new(InputRequiredResult::new(
+            Some(requests),
+            Some(sealed),
+        ))))
+    }
+
     pub fn check(
         &self,
         call: &Call,
@@ -147,48 +191,11 @@ impl Gate {
                     decision: Some(Decision::Refused),
                     ..AuditFacts::default()
                 })),
-                Answer::Missing => Err(Error::ConfirmationRequired {
-                    operation: "the confirmation prompt returned no answer".to_owned(),
-                }
-                .into()),
+                Answer::Missing => self.ask(call, tool, classification, rule),
             };
         }
         if call.can_elicit {
-            let sealed = self.seal(&Pending {
-                tool: tool.to_owned(),
-                sql_sha256: classification.sql_sha256.clone(),
-                principal: call.principal.clone(),
-                nonce: rand::random(),
-            })?;
-            let message = format!(
-                "This {} statement is destructive: {rule}. Statement: {}. Run it?",
-                classification.kind,
-                short_statement(&classification.normalized)
-            );
-            let schema = ElicitationSchema::builder()
-                .required_property(
-                    "proceed",
-                    PrimitiveSchemaDefinition::Boolean(
-                        BooleanSchema::new()
-                            .title("Run the statement")
-                            .description("true runs it now; false leaves the database untouched"),
-                    ),
-                )
-                .build()
-                .map_err(|reason| Error::ProtocolFailed {
-                    detail: format!("the confirmation form is invalid: {reason}"),
-                })?;
-            let request = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
-                meta: None,
-                message,
-                requested_schema: schema,
-            });
-            let mut requests = BTreeMap::new();
-            requests.insert(REQUEST_KEY.to_owned(), InputRequest::Elicitation(request));
-            return Ok(Verdict::Ask(Box::new(InputRequiredResult::new(
-                Some(requests),
-                Some(sealed),
-            ))));
+            return self.ask(call, tool, classification, rule);
         }
         Err(Error::ConfirmationRequired {
             operation: format!(
