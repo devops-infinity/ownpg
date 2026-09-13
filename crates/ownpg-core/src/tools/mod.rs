@@ -25,7 +25,7 @@ use serde::de::DeserializeOwned;
 use crate::audit::{Decision, Sink, Transport};
 use crate::config::{MAX_ROW_CAP, Settings};
 use crate::engine::Engine;
-use crate::error::{Error, ErrorId};
+use crate::error::Error;
 use crate::shape::{Caps, ResultSet};
 use crate::tool_specs::ToolSpec;
 
@@ -61,6 +61,7 @@ pub struct Call {
     pub context: Context,
     pub arguments: JsonObject,
     pub principal: String,
+    pub scopes: Option<Vec<String>>,
     pub request_state: Option<String>,
     pub input_responses: Option<InputResponses>,
     pub can_elicit: bool,
@@ -82,6 +83,13 @@ impl Call {
     #[must_use]
     pub fn caps(&self, row_cap: u32) -> Caps {
         self.context.caps(row_cap)
+    }
+
+    #[must_use]
+    pub fn allows(&self, scope: &str) -> bool {
+        self.scopes
+            .as_ref()
+            .is_none_or(|held| held.iter().any(|granted| granted == scope))
     }
 }
 
@@ -378,11 +386,6 @@ pub fn all_routes() -> Result<Vec<Route>, Error> {
     routes.extend(host::routes()?);
     routes.extend(monitoring::routes()?);
     Ok(routes)
-}
-
-#[must_use]
-pub fn is_recoverable(id: ErrorId) -> bool {
-    !matches!(id, ErrorId::ProtocolFailed)
 }
 
 #[must_use]

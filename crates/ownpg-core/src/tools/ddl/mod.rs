@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::write::execute;
 use super::{Call, Outcome, Route};
 use crate::error::{Error, Result};
-use crate::render::{QualifiedName, quote_ident, verify};
+use crate::render::{QualifiedName, verify};
 
 #[derive(Debug, Default)]
 pub struct Missing {
@@ -190,15 +190,6 @@ pub enum GeneratedKind {
     #[default]
     Stored,
     Virtual,
-}
-
-#[must_use]
-pub fn quoted_or_empty(name: &str) -> String {
-    if name.trim().is_empty() {
-        String::new()
-    } else {
-        quote_ident(name.trim())
-    }
 }
 
 pub fn routes() -> Result<Vec<Route>> {

@@ -437,8 +437,9 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
         .await;
     assert_eq!(
         role_sql,
-        "CREATE ROLE \"app_reader\" WITH LOGIN CONNECTION LIMIT 5 PASSWORD 's3cret'"
+        "CREATE ROLE \"app_reader\" WITH LOGIN CONNECTION LIMIT 5 PASSWORD '***'"
     );
+    assert!(!role_sql.contains("s3cret"), "{role_sql}");
     let refused_role = rig
         .failed(
             "pg_role",

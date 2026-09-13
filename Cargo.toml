@@ -120,8 +120,7 @@ debug-assertions = true
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.32.0"
-ci = ["github"]
-allow-dirty = ["ci"]
+ci = []
 installers = ["shell", "powershell", "homebrew", "npm"]
 publish-jobs = ["homebrew"]
 tap = "devops-infinity/homebrew-tap"

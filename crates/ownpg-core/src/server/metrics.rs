@@ -39,7 +39,7 @@ impl Metrics {
     }
 
     pub fn start(endpoint: &str) -> Result<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        super::ensure_tls_provider();
         super::http::announce_proxy("metrics export");
         let exporter = opentelemetry_otlp::MetricExporter::builder()
             .with_http()

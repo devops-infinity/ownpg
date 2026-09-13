@@ -126,11 +126,6 @@ impl SslMode {
             _ => None,
         }
     }
-
-    #[must_use]
-    pub const fn verifies(self) -> bool {
-        matches!(self, Self::VerifyCa | Self::VerifyFull)
-    }
 }
 
 impl fmt::Display for SslMode {

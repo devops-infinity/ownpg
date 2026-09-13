@@ -578,6 +578,75 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     remote.finish().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_scoped_token_cannot_use_explain_analyze_to_run_a_write() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app; CREATE TABLE app.t (id int)")
+        .await
+        .unwrap();
+    let tokens = format!("{TOKEN_READ} read-only reader;{TOKEN_WRITE} read-write writer");
+    let remote = remote(
+        &scratch,
+        Some(AuthMode::Bearer),
+        &[
+            ("OWNPG_BEARER_TOKENS", tokens.as_str()),
+            ("OWNPG_RATE_LIMIT_PER_MINUTE", "60"),
+        ],
+    )
+    .await;
+
+    let body = remote.call_body(
+        "pg_explain",
+        json!({"sql": "UPDATE app.t SET id = 0", "analyze": true}),
+    );
+    let response = remote
+        .post(&body)
+        .header("Mcp-Name", "pg_explain")
+        .bearer_auth(TOKEN_READ)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(result_of(&answer)["isError"], true, "{answer}");
+    assert_eq!(
+        result_of(&answer)["structuredContent"]["code"],
+        "scope.insufficient",
+        "{answer}"
+    );
+
+    let body = remote.call_body(
+        "pg_explain",
+        json!({"sql": "UPDATE app.t SET id = 0", "analyze": true}),
+    );
+    let response = remote
+        .post(&body)
+        .header("Mcp-Name", "pg_explain")
+        .bearer_auth(TOKEN_WRITE)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert_eq!(status, 200, "{text}");
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert_ne!(result_of(&answer)["isError"], true, "{answer}");
+    assert_eq!(
+        result_of(&answer)["structuredContent"]["rolled_back"],
+        true,
+        "{answer}"
+    );
+
+    remote.finish().await;
+}
+
 async fn guess_until_throttled(remote: &HttpRig, forwarded: &str) -> (u16, u16) {
     let body = remote.call_body("pg_health", json!({}));
     let mut first = None;

@@ -455,6 +455,12 @@ pub fn explain(call: Call, args: ExplainArgs) -> BoxFuture<'static, Outcome> {
         let facts = facts_for(&classification);
         let caps = context.caps(1_000).without_cell_cap();
         let writes = classification.class != StatementClass::Read;
+        if writes && !call.allows(tool_specs::SCOPE_WRITE) {
+            return Err(ToolFailure::from(Error::ScopeInsufficient {
+                scope: tool_specs::SCOPE_WRITE.to_owned(),
+            })
+            .with_facts(facts));
+        }
         let result = if writes {
             context.engine.run_and_rollback(&statement, caps).await
         } else {

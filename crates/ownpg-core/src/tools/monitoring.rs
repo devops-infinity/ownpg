@@ -69,12 +69,19 @@ fn activity_sql(args: &ActivityArgs) -> String {
              wait_event_type, wait_event, \
              EXTRACT(EPOCH FROM (now() - xact_start))::int8 AS transaction_seconds, \
              EXTRACT(EPOCH FROM (now() - query_start))::int8 AS statement_seconds, \
-             left(query, 500) AS query \
+             {} AS query \
              FROM pg_catalog.pg_stat_activity \
              WHERE backend_type = 'client backend' AND pid <> pg_catalog.pg_backend_pid(){idle} \
              AND COALESCE(EXTRACT(EPOCH FROM (now() - query_start)), 0) >= {} \
              ORDER BY xact_start NULLS LAST, pid",
+        redacted_query_sql("query", 500),
         args.min_duration_seconds
+    )
+}
+
+fn redacted_query_sql(column: &str, cap: usize) -> String {
+    format!(
+        "(CASE WHEN {column} ~* 'password' THEN 'a credential-bearing statement is withheld here' ELSE left({column}, {cap}) END)"
     )
 }
 
@@ -95,19 +102,25 @@ pub struct LocksArgs {
     pub row_cap: u32,
 }
 
-const LOCKS_SQL: &str = "SELECT a.pid, pg_catalog.pg_blocking_pids(a.pid)::text AS blocked_by, l.locktype, \
+fn locks_sql() -> String {
+    format!(
+        "SELECT a.pid, pg_catalog.pg_blocking_pids(a.pid)::text AS blocked_by, l.locktype, \
                    l.relation::regclass::text AS relation, l.mode, \
                    EXTRACT(EPOCH FROM (now() - a.query_start))::int8 AS waiting_seconds, \
-                   left(a.query, 300) AS query, \
-                   (SELECT string_agg(left(b.query, 200), ' | ') FROM pg_catalog.pg_stat_activity b \
+                   {} AS query, \
+                   (SELECT string_agg({}, ' | ') FROM pg_catalog.pg_stat_activity b \
                     WHERE b.pid = ANY(pg_catalog.pg_blocking_pids(a.pid))) AS blocking_queries \
                    FROM pg_catalog.pg_stat_activity a \
                    JOIN pg_catalog.pg_locks l ON l.pid = a.pid AND NOT l.granted \
                    WHERE cardinality(pg_catalog.pg_blocking_pids(a.pid)) > 0 \
-                   ORDER BY waiting_seconds DESC NULLS LAST, a.pid";
+                   ORDER BY waiting_seconds DESC NULLS LAST, a.pid",
+        redacted_query_sql("a.query", 300),
+        redacted_query_sql("b.query", 200)
+    )
+}
 
 pub fn locks(call: Call, args: LocksArgs) -> BoxFuture<'static, Outcome> {
-    Box::pin(async move { run_catalog(&call, "locks", LOCKS_SQL, args.row_cap).await })
+    Box::pin(async move { run_catalog(&call, "locks", &locks_sql(), args.row_cap).await })
 }
 
 const REPLICATION_SQL: &str = "SELECT 'server' AS kind, 'in_recovery' AS name, pg_catalog.pg_is_in_recovery()::text AS state, NULL::text AS sync_state, \
@@ -559,7 +572,7 @@ mod tests {
             changed,
             old,
             new,
-            LOCKS_SQL.to_owned(),
+            locks_sql(),
             REPLICATION_SQL.to_owned(),
             indexes_health_sql("app"),
             bloat_sql("app"),

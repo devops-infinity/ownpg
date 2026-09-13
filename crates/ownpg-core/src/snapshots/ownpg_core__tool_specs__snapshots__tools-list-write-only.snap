@@ -1723,11 +1723,16 @@ expression: tools
   {
     "name": "pg_merge",
     "title": "Upsert rows with MERGE",
-    "description": "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. Matched rows have update_columns set from the source (default: every column except match_on); unmatched rows are inserted when insert_unmatched is true. returning (PostgreSQL 17 and later) lists columns to return.",
+    "description": "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. Matched rows have update_columns set from the source (default: every column except match_on); unmatched rows are inserted when insert_unmatched is true. returning (PostgreSQL 17 and later) lists columns to return. dry_run shows the statement without running it; a MERGE the classifier marks destructive needs confirm: true or the confirmation prompt.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "confirm": {
+          "default": false,
+          "description": "Run a MERGE the classifier marks destructive.",
+          "type": "boolean"
+        },
         "dry_run": {
           "default": false,
           "description": "Show the statement without running it.",

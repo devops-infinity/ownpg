@@ -12,6 +12,7 @@ use super::ddl::{Toggle, number, scoped_name};
 use super::read::facts_for;
 use super::write::dry_run_reply;
 use super::{AuditFacts, Call, Outcome, Route, ToolFailure, ToolOutput, route, text_rows};
+use crate::classify::{self, SchemaScope};
 use crate::error::{Error, Result};
 use crate::render::{QualifiedName, ident_list, quote_ident, verify};
 use crate::shape::{ResultSet, UNTRUSTED_NOTICE};
@@ -657,6 +658,14 @@ pub fn backend(call: Call, args: BackendArgs) -> BoxFuture<'static, Outcome> {
         let sql = format!("SELECT pg_catalog.{function}({}) AS signalled", args.pid);
         let mut classification = verify(&sql, &["SelectStmt"])?;
         classification.refusals.clear();
+        let settings = call.settings();
+        let pooled = call.engine().info().await.pooled;
+        let scope = SchemaScope {
+            schema: &settings.schema.value,
+            require_qualified_names: pooled,
+        };
+        classify::authorize(&classification, settings.mode.value, &scope)
+            .map_err(|error| ToolFailure::from(error).with_facts(facts_for(&classification)))?;
         if args.operation == BackendOperation::Terminate
             && classification.destructive_reason.is_none()
         {

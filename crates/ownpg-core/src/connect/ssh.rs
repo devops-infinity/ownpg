@@ -233,6 +233,14 @@ pub fn plan_route(settings: &SshSettings, hints: &Hints) -> Result<Vec<Hop>> {
     Ok(hops)
 }
 
+async fn spawn_plan_route(settings: &SshSettings, hints: &Hints) -> Result<Vec<Hop>> {
+    let settings = settings.clone();
+    let hints = hints.clone();
+    tokio::task::spawn_blocking(move || plan_route(&settings, &hints))
+        .await
+        .map_err(|error| ssh_error("ssh", format!("the route planner panicked: {error}")))?
+}
+
 pub async fn open(
     settings: &SshSettings,
     target_host: &str,
@@ -251,7 +259,7 @@ async fn open_in_process(
     target_port: u16,
     hints: &Hints,
 ) -> Result<Tunnel> {
-    let hops = plan_route(settings, hints)?;
+    let hops = spawn_plan_route(settings, hints).await?;
     let timeout = settings.connect_timeout.value;
     let keys = load_keys(&hops, settings).await?;
     let config = Arc::new(client::Config {
@@ -586,7 +594,7 @@ async fn open_system(
 ) -> Result<Tunnel> {
     use openssh::{ForwardType, KnownHosts, SessionBuilder, Socket};
 
-    let hops = plan_route(settings, hints)?;
+    let hops = spawn_plan_route(settings, hints).await?;
     let bastion = hops
         .last()
         .ok_or_else(|| ssh_error(&settings.host.value, "no hop"))?;
@@ -628,12 +636,20 @@ async fn open_system(
         use std::os::unix::fs::PermissionsExt;
         socket_dir.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    let socket_dir = socket_dir.tempdir().map_err(|error| {
-        ssh_error(
-            &bastion.host,
-            format!("no directory for the forward socket: {error}"),
-        )
-    })?;
+    let socket_dir = tokio::task::spawn_blocking(move || socket_dir.tempdir())
+        .await
+        .map_err(|error| {
+            ssh_error(
+                &bastion.host,
+                format!("the socket directory setup panicked: {error}"),
+            )
+        })?
+        .map_err(|error| {
+            ssh_error(
+                &bastion.host,
+                format!("no directory for the forward socket: {error}"),
+            )
+        })?;
     let socket_path = socket_dir.path().join("forward.sock");
     session
         .request_port_forward(
@@ -694,10 +710,6 @@ pub fn agent_socket_from(value: Option<&str>) -> Option<PathBuf> {
         return explicit.or_else(|| Some(PathBuf::from(r"\\.\pipe\openssh-ssh-agent")));
     }
     explicit
-}
-
-pub fn known_hosts_default(home: Option<&Path>) -> Option<PathBuf> {
-    home.map(|home| home.join(".ssh").join("known_hosts"))
 }
 
 #[cfg(test)]

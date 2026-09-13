@@ -33,6 +33,12 @@ fn install_panic_hook() {
         let _ = writeln!(stderr, "{}", build_info::ISSUES_URL);
         let _ = writeln!(stderr, "  version: {}", build_info::version_line());
         drop(stderr);
-        previous(info);
+        if backtrace_requested() {
+            previous(info);
+        }
     }));
+}
+
+fn backtrace_requested() -> bool {
+    std::env::var("RUST_BACKTRACE").is_ok_and(|value| value != "0")
 }

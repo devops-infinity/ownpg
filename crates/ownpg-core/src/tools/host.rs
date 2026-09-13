@@ -835,8 +835,13 @@ fn directory_size(path: &Path) -> Option<u64> {
     let mut total = 0;
     let mut pending = vec![path.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-            let metadata = entry.metadata().ok()?;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
             if metadata.is_dir() {
                 pending.push(entry.path());
             } else {
@@ -1122,7 +1127,7 @@ pub fn restore(call: Call, args: RestoreArgs) -> BoxFuture<'static, Outcome> {
         ];
         for table in &args.tables {
             let qualified = scoped_name(&call, "tables", table)?;
-            arguments.push(format!("--table={}", qualified.name));
+            arguments.push(format!("--table={}", qualified.sql()));
         }
         for (flag, set) in [
             ("--data-only", args.data_only),
