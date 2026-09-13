@@ -77,10 +77,13 @@ impl Gate {
     }
 
     pub fn from_key_file(path: &std::path::Path) -> Result<Self, Error> {
-        crate::config::profile::refuse_open_permissions(path)?;
-        let bytes = std::fs::read(path).map_err(|source| Error::ConfigUnreadable {
-            path: path.to_path_buf(),
-            source,
+        let mut file = crate::config::profile::open_private(path)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|source| {
+            Error::ConfigUnreadable {
+                path: path.to_path_buf(),
+                source,
+            }
         })?;
         if bytes.len() < 32 {
             return Err(Error::ConfigInvalid {

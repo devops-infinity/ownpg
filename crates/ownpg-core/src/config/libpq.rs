@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::environment::Environment;
-use super::profile::{open_permissions, read_capped};
+use super::profile::{handle_permissions, open_file, read_capped, read_capped_handle};
 use super::{ChannelBinding, Secret, SslMode};
 use crate::error::{Error, Result};
 
@@ -418,13 +418,14 @@ pub fn password_from_file(
     if !path.exists() {
         return Ok(PasswordFileOutcome::Missing);
     }
-    if let Some(mode) = open_permissions(path)? {
+    let file = open_file(path)?;
+    if let Some(mode) = handle_permissions(&file, path)? {
         return Ok(PasswordFileOutcome::IgnoredPermissions {
             path: path.to_path_buf(),
             mode,
         });
     }
-    let text = read_capped(path)?;
+    let text = read_capped_handle(file, path)?;
     let host_key = match host {
         Some(host) if !super::presets::is_socket_directory(host) => host,
         _ => LOCALHOST,

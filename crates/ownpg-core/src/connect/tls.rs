@@ -171,9 +171,9 @@ pub fn build(connection: &ConnectionSettings, target: &str) -> Result<Tls> {
                         format!("the client certificate could not be parsed: {error}"),
                     )
                 })?;
-            crate::config::profile::refuse_open_permissions(&key.value)
+            let key_file = crate::config::profile::open_private(&key.value)
                 .map_err(|error| tls_error(target, error.to_string()))?;
-            let key = PrivateKeyDer::from_pem_file(&key.value).map_err(|error| {
+            let key = PrivateKeyDer::from_pem_reader(key_file).map_err(|error| {
                 tls_error(target, format!("the client key could not be read: {error}"))
             })?;
             with_verifier

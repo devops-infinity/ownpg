@@ -983,6 +983,32 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_statements_carry_no_destructive_reason_of_their_own() {
+        for sql in [
+            "VACUUM orders",
+            "VACUUM (FULL) orders",
+            "ANALYZE orders",
+            "ANALYZE orders (a, b)",
+            "REINDEX INDEX orders_pkey",
+            "REINDEX TABLE orders",
+            "REINDEX SCHEMA app",
+            "REINDEX TABLE CONCURRENTLY orders",
+            "REFRESH MATERIALIZED VIEW mv WITH DATA",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY mv WITH DATA",
+            "REFRESH MATERIALIZED VIEW mv WITH NO DATA",
+            "CHECKPOINT",
+        ] {
+            let classification = classify_ok(sql);
+            assert_eq!(classification.class, StatementClass::Maintenance, "{sql}");
+            assert!(
+                classification.destructive_reason.is_none(),
+                "{sql} was flagged: {:?}",
+                classification.destructive_reason
+            );
+        }
+    }
+
+    #[test]
     fn a_procedural_body_the_classifier_cannot_see_inside_is_always_flagged() {
         for sql in [
             "DO $$ BEGIN DELETE FROM other_schema.customers; END $$",

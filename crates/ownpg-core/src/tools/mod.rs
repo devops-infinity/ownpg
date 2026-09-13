@@ -22,7 +22,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::audit::{Decision, Transport};
+use crate::audit::{Decision, Sink, Transport};
 use crate::config::{MAX_ROW_CAP, Settings};
 use crate::engine::Engine;
 use crate::error::{Error, ErrorId};
@@ -35,7 +35,7 @@ pub const LIST_CAP: usize = 200;
 pub struct Context {
     pub engine: Arc<Engine>,
     pub transport: Transport,
-    pub audit_path: Option<std::path::PathBuf>,
+    pub audit: Arc<Sink>,
     pub gate: Arc<confirm::Gate>,
 }
 

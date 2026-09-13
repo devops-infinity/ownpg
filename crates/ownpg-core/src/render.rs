@@ -112,6 +112,12 @@ pub fn type_name(argument: &str, text: &str) -> Result<String> {
             detail: format!("`{trimmed}` is not a plain type name"),
         });
     }
+    if let Some(rule) = parsed.refusals.first() {
+        return Err(Error::StatementRefused {
+            rule: rule.clone(),
+            mode: "any".to_owned(),
+        });
+    }
     Ok(trimmed.to_owned())
 }
 
@@ -239,16 +245,29 @@ pub fn expression(argument: &str, text: &str) -> Result<String> {
     Ok(trimmed.to_owned())
 }
 
+fn redacted(normalized: &str) -> String {
+    if normalized.trim().is_empty() {
+        return "(withheld)".to_owned();
+    }
+    crate::audit::short_statement(normalized).unwrap_or_else(|| {
+        crate::shape::cut_graphemes(normalized, crate::audit::SHORT_STATEMENT_CAP)
+    })
+}
+
 pub fn verify(sql: &str, expected_kinds: &[&str]) -> Result<Classification> {
     let classification = classify::classify(sql).map_err(|error| Error::ProtocolFailed {
-        detail: format!("the rendered statement did not parse: {error}; statement: {sql}"),
+        detail: format!(
+            "the rendered statement did not parse: {error}; statement: {}",
+            redacted(&pg_query::normalize(sql).unwrap_or_default())
+        ),
     })?;
     if !expected_kinds.is_empty() && !expected_kinds.contains(&classification.kind.as_str()) {
         return Err(Error::ProtocolFailed {
             detail: format!(
-                "the rendered statement is a {} where {} was expected; statement: {sql}",
+                "the rendered statement is a {} where {} was expected; statement: {}",
                 classification.kind,
-                expected_kinds.join(" or ")
+                expected_kinds.join(" or "),
+                redacted(&classification.normalized)
             ),
         });
     }
@@ -339,11 +358,32 @@ mod tests {
     }
 
     #[test]
+    fn a_type_name_that_smuggles_a_refused_function_is_turned_away() {
+        let error = type_name("type", "int, pg_read_file('/etc/passwd')").unwrap_err();
+        assert_eq!(error.id(), crate::error::ErrorId::StatementRefused);
+        assert!(error.to_string().contains("pg_read_file"));
+    }
+
+    #[test]
     fn the_verify_guard_checks_the_statement_kind() {
         let parsed = verify("CREATE TABLE app.t (id int)", &["CreateStmt"]).unwrap();
         assert_eq!(parsed.class.as_str(), "ddl");
         assert!(verify("CREATE TABLE app.t (id int)", &["IndexStmt"]).is_err());
         assert!(verify("CREATE TABLE app.t (id int); DROP TABLE app.t", &[]).is_err());
+    }
+
+    #[test]
+    fn a_refused_statement_never_echoes_a_password_literal_back_to_the_caller() {
+        let wrong_kind = verify("CREATE ROLE app WITH PASSWORD 'hunter2'", &["IndexStmt"])
+            .unwrap_err()
+            .to_string();
+        assert!(!wrong_kind.contains("hunter2"), "{wrong_kind}");
+        assert!(wrong_kind.contains("PASSWORD $1"), "{wrong_kind}");
+        let unparsable = verify("CREATE ROLE app WITH PASSWORD 'hunter2' MAYBE (", &[])
+            .unwrap_err()
+            .to_string();
+        assert!(!unparsable.contains("hunter2"), "{unparsable}");
+        assert!(unparsable.contains("(withheld)"), "{unparsable}");
     }
 
     #[test]

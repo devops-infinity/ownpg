@@ -386,48 +386,7 @@ else
 fi
 
 if [[ $SKIP_GATE -eq 0 ]]; then
-	say INFO "running the verification gate"
-	cargo fmt --all -- --check >/dev/null 2>&1 || die "formatting is not clean; run: cargo fmt --all"
-	say SUCCESS "formatting"
-	cargo check --workspace --all-targets --all-features --locked --color=never >/dev/null 2>&1 ||
-		die "the check failed; run: cargo check --workspace --all-targets --all-features"
-	say SUCCESS "check"
-	cargo clippy --workspace --all-targets --all-features --locked --color=never -- -D warnings \
-		>/dev/null 2>&1 || die "clippy found problems; run: cargo clippy --workspace --all-targets --all-features -- -D warnings"
-	say SUCCESS "lint"
-	if command -v cargo-nextest >/dev/null 2>&1; then
-		cargo nextest run --workspace --all-features --locked --no-tests=warn --color=never >/dev/null 2>&1 ||
-			die "tests failed; run: cargo nextest run --workspace --all-features"
-	else
-		cargo test --workspace --all-features --locked >/dev/null 2>&1 ||
-			die "tests failed; run: cargo test --workspace --all-features"
-	fi
-	say SUCCESS "tests"
-	cargo test --workspace --all-features --locked --doc >/dev/null 2>&1 ||
-		die "doc tests failed; run: cargo test --workspace --all-features --doc"
-	say SUCCESS "doc tests"
-	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked >/dev/null 2>&1 ||
-		die "the docs do not build; run: RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --all-features --no-deps"
-	say SUCCESS "docs"
-	for tool in cargo-audit cargo-deny cargo-machete; do
-		command -v "$tool" >/dev/null 2>&1 ||
-			die "$tool is not installed, so the gate cannot run; install it with: cargo install --locked $tool (or pass --skip-gate to install without the gate)"
-	done
-	cargo audit --deny warnings >/dev/null 2>&1 || die "cargo audit found an advisory; run: cargo audit --deny warnings"
-	say SUCCESS "advisories"
-	DENY_CODE=0
-	cargo deny check >/dev/null 2>&1 || DENY_CODE=$?
-	if [[ $DENY_CODE -ne 0 ]]; then
-		DENY_FAILED_CHECKS=""
-		((DENY_CODE & 1)) && DENY_FAILED_CHECKS="$DENY_FAILED_CHECKS advisories"
-		((DENY_CODE & 2)) && DENY_FAILED_CHECKS="$DENY_FAILED_CHECKS bans"
-		((DENY_CODE & 4)) && DENY_FAILED_CHECKS="$DENY_FAILED_CHECKS licenses"
-		((DENY_CODE & 8)) && DENY_FAILED_CHECKS="$DENY_FAILED_CHECKS sources"
-		die "cargo deny found a policy violation in:${DENY_FAILED_CHECKS:- an unrecognized check (exit $DENY_CODE)}; run: cargo deny check"
-	fi
-	say SUCCESS "dependency policy"
-	cargo machete >/dev/null 2>&1 || die "cargo machete found an unused dependency; run: cargo machete"
-	say SUCCESS "no unused dependency"
+	"$REPO/tools/verify.sh" || die "the verification gate failed; pass --skip-gate to install without it"
 else
 	say WARNING "skipping the verification gate"
 fi

@@ -8,7 +8,7 @@ use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
 use russh::keys::{
-    HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key,
+    HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate, decode_secret_key,
 };
 
 use crate::config::{SshSettings, SshTransport, parse_ssh_target};
@@ -375,6 +375,13 @@ fn host_key_error(
 
 type LoadedKeys = HashMap<PathBuf, std::result::Result<Arc<PrivateKey>, String>>;
 
+fn read_private_key(path: &Path) -> std::result::Result<String, String> {
+    let mut file = crate::config::profile::open_private(path).map_err(|error| error.to_string())?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text).map_err(|error| error.to_string())?;
+    Ok(text)
+}
+
 async fn load_keys(hops: &[Hop], settings: &SshSettings) -> Result<LoadedKeys> {
     let mut files: Vec<PathBuf> = hops.iter().flat_map(|hop| hop.key_files.clone()).collect();
     files.sort();
@@ -391,18 +398,18 @@ async fn load_keys(hops: &[Hop], settings: &SshSettings) -> Result<LoadedKeys> {
         files
             .into_iter()
             .map(|file| {
-                let loaded: std::result::Result<PrivateKey, String> =
-                    match crate::config::profile::refuse_open_permissions(&file) {
-                        Err(error) => Err(error.to_string()),
-                        Ok(()) => match load_secret_key(&file, None) {
-                            Ok(key) => Ok(key),
-                            Err(first) => match passphrase.as_deref() {
-                                Some(phrase) => load_secret_key(&file, Some(phrase))
-                                    .map_err(|_| first.to_string()),
-                                None => Err(first.to_string()),
-                            },
+                let loaded: std::result::Result<PrivateKey, String> = match read_private_key(&file)
+                {
+                    Err(error) => Err(error),
+                    Ok(text) => match decode_secret_key(&text, None) {
+                        Ok(key) => Ok(key),
+                        Err(first) => match passphrase.as_deref() {
+                            Some(phrase) => decode_secret_key(&text, Some(phrase))
+                                .map_err(|_| first.to_string()),
+                            None => Err(first.to_string()),
                         },
-                    };
+                    },
+                };
                 (file, loaded.map(Arc::new))
             })
             .collect()
@@ -549,6 +556,28 @@ async fn authenticate(
 }
 
 #[cfg(unix)]
+fn system_known_hosts(settings: &SshSettings, host: &str) -> Result<PathBuf> {
+    settings
+        .known_hosts
+        .as_ref()
+        .map(|path| path.value.clone())
+        .ok_or_else(|| {
+            ssh_error(
+                host,
+                "no known hosts file is configured, so the system ssh transport would fall back to whichever file the ssh binary picks; name one in ssh.known_hosts or use the in-process transport",
+            )
+        })
+}
+
+#[cfg(unix)]
+fn system_jumps(hops: &[Hop]) -> Vec<String> {
+    hops.iter()
+        .take(hops.len().saturating_sub(1))
+        .map(|hop| format!("{}@{}:{}", hop.user, hop.host, hop.port))
+        .collect()
+}
+
+#[cfg(unix)]
 async fn open_system(
     settings: &SshSettings,
     target_host: &str,
@@ -561,6 +590,8 @@ async fn open_system(
     let bastion = hops
         .last()
         .ok_or_else(|| ssh_error(&settings.host.value, "no hop"))?;
+    let known_hosts = system_known_hosts(settings, &bastion.host)?;
+    let jumps = system_jumps(&hops);
     let mut builder = SessionBuilder::default();
     builder
         .known_hosts_check(if settings.trust_new_host.value {
@@ -568,12 +599,16 @@ async fn open_system(
         } else {
             KnownHosts::Strict
         })
+        .user_known_hosts_file(&known_hosts)
         .connect_timeout(settings.connect_timeout.value)
         .control_persist(openssh::ControlPersist::IdleFor(
             std::num::NonZeroUsize::new(30).unwrap_or(std::num::NonZeroUsize::MIN),
         ))
         .user(bastion.user.clone())
         .port(bastion.port);
+    if !jumps.is_empty() {
+        builder.jump_hosts(&jumps);
+    }
     if let Some(key) = &settings.key_file {
         builder.keyfile(&key.value);
     }
@@ -626,12 +661,14 @@ async fn open_system(
                 format!("the forward socket did not answer: {error}"),
             )
         })?;
+    let mut route = jumps;
+    route.push(format!(
+        "{}@{}:{} (system ssh)",
+        bastion.user, bastion.host, bastion.port
+    ));
     Ok(Tunnel {
         stream: TunnelStream::Unix { inner: stream },
-        route: vec![format!(
-            "{}@{}:{} (system ssh)",
-            bastion.user, bastion.host, bastion.port
-        )],
+        route,
         kept_alive: vec![Box::new(session), Box::new(socket_dir)],
     })
 }
@@ -752,6 +789,38 @@ mod tests {
         };
         let hops = plan_route(&settings("bastion", Vec::new(), None), &hints).unwrap();
         assert_eq!(hops[0].key_files, vec![dir.path().join(".ssh/id_ed25519")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_system_transport_carries_every_jump_and_the_configured_known_hosts_file() {
+        let hints = Hints {
+            os_user: Some("me".to_owned()),
+            ..Hints::default()
+        };
+        let mut resolved = settings(
+            "bastion",
+            vec!["first".to_owned(), "ops@second:2200".to_owned()],
+            None,
+        );
+        resolved.transport = Resolved::preset(SshTransport::System);
+        resolved.known_hosts = Some(Resolved::new(
+            PathBuf::from("/keys/known_hosts"),
+            Origin::Profile,
+        ));
+        let hops = plan_route(&resolved, &hints).unwrap();
+        assert_eq!(
+            system_jumps(&hops),
+            vec!["me@first:22".to_owned(), "ops@second:2200".to_owned()]
+        );
+        assert_eq!(
+            system_known_hosts(&resolved, "bastion").unwrap(),
+            PathBuf::from("/keys/known_hosts")
+        );
+        resolved.known_hosts = None;
+        let refused = system_known_hosts(&resolved, "bastion").unwrap_err();
+        assert_eq!(refused.id(), crate::error::ErrorId::SshFailed);
+        assert!(refused.to_string().contains("known hosts"));
     }
 
     #[test]
