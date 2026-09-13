@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - Dockerfile
-      - compose.yaml
+      - docker-compose.yml
       - Cargo.toml
       - Cargo.lock
       - crates/**
