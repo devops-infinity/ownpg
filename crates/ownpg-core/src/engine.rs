@@ -1280,29 +1280,6 @@ impl Engine {
         .await
     }
 
-    pub async fn run_unparsed(
-        &self,
-        sql: &str,
-        caps: Caps,
-        principal: &str,
-        handle: Option<&str>,
-    ) -> Result<ResultSet> {
-        {
-            let mut hold = self.read_hold().await?;
-            let lane = hold.lane()?;
-            let _tracked = self.track(lane.conn.session());
-            let statement = lane
-                .conn
-                .client()
-                .prepare(sql)
-                .await
-                .map_err(|error| describe_sqlstate(&error))?;
-            drop(statement);
-        }
-        self.run_write_with(sql, caps, principal, handle, false, None)
-            .await
-    }
-
     pub async fn copy_in(
         &self,
         sql: &str,

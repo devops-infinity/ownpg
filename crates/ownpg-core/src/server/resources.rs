@@ -145,6 +145,7 @@ impl Server {
             context: self.context.clone(),
             arguments: rmcp::model::JsonObject::new(),
             principal: principal.name.clone(),
+            scopes: principal.scopes.clone(),
             request_state: None,
             input_responses: None,
             can_elicit: false,

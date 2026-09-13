@@ -337,6 +337,7 @@ fn unset_password(process: &Process, profile: &str) -> Result<ExitClass> {
 fn cache_clear(process: &Process, dry_run: bool) -> Result<ExitClass> {
     let cache = &process.paths.cache_dir;
     let mut removed = 0usize;
+    let mut failed = 0usize;
     if cache.is_dir() {
         let entries = std::fs::read_dir(cache).map_err(|source| Error::OutputUnwritable {
             target: cache.display().to_string(),
@@ -355,15 +356,27 @@ fn cache_clear(process: &Process, dry_run: bool) -> Result<ExitClass> {
             } else {
                 std::fs::remove_file(&path)
             };
-            outcome.map_err(|source| Error::OutputUnwritable {
-                target: path.display().to_string(),
-                source,
-            })?;
-            removed += 1;
+            match outcome {
+                Ok(()) => removed += 1,
+                Err(source) => {
+                    failed += 1;
+                    tracing::warn!(path = %path.display(), %source, "could not remove cache entry");
+                }
+            }
         }
     }
     let verb = if dry_run { "would remove" } else { "removed" };
     emit(|out| writeln!(out, "{verb} {removed} entries from {}", cache.display()))
         .map_err(stdout_error)?;
+    if failed > 0 {
+        emit(|out| {
+            writeln!(
+                out,
+                "{failed} entries could not be removed; see the warnings above"
+            )
+        })
+        .map_err(stdout_error)?;
+        return Ok(ExitClass::Runtime);
+    }
     Ok(ExitClass::Success)
 }

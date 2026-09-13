@@ -347,6 +347,14 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
             .map_or_else(|| libpq::DEFAULT_USER.to_owned(), str::to_owned),
     );
 
+    if profile.password.is_some() && env.var("OWNPG_PASSWORD").is_none() {
+        warnings.push(Warning {
+            code: "profile_password_plaintext",
+            message:
+                "the profile file stores this password in plain text; run `ownpg config set-password` to move it to the platform keychain instead"
+                    .to_owned(),
+        });
+    }
     let mut password = Pick::new(
         None,
         env.var("OWNPG_PASSWORD")

@@ -835,7 +835,9 @@ fn directory_size(path: &Path) -> Option<u64> {
     let mut total = 0;
     let mut pending = vec![path.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
             let metadata = entry.metadata().ok()?;
             if metadata.is_dir() {
                 pending.push(entry.path());

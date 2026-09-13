@@ -351,6 +351,20 @@ pub fn authorize(
             }
         }
     }
+    for function in &classification.functions {
+        let Some(qualified) = split_qualified(function) else {
+            continue;
+        };
+        if let Some(schema) = &qualified.schema
+            && schema != scope.schema
+            && !CATALOG_SCHEMAS.contains(&schema.as_str())
+        {
+            return Err(refuse(format!(
+                "function outside scoped schema: `{}.{}` (this server serves `{}`)",
+                schema, qualified.name, scope.schema
+            )));
+        }
+    }
     if !classification.class.allowed_in(mode) {
         return Err(refuse(format!(
             "a {} statement ({}) is not allowed",
@@ -564,6 +578,24 @@ fn walk(value: &Value, found: &mut Findings) {
                             found.functions.push(name);
                         }
                     }
+                    "CallStmt" => {
+                        if let Some(name) = child
+                            .get("funccall")
+                            .and_then(|funccall| dotted_name(funccall.get("funcname")))
+                        {
+                            found.functions.push(name);
+                        }
+                    }
+                    "TypeCast" => {
+                        if let Some(name) = dotted_name(child.pointer("/type_name/names")) {
+                            found.functions.push(name);
+                        }
+                    }
+                    "AExpr" => {
+                        if let Some(name) = dotted_name(child.get("name")) {
+                            found.functions.push(name);
+                        }
+                    }
                     "CommonTableExpr" => {
                         if let Some(name) = child.get("ctename").and_then(Value::as_str) {
                             found.cte_names.push(name.to_owned());
@@ -630,6 +662,14 @@ fn walk(value: &Value, found: &mut Findings) {
                             note_destructive(
                                 found,
                                 "UPDATE without a narrowing WHERE clause changes every row",
+                            );
+                        }
+                    }
+                    "MergeStmt" => {
+                        if merge_matches_every_row(child) && merge_has_mutating_clause(child) {
+                            note_destructive(
+                                found,
+                                "MERGE with no narrowing ON condition updates or deletes every matched row",
                             );
                         }
                     }
@@ -732,6 +772,31 @@ fn where_is_absent_or_constant(statement: &Value) -> bool {
         None | Some(Value::Null) => true,
         Some(clause) => is_constant_expression(clause),
     }
+}
+
+fn merge_matches_every_row(statement: &Value) -> bool {
+    match statement.get("join_condition") {
+        None | Some(Value::Null) => true,
+        Some(condition) => is_constant_expression(condition),
+    }
+}
+
+const MERGE_COMMAND_UPDATE: i64 = 3;
+const MERGE_COMMAND_DELETE: i64 = 5;
+
+fn merge_has_mutating_clause(statement: &Value) -> bool {
+    statement
+        .get("merge_when_clauses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|clause| clause.pointer("/node/MergeWhenClause"))
+        .any(|clause| {
+            matches!(
+                clause.get("command_type").and_then(Value::as_i64),
+                Some(MERGE_COMMAND_UPDATE | MERGE_COMMAND_DELETE)
+            )
+        })
 }
 
 fn is_constant_expression(node: &Value) -> bool {
@@ -960,6 +1025,14 @@ mod tests {
             ("DROP DATABASE d", "DROP DATABASE"),
             ("DROP ROLE r", "DROP ROLE"),
             ("DROP OWNED BY r", "DROP OWNED"),
+            (
+                "MERGE INTO orders USING src ON true WHEN MATCHED THEN DELETE",
+                "MERGE with no narrowing ON",
+            ),
+            (
+                "MERGE INTO orders USING src ON 1 = 1 WHEN MATCHED THEN UPDATE SET a = 1",
+                "MERGE with no narrowing ON",
+            ),
         ] {
             let classification = classify_ok(sql);
             let reason = classification
@@ -974,6 +1047,9 @@ mod tests {
             "ALTER TABLE orders ALTER COLUMN a TYPE bigint",
             "INSERT INTO orders VALUES (1)",
             "CREATE TABLE t (a int)",
+            "MERGE INTO orders o USING src s ON o.id = s.id WHEN MATCHED THEN DELETE",
+            "MERGE INTO orders o USING src s ON o.id = s.id WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)",
+            "MERGE INTO orders o USING src s ON true WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)",
         ] {
             assert!(
                 classify_ok(sql).destructive_reason.is_none(),
@@ -1081,6 +1157,47 @@ mod tests {
                 "{sql}: {message}"
             );
         }
+    }
+
+    #[test]
+    fn a_function_call_in_another_schema_is_refused_even_in_a_read() {
+        for sql in [
+            "SELECT other.leak()",
+            "SELECT * FROM other.leak()",
+            "SELECT other.leak() FROM orders",
+        ] {
+            let message = refused(sql, Mode::ReadOnly);
+            assert!(
+                message.contains("function outside scoped schema"),
+                "{sql}: {message}"
+            );
+        }
+        let message = refused("CALL other.leak()", Mode::ReadWrite);
+        assert!(
+            message.contains("function outside scoped schema"),
+            "{message}"
+        );
+        allowed("SELECT pg_catalog.now()", Mode::ReadOnly);
+        allowed("SELECT app.compute()", Mode::ReadOnly);
+        allowed("SELECT count(*), lower(name) FROM orders", Mode::ReadOnly);
+    }
+
+    #[test]
+    fn a_schema_qualified_cast_or_operator_in_another_schema_is_refused() {
+        let message = refused("SELECT 'x'::other.sometype", Mode::ReadOnly);
+        assert!(
+            message.contains("function outside scoped schema"),
+            "{message}"
+        );
+        let message = refused("SELECT 1 OPERATOR(other.+) 2", Mode::ReadOnly);
+        assert!(
+            message.contains("function outside scoped schema"),
+            "{message}"
+        );
+        allowed("SELECT 'x'::int4", Mode::ReadOnly);
+        allowed("SELECT 'x'::app.sometype", Mode::ReadOnly);
+        allowed("SELECT 1 + 2", Mode::ReadOnly);
+        allowed("SELECT id::text FROM orders WHERE id = 1", Mode::ReadOnly);
     }
 
     #[test]

@@ -60,11 +60,6 @@ impl RoleProfile {
         }
     }
 
-    #[must_use]
-    pub fn is_elevated(&self) -> bool {
-        self.elevated_attribute().is_some()
-    }
-
     pub fn enforce(&self, strict: bool) -> Result<()> {
         match (strict, self.elevated_attribute()) {
             (true, Some(attribute)) => Err(Error::RoleRefused {

@@ -1,20 +1,6 @@
 version: 2
 
 updates:
-  - package-ecosystem: github-actions
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-      time: "03:00"
-      timezone: Asia/Dhaka
-    commit-message:
-      prefix: "ci"
-    groups:
-      actions:
-        patterns:
-          - "*"
-
   - package-ecosystem: cargo
     directory: /
     schedule:

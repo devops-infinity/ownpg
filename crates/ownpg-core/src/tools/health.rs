@@ -69,6 +69,21 @@ fn worst(checks: &[Check]) -> Status {
     status
 }
 
+pub async fn public_schema_grants_create(engine: &Engine) -> Result<bool> {
+    let rows = engine
+        .catalog_rows(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) a \
+             WHERE n.nspname = 'public' AND a.grantee = 0 AND a.privilege_type = 'CREATE')",
+            &[],
+        )
+        .await?;
+    match rows.first() {
+        Some(row) => catalog::read_column(row, 0),
+        None => Ok(false),
+    }
+}
+
 pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
     let info = engine.info().await;
     let scoped = engine.settings().schema.value.clone();

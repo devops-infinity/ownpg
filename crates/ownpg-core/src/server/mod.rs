@@ -6,8 +6,8 @@ pub mod stdio;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rmcp::model::{
@@ -29,6 +29,16 @@ use crate::engine::Engine;
 use crate::error::Result;
 use crate::tool_specs;
 use crate::tools::{self, Call, Context, Outcome, Reply, Route};
+
+static TLS_PROVIDER: OnceLock<()> = OnceLock::new();
+
+pub(crate) fn ensure_tls_provider() {
+    TLS_PROVIDER.get_or_init(|| {
+        if let Err(error) = rustls::crypto::ring::default_provider().install_default() {
+            tracing::warn!(?error, "the ring crypto provider could not be installed");
+        }
+    });
+}
 
 pub const LIST_TTL_MS: u64 = 60_000;
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(1);
@@ -336,6 +346,7 @@ impl Server {
             context: self.context.clone(),
             arguments,
             principal: principal.name.clone(),
+            scopes: principal.scopes.clone(),
             request_state,
             input_responses,
             can_elicit,

@@ -261,6 +261,15 @@ pub fn role(call: Call, args: RoleArgs) -> BoxFuture<'static, Outcome> {
                 )
             }
         };
+        let sql = if args.dry_run && !args.password.is_empty() && !args.clear_password {
+            sql.replacen(
+                &format!("PASSWORD {}", quote_literal(&args.password)),
+                "PASSWORD '***'",
+                1,
+            )
+        } else {
+            sql
+        };
         run_ddl(
             &call,
             "pg_role",

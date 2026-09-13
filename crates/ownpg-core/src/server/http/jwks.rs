@@ -13,7 +13,7 @@ pub const BODY_CAP: usize = 1024 * 1024;
 pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
 pub const MIN_TTL: Duration = Duration::from_secs(60);
 pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-pub const MAX_STALE: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MAX_STALE: Duration = Duration::from_secs(30 * 60);
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,7 +293,7 @@ fn max_age(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 
 impl JwksClient {
     pub fn new(url: String) -> Result<Self, JwksError> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        crate::server::ensure_tls_provider();
         super::announce_proxy("key endpoint");
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)

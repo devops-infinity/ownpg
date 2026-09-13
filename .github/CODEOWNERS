@@ -1,8 +1,0 @@
-Cargo.toml @SHSharkar
-Cargo.lock @SHSharkar
-crates/*/Cargo.toml @SHSharkar
-deny.toml @SHSharkar
-about.toml @SHSharkar
-.github/workflows/ @SHSharkar
-tools/release.sh @SHSharkar
-Dockerfile @SHSharkar
