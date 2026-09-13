@@ -8,7 +8,7 @@ The Claude Code global constitution at `~/.claude/skills/constitution/constituti
 
 ## Architecture
 
-The workspace has two crates. `ownpg-core` holds every piece of business and protocol logic: the statement classifier, the engine, the MCP (Model Context Protocol) server for stdio and Streamable HTTP, the tool implementations, connection handling (TLS, SSH), and configuration resolution. `ownpg` is a thin CLI shell: argument parsing, subcommand dispatch, output formatting, logging setup, and manual-page and completion generation. `ownpg` depends on `ownpg-core`; the dependency never runs the other way. New engine, tool, classifier, connection, or protocol logic belongs in `crates/ownpg-core/src/`, never in `crates/ownpg/src/`.
+The workspace has two crates. `ownpg-core` holds every piece of business and protocol logic: the statement classifier, the engine, the MCP (Model Context Protocol) server for stdio and Streamable HTTP, the tool implementations, connection handling (TLS, SSH), and configuration resolution. `ownpg` is a thin CLI shell: argument parsing, subcommand dispatch, output formatting, logging setup, and manual-page and completion generation. `ownpg` depends on `ownpg-core`; the dependency never runs the other way. Engine, tool, classifier, connection, and protocol logic belongs in `crates/ownpg-core/src/`, never in `crates/ownpg/src/`.
 
 See `README.md` for what the project does and how to run it, `CHANGELOG.md` for the version history, and `SECURITY.md` for the vulnerability-reporting process.
 
