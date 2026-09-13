@@ -9,7 +9,7 @@ use crate::shape::ResultSet;
 use crate::tool_specs;
 use crate::tools::{Call, Outcome, Route, route};
 
-const PUBLICATION_DESCRIPTION: &str = "Create, alter, rename, or drop a logical replication publication. create takes for_all_tables or a list of tables in the scoped schema, plus the optional publish list (insert, update, delete, truncate) and publish_via_partition_root. for_all_tables needs a superuser connection; a least-privilege connection, the kind this server recommends, gets PostgreSQL's own permission error back. add_tables, set_tables, and drop_tables change the table list of an existing publication. Publications only ship changes to a subscriber that connects on its own; this server never creates a subscription, since a subscription would make the database host open an outbound connection to an address this server does not control. drop is destructive and needs confirm: true or the confirmation prompt.";
+const PUBLICATION_DESCRIPTION: &str = "Create, alter, rename, or drop a logical replication publication, which belongs to the whole database, not to the scoped schema. create takes for_all_tables or a list of tables in the scoped schema, plus the optional publish list (insert, update, delete, truncate) and publish_via_partition_root. for_all_tables is the one argument on this tool that reaches outside the scoped schema: it publishes every table in every schema of the database, present and future, and needs a superuser connection to do it; a least-privilege connection, the kind this server recommends, gets PostgreSQL's own permission error back instead. add_tables appends to the table list and never needs confirm; set_tables replaces the whole table list, so any table left out stops replicating, and drop_tables removes named tables from the list, so both need confirm: true or the confirmation prompt, the same as drop. The table list a create or add_tables call names is fixed at that moment; it does not track tables created later, and this tool cannot express PostgreSQL's per-schema or row-filtered publication forms. Publications only ship changes to a subscriber that connects on its own; this server never creates a subscription, since a subscription would make the database host open an outbound connection to an address this server does not control. drop is destructive and needs confirm: true or the confirmation prompt.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -28,11 +28,13 @@ pub enum PublicationOperation {
 pub struct PublicationArgs {
     pub operation: PublicationOperation,
     #[schemars(
-        description = "Publication name. Publications are cluster-wide, not schema-scoped."
+        description = "Publication name. A publication belongs to the whole database, not to the scoped schema."
     )]
     pub name: String,
     #[serde(default)]
-    #[schemars(description = "create: publish every table in the database, present and future.")]
+    #[schemars(
+        description = "create: publish every table in every schema of the database, present and future. The one argument on this tool that reaches outside the scoped schema; needs a superuser connection."
+    )]
     pub for_all_tables: bool,
     #[serde(default)]
     #[schemars(

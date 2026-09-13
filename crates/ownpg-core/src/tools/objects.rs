@@ -339,6 +339,10 @@ pub enum ObjectDescription {
         relation: TableDescription,
         notice: &'static str,
     },
+    Index {
+        relation: TableDescription,
+        notice: &'static str,
+    },
     Sequence {
         sequence: SequenceDescription,
         notice: &'static str,
@@ -372,6 +376,7 @@ impl ObjectDescription {
             Self::Table { .. } => "table",
             Self::View { .. } => "view",
             Self::MaterializedView { .. } => "materialized_view",
+            Self::Index { .. } => "index",
             Self::Sequence { .. } => "sequence",
             Self::Routine { .. } => "routine",
             Self::Type { .. } => "type",
@@ -388,6 +393,10 @@ impl ObjectDescription {
                 notice: UNTRUSTED_NOTICE,
             },
             ObjectType::MaterializedView => Self::MaterializedView {
+                relation,
+                notice: UNTRUSTED_NOTICE,
+            },
+            ObjectType::Index => Self::Index {
                 relation,
                 notice: UNTRUSTED_NOTICE,
             },
@@ -519,7 +528,8 @@ fn render_description(description: &ObjectDescription) -> String {
     match description {
         ObjectDescription::Table { relation, .. }
         | ObjectDescription::View { relation, .. }
-        | ObjectDescription::MaterializedView { relation, .. } => {
+        | ObjectDescription::MaterializedView { relation, .. }
+        | ObjectDescription::Index { relation, .. } => {
             out.push_str(&format!(
                 "{} {}.{} ({}, {}, {} bytes total)\n",
                 relation.kind.as_str(),
@@ -758,6 +768,9 @@ fn render_description(description: &ObjectDescription) -> String {
             }
         }
         ObjectDescription::Privileges { privileges, .. } => {
+            if privileges.is_empty() {
+                out.push_str("  no privileges are granted on this object\n");
+            }
             for grant in privileges {
                 out.push_str(&format!(
                     "  {} has {}{} (granted by {})\n",

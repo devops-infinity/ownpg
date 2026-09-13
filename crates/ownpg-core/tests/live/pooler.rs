@@ -152,7 +152,8 @@ async fn pg_pool_status_fails_clearly_against_a_direct_postgresql_connection() {
         .expect("the call returns a result");
     assert_eq!(refused.is_error, Some(true), "{refused:?}");
     let structured = refused.structured_content.clone().unwrap();
-    assert_eq!(structured["code"], "protocol.failed");
+    assert_eq!(structured["code"], "sql.failed");
+    assert_eq!(structured["sqlstate"], "3D000");
 
     drop(client);
     server_task

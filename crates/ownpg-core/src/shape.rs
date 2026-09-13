@@ -114,7 +114,9 @@ impl ResultSet {
         out.push_str(UNTRUSTED_NOTICE);
         out.push('\n');
         if !self.columns.is_empty() {
-            out.push_str("columns (tab-separated rows below, \\N is null): ");
+            out.push_str(
+                "columns (tab-separated rows below, \\N is null, backslash/tab/newline/CR in a value are backslash-escaped): ",
+            );
             let described: Vec<String> = self
                 .columns
                 .iter()
@@ -432,11 +434,9 @@ mod tests {
         let result = collector.finish(Some("abc".to_owned()), Some(500));
         let text = result.render_text();
         assert!(text.starts_with(UNTRUSTED_NOTICE));
-        assert!(
-            text.contains(
-                "columns (tab-separated rows below, \\N is null): id (text), name (text)"
-            )
-        );
+        assert!(text.contains(
+            "columns (tab-separated rows below, \\N is null, backslash/tab/newline/CR in a value are backslash-escaped): id (text), name (text)"
+        ));
         assert!(text.contains("1\t\\N\n"));
         assert!(text.ends_with(
             "rows: 1 of about 500 (truncated by the row cap); more rows: pass cursor abc\n"

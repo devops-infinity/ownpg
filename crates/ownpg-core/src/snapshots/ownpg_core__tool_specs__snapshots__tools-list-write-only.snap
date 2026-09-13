@@ -887,6 +887,26 @@ expression: tools
         {
           "properties": {
             "kind": {
+              "const": "index",
+              "type": "string"
+            },
+            "notice": {
+              "type": "string"
+            },
+            "relation": {
+              "$ref": "#/$defs/TableDescription"
+            }
+          },
+          "required": [
+            "kind",
+            "relation",
+            "notice"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
               "const": "sequence",
               "type": "string"
             },
