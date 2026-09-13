@@ -21,7 +21,7 @@ const DELETE_DESCRIPTION: &str = "Delete rows from a table in the scoped schema.
 
 const MERGE_DESCRIPTION: &str = "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. Matched rows have update_columns set from the source (default: every column except match_on); unmatched rows are inserted when insert_unmatched is true. returning (PostgreSQL 17 and later) lists columns to return.";
 
-const RUN_WRITE_DESCRIPTION: &str = "Run one write statement written in SQL: INSERT, UPDATE, DELETE, MERGE, COPY ... FROM STDIN is refused here (use pg_copy), DO, or CALL. Exactly one statement per call. The statement is parsed and classified first: reads are refused (use pg_run_query), schema changes are refused (use the DDL tools), and destructive shapes (a DELETE or UPDATE without a narrowing WHERE) need confirm: true or the confirmation prompt. dry_run returns the classification without running anything. A statement the parser cannot read is refused in read-only and write-only modes; in read-write mode it runs with confirm: true through the extended query protocol, which lets PostgreSQL itself refuse a batch, and the audit record carries the decision unparsed.";
+const RUN_WRITE_DESCRIPTION: &str = "Run one write statement written in SQL: INSERT, UPDATE, DELETE, MERGE, COPY ... FROM STDIN is refused here (use pg_copy), DO, or CALL. Exactly one statement per call. The statement is parsed and classified first: reads are refused (use pg_run_query), schema changes are refused (use the DDL tools), and destructive shapes (a DELETE or UPDATE without a narrowing WHERE) need confirm: true or the confirmation prompt. dry_run returns the classification without running anything. A statement the parser cannot read is refused in every mode and never runs, because a statement without a class cannot be held to the access mode or the scoped schema; dry_run still reports it, with the kind unparsed and the class unknown.";
 
 const COPY_DESCRIPTION: &str = "Move rows in bulk. direction in loads data into a table from the data argument through COPY FROM STDIN; direction out returns the rows of a table or a read query through COPY TO STDOUT, cut at the byte cap. Formats are text and csv; binary is refused. COPY never touches a file or a program on the database host.";
 
@@ -672,7 +672,7 @@ pub fn run_write(call: Call, args: RunWriteArgs) -> BoxFuture<'static, Outcome> 
                 if mode == Mode::ReadWrite
                     && matches!(failure.error(), Error::StatementUnparsable { .. }) =>
             {
-                return run_unparsed(&call, &sql, &args).await;
+                return unparsed_reply(&sql, &args, failure);
             }
             Err(failure) => return Err(failure),
         };
@@ -715,7 +715,7 @@ pub fn run_write(call: Call, args: RunWriteArgs) -> BoxFuture<'static, Outcome> 
     })
 }
 
-async fn run_unparsed(call: &Call, sql: &str, args: &RunWriteArgs) -> Outcome {
+fn unparsed_reply(sql: &str, args: &RunWriteArgs, failure: ToolFailure) -> Outcome {
     let fingerprint: String = crate::audit::sha256_hex(sql.as_bytes())
         .chars()
         .take(16)
@@ -724,7 +724,6 @@ async fn run_unparsed(call: &Call, sql: &str, args: &RunWriteArgs) -> Outcome {
         operation: Some("unparsed".to_owned()),
         statement_hash: Some(fingerprint.clone()),
         statement: crate::audit::short_statement(sql),
-        decision: Some(Decision::Unparsed),
         ..AuditFacts::default()
     };
     if args.dry_run {
@@ -742,7 +741,7 @@ async fn run_unparsed(call: &Call, sql: &str, args: &RunWriteArgs) -> Outcome {
             notice: UNTRUSTED_NOTICE,
         };
         let text = format!(
-            "dry run: unparsed statement; PostgreSQL would parse it through the extended protocol, one statement only
+            "dry run: unparsed statement; it is refused rather than run, because a statement without a class cannot be held to the access mode or the scoped schema
 {sql}
 "
         );
@@ -750,21 +749,7 @@ async fn run_unparsed(call: &Call, sql: &str, args: &RunWriteArgs) -> Outcome {
             .with_facts(facts)
             .into());
     }
-    if !args.confirm {
-        return Err(ToolFailure::from(Error::ConfirmationRequired {
-            operation: "an unparsed statement whose class and effect the server cannot check"
-                .to_owned(),
-        })
-        .with_facts(facts));
-    }
-    let handle = (!args.transaction.trim().is_empty()).then(|| args.transaction.trim());
-    facts.handle_id = handle.map(str::to_owned);
-    let result = call
-        .engine()
-        .run_unparsed(sql, call.caps(0), &call.principal, handle)
-        .await
-        .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
-    rows_reply(result, facts)
+    Err(failure.with_facts(facts))
 }
 
 fn copy_options(args: &CopyArgs) -> Result<String, Error> {

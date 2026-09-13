@@ -570,7 +570,7 @@ async fn write_only_mode_refuses_reads_and_runs_writes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unparsed_statements_run_once_through_parse_only_in_read_write_mode_with_confirm() {
+async fn an_unparsed_statement_is_reported_by_a_dry_run_and_never_runs_in_any_mode() {
     let Some(scratch) = support::scratch().await else {
         return;
     };
@@ -585,13 +585,12 @@ async fn unparsed_statements_run_once_through_parse_only_in_read_write_mode_with
     assert_eq!(structured(&dry)["kind"], "unparsed");
     assert_eq!(structured(&dry)["class"], "unknown");
     let unconfirmed = read_write.call("pg_run_write", json!({"sql": sql})).await;
-    assert_eq!(structured(&unconfirmed)["code"], "confirmation.required");
-    let ran = read_write
+    assert_eq!(structured(&unconfirmed)["code"], "statement.unparsable");
+    let confirmed = read_write
         .call("pg_run_write", json!({"sql": sql, "confirm": true}))
         .await;
-    assert_ne!(ran.is_error, Some(true), "{ran:?}");
-    assert_eq!(structured(&ran)["rows"][0][0], "1");
-    assert_eq!(structured(&ran)["rows"][0][1], "11");
+    assert_eq!(confirmed.is_error, Some(true), "{confirmed:?}");
+    assert_eq!(structured(&confirmed)["code"], "statement.unparsable");
     let chained = read_write
         .call(
             "pg_run_write",
@@ -599,10 +598,14 @@ async fn unparsed_statements_run_once_through_parse_only_in_read_write_mode_with
         )
         .await;
     assert_eq!(chained.is_error, Some(true), "{chained:?}");
-    let still_there = read_write
-        .call("pg_run_query", json!({"sql": "SELECT count(*) FROM items"}))
+    let untouched = read_write
+        .call(
+            "pg_run_query",
+            json!({"sql": "SELECT count(*), sum(qty) FROM items"}),
+        )
         .await;
-    assert_eq!(structured(&still_there)["rows"][0][0], "3");
+    assert_eq!(structured(&untouched)["rows"][0][0], "3");
+    assert_eq!(structured(&untouched)["rows"][0][1], "6");
     let data_dir = read_write.data_dir.clone();
     read_write.finish().await;
     let audit_file = std::fs::read_dir(&data_dir)
@@ -612,8 +615,9 @@ async fn unparsed_statements_run_once_through_parse_only_in_read_write_mode_with
         .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
         .unwrap();
     let content = std::fs::read_to_string(audit_file).unwrap();
-    assert!(content.contains("\"decision\":\"unparsed\""), "{content}");
     assert!(content.contains("\"operation\":\"unparsed\""), "{content}");
+    assert!(content.contains("\"decision\":\"refused\""), "{content}");
+    assert!(!content.contains("\"decision\":\"unparsed\""), "{content}");
 
     let (engine, audit) = engine_and_audit(&scratch, Mode::WriteOnly).await;
     let write_only = rig(engine, audit, "writer", (), ClientLifecycleMode::Initialize).await;
@@ -644,6 +648,39 @@ async fn a_write_builder_cannot_reach_outside_its_schema_through_a_filter_subque
         .await;
     assert_eq!(escape.is_error, Some(true), "{escape:?}");
     assert_eq!(structured(&escape)["code"], "statement.refused");
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unparsed_statement_cannot_smuggle_ddl_through_the_write_tool() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    seed_schema(&scratch).await;
+    let sql =
+        "CREATE TABLE app.smuggled (id int, doubled int GENERATED ALWAYS AS (id * 2) VIRTUAL)";
+    let (engine, audit) = engine_and_audit(&scratch, Mode::ReadWrite).await;
+    let rig = rig(engine, audit, "writer", (), ClientLifecycleMode::Initialize).await;
+    let dry = rig
+        .call("pg_run_write", json!({"sql": sql, "dry_run": true}))
+        .await;
+    assert_ne!(dry.is_error, Some(true), "{dry:?}");
+    assert_eq!(structured(&dry)["kind"], "unparsed");
+    assert_eq!(structured(&dry)["class"], "unknown");
+    let refused = rig
+        .call("pg_run_write", json!({"sql": sql, "confirm": true}))
+        .await;
+    assert_eq!(refused.is_error, Some(true), "{refused:?}");
+    assert_eq!(structured(&refused)["code"], "statement.unparsable");
+    let created = rig
+        .call(
+            "pg_run_query",
+            json!({
+                "sql": "SELECT count(*) FROM pg_catalog.pg_class WHERE relname = 'smuggled'"
+            }),
+        )
+        .await;
+    assert_eq!(structured(&created)["rows"][0][0], "0");
     rig.finish().await;
 }
 
