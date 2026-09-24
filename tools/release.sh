@@ -897,7 +897,7 @@ write_registry_manifest() {
 		name="$(basename "$bundle")"
 		sha="$(shasum -a 256 "$bundle" | awk '{print $1}')"
 		packages="$(jq -c --arg version "$VERSION" --arg url "https://github.com/$PUBLIC_RELEASE_REPO/releases/download/v$VERSION/$name" --arg sha "$sha" \
-			'. + [{registryType: "mcpb", registryBaseUrl: "https://github.com", identifier: $url, version: $version, fileSha256: $sha, transport: {type: "stdio"}}]' <<<"$packages")"
+			'. + [{registryType: "mcpb", identifier: $url, version: $version, fileSha256: $sha, transport: {type: "stdio"}}]' <<<"$packages")"
 	done
 	shopt -u nullglob
 	jq --arg version "$VERSION" --argjson packages "$packages" '.version = $version | .packages = $packages' "$REGISTRY_MANIFEST" >"target/distrib/$REGISTRY_MANIFEST" || die "could not write the filled $REGISTRY_MANIFEST"
@@ -1386,7 +1386,7 @@ sign_checksums
 
 step "registry manifest"
 write_registry_manifest
-say INFO "publish to the MCP Registry by hand once the release is up: mcp-publisher login github && (cd target/distrib && mcp-publisher publish)"
+say INFO "publish to the MCP Registry by hand: cd target/distrib, run mcp-publisher login github --token with a classic PAT that has only read:org, then mcp-publisher publish; the browser login grants only your personal namespace"
 
 step "GitHub Release"
 publish_github_release ""
