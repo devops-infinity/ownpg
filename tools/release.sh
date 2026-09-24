@@ -219,6 +219,14 @@ require_credentials() {
 	die "no crates.io credentials: run 'cargo login' or set CARGO_REGISTRY_TOKEN"
 }
 
+require_npm_auth() {
+	[[ "${OWNPG_SKIP_NPM:-0}" == "1" ]] && return 0
+	require_tools npm
+	npm whoami >/dev/null 2>&1 ||
+		die "npm is not logged in; put a publish token that bypasses 2FA in ~/.npmrc, or set OWNPG_SKIP_NPM=1"
+	say SUCCESS "npm is logged in"
+}
+
 require_gh_auth() {
 	gh auth status >/dev/null 2>&1 || die "gh is not authenticated: run 'gh auth login'"
 }
@@ -811,16 +819,22 @@ publish_npm_package() {
 		return 0
 	fi
 	[[ -f "$package" ]] || die "$package is missing; dist did not write the npm package"
-	require_tools npm
-	local package_name
+	local package_name log
 	package_name="$(tar -xOzf "$package" package/package.json | jq -r '.name')" ||
 		die "could not read the package name from $package"
-	if [[ "$(npm view "$package_name@$VERSION" version 2>/dev/null || true)" == "$VERSION" ]]; then
+	if [[ "$(npm view "$package_name@$VERSION" version --color=false 2>/dev/null || true)" == "$VERSION" ]]; then
 		say INFO "$package_name $VERSION is already on npm"
 		return 0
 	fi
-	npm whoami >/dev/null 2>&1 || die "npm is not logged in: run 'npm login' first"
-	run "npm publish" npm publish "$package" --access public
+	STEP="npm publish"
+	log="$(log_path_for "npm publish")"
+	if ! npm publish "$package" --access public >"$log" 2>&1; then
+		grep -q 'EOTP' "$log" &&
+			die "npm wants a one-time password for $package_name; ~/.npmrc needs a publish token that bypasses 2FA, or finish by hand with: npm publish $package --access public"
+		say INFO "last 40 lines of output:"
+		tail -n 40 "$log" >&2
+		die "npm publish failed for $package_name $VERSION"
+	fi
 	say SUCCESS "npm package published"
 }
 
@@ -1214,6 +1228,7 @@ BEHIND="$(git rev-list --count "HEAD..$REMOTE/$BRANCH")"
 say SUCCESS "$BRANCH is level with $REMOTE/$BRANCH"
 require_credentials
 require_gh_auth
+require_npm_auth
 require_minisign_key
 check_dist_version
 require_llvm_tools
