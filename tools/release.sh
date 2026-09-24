@@ -614,7 +614,7 @@ dist_targets() {
 
 c_flags_for() {
 	case "$1" in
-	aarch64-pc-windows-msvc) printf -- '-Wno-error=incompatible-pointer-types -D_mm_pause=__builtin_arm_yield' ;;
+	aarch64-pc-windows-msvc) printf -- '-Wno-error=incompatible-pointer-types -D_mm_pause=__builtin_arm_yield -U__ARM_NEON' ;;
 	*-pc-windows-msvc) printf -- '-Wno-error=incompatible-pointer-types' ;;
 	*) printf '' ;;
 	esac
