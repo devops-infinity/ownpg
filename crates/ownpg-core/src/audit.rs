@@ -1005,11 +1005,13 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     fn break_directory(nested: &Path) {
         fs::remove_dir_all(nested).unwrap();
         fs::write(nested, "").unwrap();
     }
 
+    #[cfg(unix)]
     fn repair_directory(nested: &Path) {
         fs::remove_file(nested).unwrap();
     }
