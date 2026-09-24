@@ -6,6 +6,17 @@ The format follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-24
+
+### Added
+
+- The README names the server's MCP Registry entry, `io.github.devops-infinity/ownpg`, which the registry checks before it lists the crates.io package.
+- Install steps for the npm package, `npm install -g @devops-infinity/ownpg`.
+
+### Fixed
+
+- The description in `server.json` fits the MCP Registry's 100-character limit.
+
 ## [0.1.1] - 2026-09-24
 
 ### Added
@@ -67,6 +78,7 @@ The format follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/
 - `ownpg completions`, shell completion scripts for bash, elvish, fish, powershell, and zsh.
 - `--log-file`, which also writes logs to a file rotated daily with the newest eight kept, and `--log-format text|json`.
 
-[Unreleased]: https://github.com/devops-infinity/ownpg/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/devops-infinity/ownpg/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/devops-infinity/ownpg-releases/releases/tag/v0.1.2
 [0.1.1]: https://github.com/devops-infinity/ownpg-releases/releases/tag/v0.1.1
 [0.1.0]: https://github.com/devops-infinity/ownpg-releases/releases/tag/v0.1.0

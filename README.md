@@ -22,7 +22,7 @@ OwnPG is an MCP server. Connect an AI assistant such as Claude Code, Claude Desk
 
 ## Status
 
-OwnPG is pre-1.0 software. Until 1.0, a minor release can change or remove behavior, and [CHANGELOG.md](https://github.com/devops-infinity/ownpg/blob/main/CHANGELOG.md) lists every change. Releases, installers, and issue reports live in the public [devops-infinity/ownpg-releases](https://github.com/devops-infinity/ownpg-releases) repository.
+OwnPG is pre-1.0 software. Until 1.0, a minor release can change or remove behavior, and [CHANGELOG.md](https://github.com/devops-infinity/ownpg/blob/main/CHANGELOG.md) lists every change. Releases, installers, and issue reports live in the public [devops-infinity/ownpg-releases](https://github.com/devops-infinity/ownpg-releases) repository. The [MCP Registry](https://registry.modelcontextprotocol.io) lists OwnPG under `mcp-name: io.github.devops-infinity/ownpg`.
 
 ## How it keeps the database safe
 
@@ -52,6 +52,12 @@ Or install the `ownpg` binary from crates.io:
 ```bash
 cargo install ownpg --locked
 ownpg --version
+```
+
+Or install it from npm, which downloads the matching prebuilt binary:
+
+```bash
+npm install -g @devops-infinity/ownpg
 ```
 
 Prebuilt archives for macOS, Linux, and Windows are on the [releases page](https://github.com/devops-infinity/ownpg-releases/releases/latest), with a shell installer and a PowerShell installer. Each release signs its `sha256.sum` with minisign. To check a download, verify that signature against the project's public key, then check the archive against the file:
