@@ -16,6 +16,7 @@ MCPB_MANIFEST="mcpb/manifest.json"
 REGISTRY_MANIFEST="server.json"
 MINISIGN_PUB="${OWNPG_MINISIGN_PUB:-minisign.pub}"
 BRANCH="main"
+PROTECTED_BRANCHES=(main master develop staging production)
 REMOTE="origin"
 PUBLIC_RELEASE_REPO="devops-infinity/ownpg-releases"
 RELEASE_URL_BASE="https://github.com/devops-infinity/ownpg-releases/releases/tag"
@@ -40,7 +41,6 @@ LOCK_DIR=""
 MUTATED=0
 IRREVERSIBLE=0
 UPLOADED=0
-RESUMING=0
 RESUME_REQUESTED=0
 LIB_PUBLISHED=0
 BIN_PUBLISHED=0
@@ -50,8 +50,9 @@ CRATE_BODY_FILE=""
 
 usage() {
 	cat <<'USAGE'
-Usage: tools/release.sh --patch | --minor | --major [options]
+Usage: tools/release.sh --prepare --patch | --minor | --major | --version X.Y.Z
        tools/release.sh --version X.Y.Z [options]
+       tools/release.sh --patch | --minor | --major --branch NAME [options]
        tools/release.sh --dry-run --patch
        tools/release.sh --resume --version X.Y.Z
        tools/release.sh --yank X.Y.Z | --unyank X.Y.Z
@@ -60,6 +61,9 @@ Usage: tools/release.sh --patch | --minor | --major [options]
   --minor          release the next minor version
   --patch          release the next patch version
   --version X.Y.Z  release this exact version instead of a computed one
+  --prepare        write the version bump and the changelog heading into the
+                   working tree and stop; nothing is published, committed, or
+                   pushed, so the bump reaches main through a pull request
   --dry-run        run every check and the bump, publish nothing, revert the bump
   --resume         finish a release that stopped part way: every step that
                    already happened (a crate on crates.io, the commit, the
@@ -80,6 +84,12 @@ signed with minisign, and a GitHub release is created and uploaded last, after
 the tag is pushed, on this repository and again on the public
 devops-infinity/ownpg-releases repository the installer scripts, the Homebrew
 formula, the npm package, and cargo-binstall actually resolve against.
+
+The script never commits to main, master, develop, staging, or production. A
+release from one of them needs the bump already merged there: run --prepare on
+a new branch, merge it through a pull request, then run --version X.Y.Z from
+the base branch, and only the tag is pushed. From any other branch given with
+--branch, the bump is committed and pushed to that branch.
 
 Environment:
   OWNPG_MINISIGN_KEY        the minisign secret key (default ~/.minisign/minisign.key)
@@ -118,10 +128,14 @@ print_manual_binary_steps() {
 print_manual_finish() {
 	say INFO "finish with: tools/release.sh --resume --version $VERSION"
 	say INFO "or by hand with:"
-	printf '  git add -- %s\n' "$(tracked_release_files | tr '\n' ' ')"
-	printf '  git commit -m "chore: release %s"\n' "$VERSION"
+	if ! branch_is_protected "$BRANCH"; then
+		printf '  git add -- %s\n' "$(tracked_release_files | tr '\n' ' ')"
+		printf '  git commit -m "chore: release %s"\n' "$VERSION"
+	fi
 	printf '  git tag %s v%s -m "OwnPG v%s"\n' "$(tag_flag)" "$VERSION" "$VERSION"
-	printf '  git push %s %s\n' "$REMOTE" "$BRANCH"
+	if ! branch_is_protected "$BRANCH"; then
+		printf '  git push %s %s\n' "$REMOTE" "$BRANCH"
+	fi
 	printf '  git push %s v%s\n' "$REMOTE" "$VERSION"
 	print_manual_binary_steps
 }
@@ -209,8 +223,45 @@ require_gh_auth() {
 	gh auth status >/dev/null 2>&1 || die "gh is not authenticated: run 'gh auth login'"
 }
 
+branch_is_protected() {
+	local name
+	for name in "${PROTECTED_BRANCHES[@]}"; do
+		[[ "$1" == "$name" ]] && return 0
+	done
+	return 1
+}
+
+require_prepared_release() {
+	local fix="land the bump through a pull request first (tools/release.sh --prepare --version $VERSION on a new branch), then rerun this from $BRANCH"
+	[[ "$VERSION" == "$CURRENT_VERSION" ]] ||
+		die "tools/release.sh never commits to $BRANCH, which is on $CURRENT_VERSION, not $VERSION; $fix"
+	[[ -f "$CHANGELOG" ]] || return 0
+	grep -qF "## [$VERSION]" "$CHANGELOG" ||
+		die "tools/release.sh never commits to $BRANCH, and $CHANGELOG has no [$VERSION] section; $fix"
+	grep -qF "[$VERSION]: " "$CHANGELOG" ||
+		die "tools/release.sh never commits to $BRANCH, and $CHANGELOG has no [$VERSION] link; $fix"
+}
+
+refuse_commit_on_protected_branch() {
+	branch_is_protected "$BRANCH" || return 0
+	local -a files=()
+	local changed
+	mapfile -t files < <(tracked_release_files)
+	changed="$(git status --porcelain -- "${files[@]}" | cut -c4- | tr '\n' ' ')"
+	[[ -n "${changed// /}" ]] || return 0
+	restore_tree
+	die "tools/release.sh never commits to $BRANCH, but this release would change: ${changed% }; land that through a pull request (tools/release.sh --prepare --version $VERSION on a new branch), then rerun"
+}
+
 require_minisign_key() {
 	[[ -f "$MINISIGN_KEY" ]] || die "no minisign secret key at $MINISIGN_KEY; run 'minisign -G' once, or point OWNPG_MINISIGN_KEY at the key"
+}
+
+require_llvm_tools() {
+	local sysroot
+	sysroot="$(rustc --print sysroot)" || die "rustc could not report its sysroot"
+	[[ -x "$sysroot/lib/rustlib/$(host_triple)/bin/llvm-ar" ]] ||
+		die "the llvm-tools component is missing, and cargo-xwin needs its llvm-lib for the Windows ARM64 build; run: rustup component add llvm-tools"
 }
 
 check_dist_version() {
@@ -316,7 +367,6 @@ check_registry_state() {
 	if [[ $LIB_PUBLISHED -eq 1 ]]; then
 		[[ $RESUME_REQUESTED -eq 1 ]] ||
 			die "$VERSION is already on crates.io for $LIB_CRATE$([[ $BIN_PUBLISHED -eq 1 ]] && printf ' and %s' "$BIN_CRATE"); a published version cannot be replaced, so finish it with: tools/release.sh --resume --version $VERSION"
-		RESUMING=1
 		IRREVERSIBLE=1
 		say WARNING "this run resumes a part-finished $VERSION release; steps that already happened are skipped"
 		return 0
@@ -387,6 +437,10 @@ rewrite_file() {
 		rm -f -- "$temp"
 		return "$code"
 	fi
+	if cmp -s -- "$temp" "$target"; then
+		rm -f -- "$temp"
+		return 0
+	fi
 	replace_atomically "$target" "$temp"
 	rm -f -- "$temp"
 }
@@ -422,15 +476,22 @@ bump_workspace_version() {
 		die "no ownpg-core dependency version in $CLI_MANIFEST"
 	say SUCCESS "$CLI_MANIFEST ownpg-core dependency is $VERSION"
 
-	jq --arg version "$VERSION" '.version = $version' "$MCPB_MANIFEST" >"$WORK_DIR/mcpb-manifest.json" ||
-		die "could not bump $MCPB_MANIFEST"
-	replace_atomically "$MCPB_MANIFEST" "$WORK_DIR/mcpb-manifest.json"
-	say SUCCESS "$MCPB_MANIFEST version is $VERSION"
+	bump_json_manifest "$MCPB_MANIFEST" '.version'
+	bump_json_manifest "$REGISTRY_MANIFEST" '.version' '.packages[] | select(.registryType == "cargo") | .version'
+}
 
-	jq --arg version "$VERSION" '.version = $version | .packages |= map(if .registryType == "cargo" then .version = $version else . end)' \
-		"$REGISTRY_MANIFEST" >"$WORK_DIR/registry-manifest.json" || die "could not bump $REGISTRY_MANIFEST"
-	replace_atomically "$REGISTRY_MANIFEST" "$WORK_DIR/registry-manifest.json"
-	say SUCCESS "$REGISTRY_MANIFEST version is $VERSION"
+bump_json_manifest() {
+	local file="$1" staged="$WORK_DIR/json-bump.tmp"
+	shift
+	if json_versions_match "$file" "$VERSION" "$@"; then
+		say INFO "$file already carries $VERSION, left as it is"
+		return 0
+	fi
+	set_json_versions "$file" "$VERSION" "$staged" "$@" ||
+		die "could not change only the version fields of $file to $VERSION; set them by hand"
+	replace_atomically "$file" "$staged"
+	rm -f -- "$staged"
+	say SUCCESS "$file version is $VERSION"
 }
 
 move_changelog_section() {
@@ -442,6 +503,7 @@ move_changelog_section() {
 	if grep -qF "## [$VERSION]" "$CHANGELOG"; then
 		say INFO "$CHANGELOG already has a $VERSION section"
 		add_changelog_link
+		advance_unreleased_link
 		return 0
 	fi
 	today="$(date +%F)"
@@ -463,6 +525,17 @@ move_changelog_section() {
 		return 0
 	fi
 	add_changelog_link
+	advance_unreleased_link
+}
+
+advance_unreleased_link() {
+	local program="$WORK_DIR/changelog-unreleased.awk"
+	cat >"$program" <<-'AWK'
+		/^\[Unreleased\]: / { sub(/\/compare\/v[0-9]+\.[0-9]+\.[0-9]+\.\.\.HEAD$/, "/compare/v" new "...HEAD") }
+		{ print }
+	AWK
+	rewrite_file "$CHANGELOG" "$program" -v new="$VERSION" ||
+		die "could not point the [Unreleased] link of $CHANGELOG at v$VERSION"
 }
 
 add_changelog_link() {
@@ -547,6 +620,13 @@ c_flags_for() {
 	esac
 }
 
+xwin_compiler_for() {
+	case "$1" in
+	aarch64-pc-windows-msvc) printf 'clang' ;;
+	*) printf 'clang-cl' ;;
+	esac
+}
+
 skip_reason() {
 	if grep -qF 'tools are required to run this task, but are missing' "$1"; then
 		printf 'missing cross-compile tool'
@@ -575,7 +655,7 @@ build_dist_artifacts() {
 	for target in "${targets[@]}"; do
 		log="$WORK_DIR/dist-build-$target.log"
 		manifest="$WORK_DIR/dist-build-$target.json"
-		if CFLAGS="$(c_flags_for "$target")" dist build --tag="v$VERSION" --artifacts=local --target="$target" --no-local-paths \
+		if CFLAGS="$(c_flags_for "$target")" XWIN_CROSS_COMPILER="$(xwin_compiler_for "$target")" dist build --tag="v$VERSION" --artifacts=local --target="$target" --no-local-paths \
 			--output-format=json >"$manifest" 2>"$log"; then
 			mkdir -p -- target/distrib
 			cp -- "$manifest" "target/distrib/$target-dist-manifest.json"
@@ -893,13 +973,13 @@ publish_github_release() {
 		grep -q '[^[:space:]]' "$notes" || die "no commits since the previous tag; nothing to write into the release notes"
 	fi
 
-	local view="$WORK_DIR/gh-view-${target_repo//\//-}.json" view_err="$WORK_DIR/gh-view-${target_repo//\//-}.err"
-	if gh release view "v$VERSION" "${repo_flag[@]}" --json assets >"$view" 2>"$view_err"; then
+	local view="$WORK_DIR/gh-view-${target_repo//\//-}.txt" view_err="$WORK_DIR/gh-view-${target_repo//\//-}.err"
+	if gh release view "v$VERSION" "${repo_flag[@]}" --json assets --jq '.assets[].name' >"$view" 2>"$view_err"; then
 		local name
 		local -a have_names=() want_names=()
 		while IFS= read -r name; do
 			[[ -n "$name" ]] && have_names+=("$name")
-		done < <(jq -r '.assets[].name' "$view" | sort)
+		done < <(sort "$view")
 		while IFS= read -r name; do
 			[[ -n "$name" ]] && want_names+=("$name")
 		done < <(printf '%s\n' "${assets[@]##*/}" | sort)
@@ -994,6 +1074,24 @@ yank_crates() {
 	done
 }
 
+prepare_release() {
+	require_tools git cargo jq awk cmp
+	[[ -z "$(git status --porcelain)" ]] || die "the working tree is not clean; commit or stash first"
+	CURRENT_VERSION="$(read_current_version)"
+	valid_version "$CURRENT_VERSION" || die "the version in $ROOT_MANIFEST is not a semver triple: $CURRENT_VERSION"
+	if [[ -n "$BUMP" ]]; then
+		VERSION="$(next_version "$CURRENT_VERSION" "$BUMP")" || die "unknown bump: $BUMP"
+	fi
+	version_greater "$VERSION" "$CURRENT_VERSION" || die "$VERSION is not greater than the current $CURRENT_VERSION"
+	step "version bump"
+	bump_workspace_version
+	run "cargo check after the bump" cargo check --workspace --all-targets --all-features --color=never
+	say SUCCESS "$LOCK_FILE records $VERSION"
+	step "changelog"
+	move_changelog_section
+	say SUCCESS "the $CURRENT_VERSION -> $VERSION bump is in the working tree; commit it on a branch, merge it through a pull request, then run tools/release.sh --version $VERSION from $BRANCH"
+}
+
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--version)
@@ -1007,6 +1105,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--dry-run)
 		MODE="dry-run"
+		shift
+		;;
+	--prepare)
+		MODE="prepare"
 		shift
 		;;
 	--resume)
@@ -1047,12 +1149,7 @@ done
 
 cd "$REPO"
 
-RELEASE_LOCK="$REPO/.git/release.lock"
-acquire_pid_lock "$RELEASE_LOCK" ||
-	die "another release.sh is already running (lock held: $RELEASE_LOCK, process $(cat -- "$RELEASE_LOCK/pid" 2>/dev/null || printf 'unknown')); remove it by hand only if you are sure none is running"
-LOCK_DIR="$RELEASE_LOCK"
-
-if [[ -n "$BUMP" && "$MODE" != "release" && "$MODE" != "dry-run" ]]; then
+if [[ -n "$BUMP" && "$MODE" != "release" && "$MODE" != "dry-run" && "$MODE" != "prepare" ]]; then
 	die "--$BUMP names a new version, so it cannot be combined with --$MODE"
 fi
 if [[ -n "$BUMP" && -n "$VERSION" ]]; then
@@ -1073,6 +1170,16 @@ fi
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ownpg-release.XXXXXX")"
 
 say INFO "repository $REPO"
+
+if [[ "$MODE" == "prepare" ]]; then
+	prepare_release
+	exit 0
+fi
+
+RELEASE_LOCK="$REPO/.git/release.lock"
+acquire_pid_lock "$RELEASE_LOCK" ||
+	die "another release.sh is already running (lock held: $RELEASE_LOCK, process $(cat -- "$RELEASE_LOCK/pid" 2>/dev/null || printf 'unknown')); remove it by hand only if you are sure none is running"
+LOCK_DIR="$RELEASE_LOCK"
 
 case "$MODE" in
 yank)
@@ -1109,6 +1216,7 @@ require_credentials
 require_gh_auth
 require_minisign_key
 check_dist_version
+require_llvm_tools
 CURRENT_VERSION="$(read_current_version)"
 [[ -n "$CURRENT_VERSION" ]] || die "could not read the version from $ROOT_MANIFEST"
 valid_version "$CURRENT_VERSION" || die "the version in $ROOT_MANIFEST is not a semver triple: $CURRENT_VERSION"
@@ -1118,11 +1226,13 @@ if [[ -n "$BUMP" ]]; then
 fi
 check_registry_state
 if [[ "$VERSION" == "$CURRENT_VERSION" ]]; then
-	[[ $RESUMING -eq 1 ]] || die "$VERSION is not greater than the current $CURRENT_VERSION"
-	say WARNING "the manifests already carry $VERSION, so the bump step will change nothing"
+	say INFO "the manifests already carry $VERSION, so the bump step changes nothing"
 else
 	version_greater "$VERSION" "$CURRENT_VERSION" || die "$VERSION is not greater than the current $CURRENT_VERSION"
 	say SUCCESS "$CURRENT_VERSION -> $VERSION"
+fi
+if [[ "$MODE" == "release" ]] && branch_is_protected "$BRANCH"; then
+	require_prepared_release
 fi
 
 step "verification gate"
@@ -1146,6 +1256,9 @@ say SUCCESS "$LOCK_FILE records $VERSION"
 
 step "changelog"
 move_changelog_section
+if [[ "$MODE" == "release" ]]; then
+	refuse_commit_on_protected_branch
+fi
 
 step "release-profile rebuild"
 if [[ "$MODE" == "dry-run" ]]; then
@@ -1198,7 +1311,11 @@ say INFO "this will publish and push:"
 say INFO "  $LIB_CRATE $VERSION to crates.io"
 say INFO "  $BIN_CRATE $VERSION to crates.io, after the library is live"
 say INFO "  prebuilt binaries for whichever of the eight targets this machine can build, with the SBOM, the attribution file, and a minisign signature over the checksums"
-say INFO "  a commit on $BRANCH carrying the bump and the changelog"
+if branch_is_protected "$BRANCH"; then
+	say INFO "  no commit: $BRANCH already carries the $VERSION bump"
+else
+	say INFO "  a commit on $BRANCH carrying the bump and the changelog"
+fi
 say INFO "  tag v$VERSION ($(tag_flag)) pushed to $REMOTE"
 say INFO "  a GitHub release v$VERSION carrying the built binaries, here and on $PUBLIC_RELEASE_REPO"
 say INFO "  the Homebrew formula pushed to ${OWNPG_HOMEBREW_TAP:-devops-infinity/homebrew-tap} and the npm package published, unless OWNPG_SKIP_TAP or OWNPG_SKIP_NPM is 1"
@@ -1224,7 +1341,7 @@ fi
 step "commit, tag, push"
 tracked_release_files | xargs git add -- || die "git add failed"
 if git diff --cached --quiet; then
-	say WARNING "nothing staged; the bump is already committed"
+	say INFO "nothing to commit; $BRANCH already carries the $VERSION bump"
 else
 	git commit -m "chore: release $VERSION" >/dev/null || die "git commit failed"
 	say SUCCESS "committed the bump"
@@ -1236,8 +1353,12 @@ else
 	say SUCCESS "tagged v$VERSION"
 fi
 MUTATED=0
-git push "$REMOTE" "$BRANCH" ||
-	die "pushing $BRANCH failed; finish with: git push $REMOTE $BRANCH && git push $REMOTE v$VERSION"
+if [[ "$(git rev-parse HEAD)" == "$(git rev-parse "$REMOTE/$BRANCH")" ]]; then
+	say INFO "$BRANCH is level with $REMOTE/$BRANCH, so only the tag is pushed"
+else
+	git push "$REMOTE" "$BRANCH" ||
+		die "pushing $BRANCH failed; finish with: git push $REMOTE $BRANCH && git push $REMOTE v$VERSION"
+fi
 git push "$REMOTE" "v$VERSION" || die "pushing the tag failed; finish with: git push $REMOTE v$VERSION"
 PUSHED=1
 say SUCCESS "pushed v$VERSION"

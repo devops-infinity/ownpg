@@ -41,11 +41,24 @@ OwnPG is pre-1.0 software. Until 1.0, a minor release can change or remove behav
 
 ## Install
 
-Install the `ownpg` binary from crates.io:
+Install with Homebrew on macOS or Linux:
+
+```bash
+brew install devops-infinity/tap/ownpg
+```
+
+Or install the `ownpg` binary from crates.io:
 
 ```bash
 cargo install ownpg --locked
 ownpg --version
+```
+
+Prebuilt archives for macOS, Linux, and Windows are on the [releases page](https://github.com/devops-infinity/ownpg-releases/releases/latest), with a shell installer and a PowerShell installer. Each release signs its `sha256.sum` with minisign. To check a download, verify that signature against the project's public key, then check the archive against the file:
+
+```bash
+minisign -Vm sha256.sum -P RWSPyQWAsXwP5vjgAFI/PAAtbFAd5tA4BlhyFrT+MCPNmE2J+jgT26kC
+grep ownpg-aarch64-apple-darwin.tar.gz sha256.sum | shasum -a 256 --check
 ```
 
 Or build it from a checkout:
@@ -123,7 +136,7 @@ An entry that uses every tool group adds the access mode, the extra groups, and 
 
 What each part does:
 
-- `--database` and `--user` pick the database and the role. With no `--host` (or `OWNPG_HOST`), OwnPG tries the local Unix socket directories first, then `127.0.0.1`. `--port` defaults to 5432.
+- `--database` and `--user` pick the database and the role. With no `--host` (or `OWNPG_HOST`), OwnPG tries the local Unix socket directories first, then `127.0.0.1`. On Windows it goes straight to `127.0.0.1`, and a socket directory as `--host` is refused, since Unix sockets need macOS or Linux. `--port` defaults to 5432.
 - `--mode read-write` loads the write and transaction tools on top of the read tools. `ro`, `wo`, and `rw` are accepted as short forms.
 - `--tools` adds optional groups; [Tools](#user-content-tools) lists what each one holds. The write and transaction groups load on their own in a write mode, so naming them in `--tools` changes nothing.
 - `--output-dir` is the absolute path where `pg_dump`, `pg_dumpall_globals`, and `pg_basebackup` write, and where `pg_restore` reads. OwnPG creates it with owner-only access on first use. Without it, those tools refuse to run.
@@ -344,7 +357,7 @@ The `serve` options, grouped:
 - What to serve: `--database` (required), `--schema` (default `public`), `--mode` (default `read-only`), `--tools`.
 - Where the server is: `--host`, `--port`, `--user`, `OWNPG_PASSWORD`, or a whole libpq connection string in `OWNPG_DSN`.
 - TLS: `--sslmode` (default `prefer`, with the libpq meaning of each value) and `--sslrootcert`, which takes a file or `system` for the platform trust store.
-- SSH: `--ssh [USER@]HOST[:PORT]` reaches PostgreSQL through a bastion host, with the built-in client or the system `ssh` command (`--ssh-transport`). `--ssh-trust-new-host` records an unknown host key on first use.
+- SSH: `--ssh [USER@]HOST[:PORT]` reaches PostgreSQL through a bastion host, with the built-in client or the system `ssh` command (`--ssh-transport`; the system command needs macOS or Linux). `--ssh-trust-new-host` records an unknown host key on first use.
 - Profiles: `--profile` picks a named profile, and `--config` points at a profile file other than the default.
 - Host programs: `--pg-bindir` names the folder holding `pg_dump` and the other programs, when they are not on `PATH`, and `--output-dir` is where their files go.
 - Audit log: `--no-audit` and `--audit-path`.

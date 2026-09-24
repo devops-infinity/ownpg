@@ -236,12 +236,20 @@ impl Session {
     }
 }
 
+#[cfg(unix)]
 pin_project_lite::pin_project! {
     #[project = TunnelStreamProj]
     pub enum TunnelStream {
         Channel { #[pin] inner: russh::ChannelStream<russh::client::Msg> },
-        #[cfg(unix)]
         Unix { #[pin] inner: tokio::net::UnixStream },
+    }
+}
+
+#[cfg(not(unix))]
+pin_project_lite::pin_project! {
+    #[project = TunnelStreamProj]
+    pub enum TunnelStream {
+        Channel { #[pin] inner: russh::ChannelStream<russh::client::Msg> },
     }
 }
 
@@ -434,8 +442,14 @@ impl Connector {
         let connection = &settings.connection;
         let mut config = tokio_postgres::Config::new();
         match &candidate.endpoint {
+            #[cfg(unix)]
             Endpoint::Socket { directory, port } => {
                 config.host_path(directory);
+                config.port(*port);
+                config.ssl_mode(tokio_postgres::config::SslMode::Disable);
+            }
+            #[cfg(not(unix))]
+            Endpoint::Socket { port, .. } => {
                 config.port(*port);
                 config.ssl_mode(tokio_postgres::config::SslMode::Disable);
             }
@@ -567,6 +581,14 @@ impl Connector {
         tls: &Arc<Tls>,
         ssl_mode: SslMode,
     ) -> std::result::Result<Session, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(not(unix))]
+        if let Endpoint::Socket { directory, .. } = &candidate.endpoint {
+            return Err(format!(
+                "{} is a Unix socket directory, and Unix socket connections need macOS or Linux; give a TCP host",
+                directory.display()
+            )
+            .into());
+        }
         let config = self.driver_config(candidate, ssl_mode);
         let budget = self.settings.connection.connect_timeout.value;
         let (client, connection) =
@@ -940,6 +962,31 @@ mod tests {
         );
         let candidates = Connector::new(Arc::new(socket)).candidates();
         assert_eq!(candidates[0].endpoint.to_string(), "/tmp/.s.PGSQL.5432");
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn a_socket_directory_host_is_refused_off_unix_with_the_reason() {
+        let settings = settings_for(
+            FlagLayer {
+                database: Some("app".to_owned()),
+                host: Some("/tmp".to_owned()),
+                ..FlagLayer::default()
+            },
+            &Environment::default(),
+        );
+        let Err(Error::ConnectFailed { tried, source }) =
+            Connector::new(Arc::new(settings)).connect().await
+        else {
+            panic!("a socket directory host connected off Unix");
+        };
+        assert_eq!(tried.len(), 1);
+        assert!(
+            source
+                .to_string()
+                .contains("Unix socket connections need macOS or Linux"),
+            "{source}"
+        );
     }
 
     #[test]

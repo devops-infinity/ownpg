@@ -116,3 +116,38 @@ sweep_stale_install_temps() {
 	[[ -d "$dir" ]] || return 0
 	find "$dir" -maxdepth 1 -type f \( -name ".$bin.??????" -o -name ".$bin.exe.??????" \) -mmin +1440 -delete
 }
+
+json_version_filter() {
+	local filter="." path
+	for path in "$@"; do
+		filter+=" | ($path) = \$version"
+	done
+	printf '%s\n' "$filter"
+}
+
+json_versions_match() {
+	local file="$1" version="$2" filter wanted current
+	shift 2
+	filter="$(json_version_filter "$@")"
+	wanted="$(jq -S --arg version "$version" "$filter" "$file")" || return 1
+	current="$(jq -S . "$file")" || return 1
+	[[ "$wanted" == "$current" ]]
+}
+
+set_json_versions() {
+	local file="$1" version="$2" out="$3" filter wanted
+	shift 3
+	filter="$(json_version_filter "$@")"
+	wanted="$(jq -S --arg version "$version" "$filter" "$file")" || return 1
+	awk -v new="$version" '
+		match($0, /"version"[[:space:]]*:[[:space:]]*"/) {
+			head = substr($0, 1, RSTART + RLENGTH - 1)
+			tail = substr($0, RSTART + RLENGTH)
+			sub(/^[^"]*/, "", tail)
+			print head new tail
+			next
+		}
+		{ print }
+	' "$file" >"$out" || return 1
+	[[ "$(jq -S . "$out" 2>/dev/null)" == "$wanted" ]]
+}

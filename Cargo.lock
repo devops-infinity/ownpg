@@ -2428,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "ownpg"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -2451,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "ownpg-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "base64 0.23.1",

@@ -6,6 +6,18 @@ The format follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-24
+
+### Added
+
+- `minisign.pub` at the repository root, the public key that checks the minisign signature on each release's `sha256.sum`.
+
+### Fixed
+
+- `ownpg --version` on a crates.io install shows the build date, not `built unknown`.
+- A build from a git worktree shows its commit and build date, not `unknown`.
+- OwnPG builds for Windows. There, a Unix socket directory as `--host` and `--ssh-transport system` each report that they need macOS or Linux.
+
 ## [0.1.0] - 2026-09-24
 
 ### Added
@@ -55,5 +67,6 @@ The format follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/
 - `ownpg completions`, shell completion scripts for bash, elvish, fish, powershell, and zsh.
 - `--log-file`, which also writes logs to a file rotated daily with the newest eight kept, and `--log-format text|json`.
 
-[Unreleased]: https://github.com/devops-infinity/ownpg/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/devops-infinity/ownpg/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/devops-infinity/ownpg-releases/releases/tag/v0.1.1
 [0.1.0]: https://github.com/devops-infinity/ownpg-releases/releases/tag/v0.1.0

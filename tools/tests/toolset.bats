@@ -3,6 +3,7 @@
 bats_require_minimum_version 1.5.0
 
 setup() {
+	unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX
 	REPO_ROOT="$(cd -- "$BATS_TEST_DIRNAME/../.." && pwd)"
 	TEST_REPO="$BATS_TEST_TMPDIR/repo"
 	mkdir -p "$TEST_REPO/tools" "$TEST_REPO/.githooks"
@@ -16,6 +17,11 @@ setup() {
 	git config user.email "test@example.com"
 	git config user.name "test"
 	TIMESTAMP='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+}
+
+@test "every test works in its own scratch repository, even under a git hook that exports GIT_DIR" {
+	[ "$(git rev-parse --absolute-git-dir)" = "$(pwd -P)/.git" ]
+	[ "$(git rev-parse --show-toplevel)" = "$(pwd -P)" ]
 }
 
 @test "lib.sh say() writes a UTC timestamp, the level, and the message to stderr, not stdout" {
@@ -271,4 +277,68 @@ setup() {
 	run tools/release.sh --help
 	[ "$status" -eq 0 ]
 	[[ "$output" == *"--resume --version X.Y.Z"* ]]
+}
+
+@test "set_json_versions changes only the version values and keeps the layout" {
+	printf '{\n  "name": "ownpg",\n  "version": "0.1.0",\n  "keywords": ["postgres", "mcp"],\n  "packages": [\n    { "registryType": "cargo", "version": "0.1.0" }\n  ]\n}\n' >manifest.json
+	run bash -c 'source tools/lib.sh; set_json_versions manifest.json 0.2.0 out.json .version ".packages[] | select(.registryType == \"cargo\") | .version"'
+	[ "$status" -eq 0 ]
+	diff <(sed 's/"0\.1\.0"/"0.2.0"/' manifest.json) out.json
+}
+
+@test "set_json_versions refuses a manifest with a version field outside the given paths" {
+	printf '{\n  "version": "0.1.0",\n  "packages": [\n    { "registryType": "mcpb", "version": "0.1.0" }\n  ]\n}\n' >manifest.json
+	run bash -c 'source tools/lib.sh; set_json_versions manifest.json 0.2.0 out.json .version'
+	[ "$status" -eq 1 ]
+}
+
+@test "json_versions_match tells a current manifest from one that still needs the bump" {
+	printf '{\n  "version": "0.2.0",\n  "keywords": ["postgres"]\n}\n' >manifest.json
+	run bash -c 'source tools/lib.sh; json_versions_match manifest.json 0.2.0 .version'
+	[ "$status" -eq 0 ]
+	run bash -c 'source tools/lib.sh; json_versions_match manifest.json 0.3.0 .version'
+	[ "$status" -eq 1 ]
+}
+
+@test "release.sh --prepare is documented and cannot be combined with --resume" {
+	cp "$REPO_ROOT/tools/release.sh" "$TEST_REPO/tools/release.sh"
+	chmod +x "$TEST_REPO/tools/release.sh"
+	run tools/release.sh --help
+	[ "$status" -eq 0 ]
+	[[ "$output" == *"--prepare --patch | --minor | --major | --version X.Y.Z"* ]]
+	run --separate-stderr tools/release.sh --prepare --resume --version 1.2.3
+	[ "$status" -eq 1 ]
+	[[ "$stderr" == *"cannot be combined with --prepare"* ]]
+}
+
+@test "release.sh --prepare bumps every release file, keeps the manifest layout, and moves the changelog links" {
+	cp "$REPO_ROOT/tools/release.sh" "$TEST_REPO/tools/release.sh"
+	cp "$REPO_ROOT/rust-toolchain.toml" "$TEST_REPO/rust-toolchain.toml"
+	chmod +x "$TEST_REPO/tools/release.sh"
+	mkdir -p crates/ownpg-core/src crates/ownpg/src mcpb
+	printf '[workspace]\nmembers = ["crates/ownpg-core", "crates/ownpg"]\nresolver = "3"\n\n[workspace.package]\nversion = "0.1.0"\nedition = "2024"\n' >Cargo.toml
+	printf '[package]\nname = "ownpg-core"\nversion.workspace = true\nedition.workspace = true\n' >crates/ownpg-core/Cargo.toml
+	: >crates/ownpg-core/src/lib.rs
+	printf '[package]\nname = "ownpg"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\nownpg-core = { path = "../ownpg-core", version = "0.1.0" }\n' >crates/ownpg/Cargo.toml
+	printf 'fn main() {}\n' >crates/ownpg/src/main.rs
+	printf '{\n  "name": "ownpg",\n  "version": "0.1.0",\n  "keywords": ["postgres", "mcp"]\n}\n' >mcpb/manifest.json
+	printf '{\n  "version": "0.1.0",\n  "packages": [\n    {\n      "registryType": "cargo",\n      "version": "0.1.0"\n    }\n  ]\n}\n' >server.json
+	printf '# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- The build date.\n\n## [0.1.0] - 2026-09-24\n\n[Unreleased]: https://github.com/devops-infinity/ownpg/compare/v0.1.0...HEAD\n[0.1.0]: https://github.com/devops-infinity/ownpg-releases/releases/tag/v0.1.0\n' >CHANGELOG.md
+	printf '/target\n' >.gitignore
+	cargo generate-lockfile --offline --quiet
+	git add -A
+	git commit -qm fixture
+	run --separate-stderr tools/release.sh --prepare --patch
+	[ "$status" -eq 0 ]
+	grep -qxF 'version = "0.1.1"' Cargo.toml
+	grep -qF 'ownpg-core = { path = "../ownpg-core", version = "0.1.1" }' crates/ownpg/Cargo.toml
+	grep -qxF '  "keywords": ["postgres", "mcp"]' mcpb/manifest.json
+	[ "$(jq -r .version mcpb/manifest.json)" = "0.1.1" ]
+	[ "$(jq -r '.version, .packages[0].version' server.json | sort -u)" = "0.1.1" ]
+	[ "$(grep -A1 -xF 'name = "ownpg-core"' Cargo.lock | tail -n 1)" = 'version = "0.1.1"' ]
+	grep -qE '^## \[0\.1\.1\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$' CHANGELOG.md
+	grep -qxF '[Unreleased]: https://github.com/devops-infinity/ownpg/compare/v0.1.1...HEAD' CHANGELOG.md
+	grep -qxF '[0.1.1]: https://github.com/devops-infinity/ownpg-releases/releases/tag/v0.1.1' CHANGELOG.md
+	[ "$(git diff --numstat -- mcpb/manifest.json)" = "$(printf '1\t1\tmcpb/manifest.json')" ]
+	[ ! -e .git/release.lock ]
 }

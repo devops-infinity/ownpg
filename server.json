@@ -3,7 +3,7 @@
   "name": "io.github.devops-infinity/ownpg",
   "title": "OwnPG",
   "description": "PostgreSQL DBA tools over MCP, scoped to one database and one schema, with read, write, DDL, role, maintenance, monitoring, and host program tools.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://github.com/devops-infinity/ownpg-releases",
   "repository": {
     "url": "https://github.com/devops-infinity/ownpg-releases",
@@ -14,7 +14,7 @@
       "registryType": "cargo",
       "registryBaseUrl": "https://crates.io",
       "identifier": "ownpg",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "transport": {
         "type": "stdio"
       },
