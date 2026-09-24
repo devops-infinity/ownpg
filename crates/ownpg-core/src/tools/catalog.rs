@@ -20,10 +20,12 @@ pub enum ObjectType {
     Type,
     Index,
     Extension,
+    Publication,
+    EventTrigger,
 }
 
 impl ObjectType {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Schema,
         Self::Table,
         Self::View,
@@ -34,6 +36,8 @@ impl ObjectType {
         Self::Type,
         Self::Index,
         Self::Extension,
+        Self::Publication,
+        Self::EventTrigger,
     ];
 
     #[must_use]
@@ -49,6 +53,8 @@ impl ObjectType {
             Self::Type => "type",
             Self::Index => "index",
             Self::Extension => "extension",
+            Self::Publication => "publication",
+            Self::EventTrigger => "event_trigger",
         }
     }
 
@@ -87,7 +93,7 @@ pub fn check_scope(schema: &str, scoped: &str) -> Result<()> {
 }
 
 pub async fn resolve_relation(engine: &Engine, name: &str) -> Result<ResolvedRelation> {
-    let (schema, relname) = split_name(name, &engine.settings().schema.value);
+    let (schema, relname) = crate::render::split_name(name, &engine.settings().schema.value);
     let rows = engine
         .catalog_rows(
             "SELECT n.nspname::text, c.relname::text, c.relkind::text, c.oid::int8 \
@@ -443,7 +449,7 @@ pub struct RoutineDescription {
 
 pub async fn describe_routines(engine: &Engine, name: &str) -> Result<Vec<RoutineDescription>> {
     let scoped = engine.settings().schema.value.clone();
-    let (schema, bare) = split_name(name, &scoped);
+    let (schema, bare) = crate::render::split_name(name, &scoped);
     check_scope(&schema, &scoped)?;
     let mut out = Vec::new();
     for row in engine
@@ -508,7 +514,7 @@ pub struct TypeDescription {
 
 pub async fn describe_type(engine: &Engine, name: &str) -> Result<TypeDescription> {
     let scoped = engine.settings().schema.value.clone();
-    let (schema, bare) = split_name(name, &scoped);
+    let (schema, bare) = crate::render::split_name(name, &scoped);
     check_scope(&schema, &scoped)?;
     let rows = engine
         .catalog_rows(
@@ -745,7 +751,7 @@ pub async fn describe_privileges(
     for row in engine
         .catalog_rows(
             "SELECT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END, a.privilege_type::text, a.is_grantable, pg_catalog.pg_get_userbyid(a.grantor)::text \
-             FROM pg_catalog.pg_class c, pg_catalog.aclexplode(COALESCE(c.relacl, pg_catalog.acldefault('r', c.relowner))) a \
+             FROM pg_catalog.pg_class c, pg_catalog.aclexplode(COALESCE(c.relacl, pg_catalog.acldefault(CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END::\"char\", c.relowner))) a \
              WHERE c.oid = $1::oid ORDER BY 1, 2",
             &[&relation.oid],
         )
@@ -761,36 +767,46 @@ pub async fn describe_privileges(
     Ok(out)
 }
 
-#[must_use]
-pub fn split_name(name: &str, scoped: &str) -> (String, String) {
-    let trimmed = name.trim();
-    let unquote = |part: &str| -> String {
-        let part = part.trim();
-        if part.len() >= 2 && part.starts_with('"') && part.ends_with('"') {
-            part.get(1..part.len() - 1)
-                .unwrap_or(part)
-                .replace("\"\"", "\"")
-        } else {
-            part.to_ascii_lowercase()
-        }
-    };
-    if let Some((schema, bare)) = split_qualified(trimmed) {
-        (unquote(schema), unquote(bare))
-    } else {
-        (scoped.to_owned(), unquote(trimmed))
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct DefaultPrivilegeRow {
+    pub for_role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub object_type: String,
+    pub grantee: String,
+    pub privilege: String,
+    pub grantable: bool,
 }
 
-fn split_qualified(name: &str) -> Option<(&str, &str)> {
-    let mut in_quotes = false;
-    for (index, c) in name.char_indices() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            '.' if !in_quotes => return Some((name.get(..index)?, name.get(index + 1..)?)),
-            _ => {}
-        }
+pub async fn describe_default_privileges(
+    engine: &Engine,
+    schema: &str,
+) -> Result<Vec<DefaultPrivilegeRow>> {
+    let mut out = Vec::new();
+    for row in engine
+        .catalog_rows(
+            "SELECT pg_catalog.pg_get_userbyid(d.defaclrole)::text, n.nspname::text, \
+             CASE d.defaclobjtype WHEN 'r' THEN 'tables' WHEN 'S' THEN 'sequences' WHEN 'f' THEN 'routines' \
+             WHEN 'T' THEN 'types' WHEN 'n' THEN 'schemas' WHEN 'L' THEN 'large_objects' ELSE d.defaclobjtype::text END, \
+             CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::text END, \
+             a.privilege_type::text, a.is_grantable \
+             FROM pg_catalog.pg_default_acl d LEFT JOIN pg_catalog.pg_namespace n ON n.oid = d.defaclnamespace, \
+             pg_catalog.aclexplode(d.defaclacl) a \
+             WHERE d.defaclnamespace = 0 OR n.nspname = $1 ORDER BY 1, 2 NULLS FIRST, 3, 4, 5",
+            &[&schema],
+        )
+        .await?
+    {
+        out.push(DefaultPrivilegeRow {
+            for_role: read_column(&row, 0)?,
+            schema: read_column(&row, 1)?,
+            object_type: read_column(&row, 2)?,
+            grantee: read_column(&row, 3)?,
+            privilege: read_column(&row, 4)?,
+            grantable: read_column(&row, 5)?,
+        });
     }
-    None
+    Ok(out)
 }
 
 impl ObjectType {
@@ -805,26 +821,6 @@ impl ObjectType {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn names_split_on_the_unquoted_dot_and_fold_case_outside_quotes() {
-        assert_eq!(
-            split_name("orders", "app"),
-            ("app".to_owned(), "orders".to_owned())
-        );
-        assert_eq!(
-            split_name("Other.Orders", "app"),
-            ("other".to_owned(), "orders".to_owned())
-        );
-        assert_eq!(
-            split_name("\"Mixed.Case\".\"T\"", "app"),
-            ("Mixed.Case".to_owned(), "T".to_owned())
-        );
-        assert_eq!(
-            split_name("\"a\"\"b\"", "app"),
-            ("app".to_owned(), "a\"b".to_owned())
-        );
-    }
 
     #[test]
     fn the_scope_check_admits_the_catalogs_and_the_scoped_schema_only() {

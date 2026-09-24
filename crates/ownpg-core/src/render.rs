@@ -50,7 +50,7 @@ pub struct QualifiedName {
 
 impl QualifiedName {
     pub fn parse(argument: &str, input: &str, scoped_schema: &str) -> Result<Self> {
-        let (schema, name) = crate::tools::catalog::split_name(input, scoped_schema);
+        let (schema, name) = split_name(input, scoped_schema);
         validate_ident(argument, &name)?;
         validate_ident("schema", &schema)?;
         if schema != scoped_schema && !classify::CATALOG_SCHEMAS.contains(&schema.as_str()) {
@@ -230,10 +230,19 @@ pub fn expression(argument: &str, text: &str) -> Result<String> {
         argument: argument.to_owned(),
         detail: format!("`{trimmed}` is not a single expression: {error}"),
     })?;
-    if parsed.kind != "SelectStmt" {
+    let single = matches!(
+        (
+            classify::select_shape(&probe),
+            classify::select_shape("SELECT (1)"),
+        ),
+        (Some((1, shape)), Some((1, reference))) if shape == reference
+    );
+    if parsed.kind != "SelectStmt" || !single {
         return Err(Error::ArgumentInvalid {
             argument: argument.to_owned(),
-            detail: format!("`{trimmed}` is not a single expression"),
+            detail: format!(
+                "`{trimmed}` is not a single expression; FROM, UNION, GROUP BY, ORDER BY, LIMIT, and extra columns are not allowed"
+            ),
         });
     }
     if let Some(rule) = parsed.refusals.first() {
@@ -314,9 +323,61 @@ impl Statement {
     }
 }
 
+#[must_use]
+pub fn split_name(name: &str, scoped: &str) -> (String, String) {
+    let trimmed = name.trim();
+    let unquote = |part: &str| -> String {
+        let part = part.trim();
+        if part.len() >= 2 && part.starts_with('"') && part.ends_with('"') {
+            part.get(1..part.len() - 1)
+                .unwrap_or(part)
+                .replace("\"\"", "\"")
+        } else {
+            part.to_ascii_lowercase()
+        }
+    };
+    if let Some((schema, bare)) = split_qualified(trimmed) {
+        (unquote(schema), unquote(bare))
+    } else {
+        (scoped.to_owned(), unquote(trimmed))
+    }
+}
+
+fn split_qualified(name: &str) -> Option<(&str, &str)> {
+    let mut in_quotes = false;
+    for (index, c) in name.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '.' if !in_quotes => return Some((name.get(..index)?, name.get(index + 1..)?)),
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_split_on_the_unquoted_dot_and_fold_case_outside_quotes() {
+        assert_eq!(
+            split_name("orders", "app"),
+            ("app".to_owned(), "orders".to_owned())
+        );
+        assert_eq!(
+            split_name("Other.Orders", "app"),
+            ("other".to_owned(), "orders".to_owned())
+        );
+        assert_eq!(
+            split_name("\"Mixed.Case\".\"T\"", "app"),
+            ("Mixed.Case".to_owned(), "T".to_owned())
+        );
+        assert_eq!(
+            split_name("\"a\"\"b\"", "app"),
+            ("app".to_owned(), "a\"b".to_owned())
+        );
+    }
 
     #[test]
     fn identifiers_are_validated_and_quoted() {
@@ -355,6 +416,25 @@ mod tests {
         assert_eq!(expression("default", "now()").unwrap(), "now()");
         assert!(expression("default", "1); DROP TABLE x; --").is_err());
         assert!(expression("default", "pg_read_file('/etc/passwd')").is_err());
+        for good in [
+            "id = 1",
+            "status IN ('a', 'b') AND created_at > now() - interval '1 day'",
+            "EXISTS (SELECT 1 FROM app.items i WHERE i.order_id = orders.id)",
+            "(a + b) * 2",
+        ] {
+            expression("filter", good).unwrap_or_else(|error| panic!("{good}: {error}"));
+        }
+        for bad in [
+            "true) UNION SELECT (1",
+            "1) FROM orders WHERE (true",
+            "1), (2",
+            "true) ORDER BY (1",
+            "true) LIMIT (0",
+            "",
+        ] {
+            let error = expression("filter", bad).unwrap_err();
+            assert_eq!(error.id().as_str(), "argument.invalid", "{bad}");
+        }
     }
 
     #[test]

@@ -377,6 +377,103 @@ async fn older_client_sessions_are_accepted_instead_of_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_client_session_belongs_to_the_caller_that_opened_it() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app; CREATE TABLE app.t (id int)")
+        .await
+        .unwrap();
+    let tokens = format!("{TOKEN_READ} read-only reader;{TOKEN_WRITE} read-write writer");
+    let remote = remote(
+        &scratch,
+        Some(AuthMode::Bearer),
+        &[
+            ("OWNPG_BEARER_TOKENS", tokens.as_str()),
+            ("OWNPG_OLDER_CLIENT_SESSIONS", "true"),
+        ],
+    )
+    .await;
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "older", "version": "1.0.0"}
+        }
+    });
+    let opened = remote
+        .client
+        .post(format!("{}/mcp", remote.base_url))
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .bearer_auth(TOKEN_READ)
+        .body(initialize.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), 200);
+    let session = opened
+        .headers()
+        .get("mcp-session-id")
+        .expect("an older client gets a session id")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+    let send = |token: &'static str| {
+        remote
+            .client
+            .post(format!("{}/mcp", remote.base_url))
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .header("MCP-Protocol-Version", "2025-06-18")
+            .header("Mcp-Session-Id", session.as_str())
+            .bearer_auth(token)
+            .body(list.to_string())
+    };
+    let borrowed = send(TOKEN_WRITE).send().await.unwrap();
+    assert_eq!(borrowed.status(), 404);
+    let owned = send(TOKEN_READ).send().await.unwrap();
+    assert_ne!(owned.status(), 404);
+    let foreign_close = remote
+        .client
+        .delete(format!("{}/mcp", remote.base_url))
+        .header("Mcp-Session-Id", session.as_str())
+        .bearer_auth(TOKEN_WRITE)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_close.status(), 404);
+    let own_close = remote
+        .client
+        .delete(format!("{}/mcp", remote.base_url))
+        .header("Mcp-Session-Id", session.as_str())
+        .bearer_auth(TOKEN_READ)
+        .send()
+        .await
+        .unwrap();
+    assert!(own_close.status().is_success(), "{}", own_close.status());
+    let after_close = send(TOKEN_READ).send().await.unwrap();
+    assert_eq!(after_close.status(), 404);
+    let refused = remote
+        .client
+        .put(format!("{}/mcp", remote.base_url))
+        .bearer_auth(TOKEN_READ)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 405);
+    assert_eq!(refused.headers().get("allow").unwrap(), "GET, POST, DELETE");
+    remote.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
     let Some(scratch) = support::scratch().await else {
         return;
@@ -418,7 +515,9 @@ async fn bearer_tokens_gate_the_endpoint_and_bind_a_mode() {
         "{challenge}"
     );
     assert!(challenge.contains("scope=\"ownpg:read\""), "{challenge}");
-    assert_eq!(body["error"], "invalid_request");
+    assert!(!challenge.contains("error="), "{challenge}");
+    assert!(body.get("error").is_none(), "{body}");
+    assert_eq!(body["error_description"], "a bearer token is required");
 
     let (status, body, _) = remote
         .call_tool("pg_health", Some("wrong-token-0123456789"))
@@ -992,8 +1091,10 @@ async fn an_unreachable_key_endpoint_fails_closed() {
             .to_string(),
     );
     let token = format!("{header}.{payload}.AAAA");
-    let (status, body, _) = remote.call_tool("pg_health", Some(&token)).await;
-    assert_eq!(status, 401, "{body}");
+    let (status, body, headers) = remote.call_tool("pg_health", Some(&token)).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(headers.get("retry-after").unwrap(), "60");
+    assert!(headers.get("www-authenticate").is_none());
     assert!(
         body["error_description"]
             .as_str()
@@ -1019,17 +1120,17 @@ async fn metrics_are_exported_to_the_configured_collector() {
         .with_test_writer()
         .try_init();
     let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let byte_total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let request_count_in_handler = Arc::clone(&request_count);
-    let byte_total_in_handler = Arc::clone(&byte_total);
+    let bodies_in_handler = Arc::clone(&bodies);
     let app = axum::Router::new().route(
         "/v1/metrics",
         axum::routing::post(move |body: axum::body::Bytes| {
             let request_count = Arc::clone(&request_count_in_handler);
-            let byte_total = Arc::clone(&byte_total_in_handler);
+            let bodies = Arc::clone(&bodies_in_handler);
             async move {
                 request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                byte_total.fetch_add(body.len(), std::sync::atomic::Ordering::SeqCst);
+                bodies.lock().unwrap().extend_from_slice(&body);
                 axum::http::StatusCode::OK
             }
         }),
@@ -1055,6 +1156,58 @@ async fn metrics_are_exported_to_the_configured_collector() {
         request_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
         "no metrics payload reached the collector"
     );
-    assert!(byte_total.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    let exported = String::from_utf8_lossy(&bodies.lock().unwrap()).into_owned();
+    for name in [
+        "ownpg.calls",
+        "db.client.connection.count",
+        "db.client.connection.max",
+        "db.client.connection.pending_requests",
+        "db.client.connection.pool.name",
+    ] {
+        assert!(exported.contains(name), "{name} was not exported");
+    }
     collector.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_recovers_after_the_database_drops_every_connection() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app")
+        .await
+        .unwrap();
+    let remote = remote(&scratch, None, &[]).await;
+    let ready = |remote: &HttpRig| {
+        remote
+            .client
+            .get(format!("{}/healthz/ready", remote.base_url))
+            .send()
+    };
+    assert_eq!(ready(&remote).await.unwrap().status(), 200);
+    let watcher = scratch.client().await;
+    let terminated: i64 = watcher
+        .query_one(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+            &[&scratch.database],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(terminated >= 1, "{terminated}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(ready(&remote).await.unwrap().status(), 200);
+    let reopened: i64 = watcher
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+            &[&scratch.database],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(reopened >= 2, "{reopened}");
+    remote.finish().await;
 }

@@ -13,7 +13,7 @@ const ACTIVITY_DESCRIPTION: &str = "List client backends from pg_stat_activity: 
 
 const LOCKS_DESCRIPTION: &str = "List lock waits and the blocking chain behind them: for every backend waiting on a lock, the pids blocking it (pg_blocking_pids), the lock type, the relation, the mode, how long it has waited, and the statements on both sides. Sorted by wait duration, longest first, then pid.";
 
-const REPLICATION_DESCRIPTION: &str = "Report replication: whether this server is in recovery, the connected standbys from pg_stat_replication with their state, sync state, and lag in bytes, and the replication slots with their type, activity, and retained WAL. Sorted by client name, then slot name.";
+const REPLICATION_DESCRIPTION: &str = "Report replication: whether this server is in recovery, the connected standbys from pg_stat_replication with their state, sync state, and lag in bytes, the replication slots with their type, activity, and retained WAL, and this database's publications with the actions they publish (state) and what they cover (detail): all tables, whole schemas, and the tables in the scoped schema with their column lists and row filters. Rows are sorted by kind, then name.";
 
 const WAL_DESCRIPTION: &str = "Report WAL and checkpoint activity: the current WAL position, wal records, full page images, and bytes from pg_stat_wal, checkpoint counts and timing from pg_stat_checkpointer (PostgreSQL 17 and later) or pg_stat_bgwriter, and I/O totals from pg_stat_io (PostgreSQL 16 and later). One row per source, sorted by source.";
 
@@ -79,9 +79,33 @@ fn activity_sql(args: &ActivityArgs) -> String {
     )
 }
 
+const LITERAL_MASKS: [(&str, &str); 5] = [
+    (r"\$(\w*?)\$.*?\$\1\$", "g"),
+    (r"\m[eE]'(?:[^'\\]|\\.|'')*'|'(?:[^']|'')*'", "g"),
+    (r"\$([A-Za-z_]\w*)?\$.*$", ""),
+    (r"'.*$", ""),
+    (
+        r"(?<![\w$.])(?:0[xXoObB][0-9A-Fa-f_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][-+]?\d+)?|\.\d[\d_]*(?:[eE][-+]?\d+)?)",
+        "g",
+    ),
+];
+
+fn masked_literals_sql(column: &str) -> String {
+    LITERAL_MASKS
+        .iter()
+        .fold(column.to_owned(), |inner, (pattern, flags)| {
+            format!(
+                "regexp_replace({inner}, {}, '?', {})",
+                quote_literal(pattern),
+                quote_literal(flags)
+            )
+        })
+}
+
 fn redacted_query_sql(column: &str, cap: usize) -> String {
     format!(
-        "(CASE WHEN {column} ~* 'password|passwd|secret|credential' THEN 'a credential-bearing statement is withheld here' ELSE left({column}, {cap}) END)"
+        "(CASE WHEN {column} ~* 'password|passwd|secret|credential' THEN 'a credential-bearing statement is withheld here' ELSE left({}, {cap}) END)",
+        masked_literals_sql(column)
     )
 }
 
@@ -106,7 +130,7 @@ fn locks_sql() -> String {
     format!(
         "SELECT a.pid, pg_catalog.pg_blocking_pids(a.pid)::text AS blocked_by, l.locktype, \
                    l.relation::regclass::text AS relation, l.mode, \
-                   EXTRACT(EPOCH FROM (now() - a.query_start))::int8 AS waiting_seconds, \
+                   EXTRACT(EPOCH FROM (now() - COALESCE(l.waitstart, a.state_change, a.query_start)))::int8 AS waiting_seconds, \
                    {} AS query, \
                    (SELECT string_agg({}, ' | ') FROM pg_catalog.pg_stat_activity b \
                     WHERE b.pid = ANY(pg_catalog.pg_blocking_pids(a.pid))) AS blocking_queries \
@@ -128,18 +152,62 @@ const REPLICATION_SQL: &str = "SELECT 'server' AS kind, 'in_recovery' AS name, p
                    NULL::text AS detail \
                    UNION ALL \
                    SELECT 'standby', COALESCE(client_addr::text, application_name), state, sync_state, \
-                   pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_current_wal_lsn(), replay_lsn)::int8, \
+                   CASE WHEN pg_catalog.pg_is_in_recovery() THEN pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_last_wal_replay_lsn(), replay_lsn) ELSE pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_current_wal_lsn(), replay_lsn) END::int8, \
                    'write lag ' || COALESCE(write_lag::text, '-') || ', flush lag ' || COALESCE(flush_lag::text, '-') || ', replay lag ' || COALESCE(replay_lag::text, '-') \
                    FROM pg_catalog.pg_stat_replication \
                    UNION ALL \
                    SELECT 'slot', slot_name::text, CASE WHEN active THEN 'active' ELSE 'inactive' END, slot_type::text, \
-                   CASE WHEN pg_catalog.pg_is_in_recovery() THEN NULL ELSE pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_current_wal_lsn(), restart_lsn)::int8 END, \
+                   CASE WHEN pg_catalog.pg_is_in_recovery() THEN pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_last_wal_replay_lsn(), restart_lsn)::int8 ELSE pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_current_wal_lsn(), restart_lsn)::int8 END, \
                    COALESCE(plugin::text, '') || CASE WHEN database IS NULL THEN '' ELSE ' database ' || database::text END \
-                   FROM pg_catalog.pg_replication_slots \
-                   ORDER BY 1, 2";
+                   FROM pg_catalog.pg_replication_slots";
+
+fn publications_sql(features: crate::engine::Features, scoped: &str) -> String {
+    let scoped = quote_literal(scoped);
+    let (columns, filter, schemas) = if features.supports_publication_filters() {
+        (
+            "COALESCE(' (' || (SELECT pg_catalog.string_agg(pg_catalog.quote_ident(a.attname), ', ' ORDER BY a.attnum) \
+             FROM pg_catalog.pg_attribute a WHERE a.attrelid = pr.prrelid AND a.attnum = ANY(pr.prattrs::int2[])) || ')', '')",
+            "COALESCE(' where ' || pg_catalog.pg_get_expr(pr.prqual, pr.prrelid), '')",
+            "(SELECT pg_catalog.string_agg('schema ' || pg_catalog.quote_ident(n.nspname), '; ' ORDER BY n.nspname) \
+             FROM pg_catalog.pg_publication_namespace pn JOIN pg_catalog.pg_namespace n ON n.oid = pn.pnnspid WHERE pn.pnpubid = p.oid)",
+        )
+    } else {
+        ("''", "''", "NULL::text")
+    };
+    let generated = if features.supports_publication_generated_columns() {
+        "CASE p.pubgencols WHEN 's' THEN 'stored generated columns' END"
+    } else {
+        "NULL::text"
+    };
+    format!(
+        "SELECT 'publication', p.pubname::text, \
+         pg_catalog.concat_ws(', ', CASE WHEN p.pubinsert THEN 'insert' END, CASE WHEN p.pubupdate THEN 'update' END, \
+         CASE WHEN p.pubdelete THEN 'delete' END, CASE WHEN p.pubtruncate THEN 'truncate' END), NULL::text, NULL::int8, \
+         pg_catalog.concat_ws('; ', CASE WHEN p.puballtables THEN 'all tables' END, {schemas}, \
+         (SELECT pg_catalog.string_agg(pg_catalog.format('%I.%I', n.nspname, c.relname) || {columns} || {filter}, '; ' ORDER BY n.nspname, c.relname) \
+          FROM pg_catalog.pg_publication_rel pr JOIN pg_catalog.pg_class c ON c.oid = pr.prrelid \
+          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE pr.prpubid = p.oid AND n.nspname = {scoped}), \
+         (SELECT count(*) || CASE WHEN count(*) = 1 THEN ' more table' ELSE ' more tables' END || ' outside the scoped schema' \
+          FROM pg_catalog.pg_publication_rel pr \
+          JOIN pg_catalog.pg_class c ON c.oid = pr.prrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+          WHERE pr.prpubid = p.oid AND n.nspname <> {scoped} HAVING count(*) > 0), \
+         CASE WHEN p.pubviaroot THEN 'via the partition root' END, {generated}) \
+         FROM pg_catalog.pg_publication p"
+    )
+}
+
+fn replication_sql(features: crate::engine::Features, scoped: &str) -> String {
+    format!(
+        "{REPLICATION_SQL} UNION ALL {} ORDER BY 1, 2",
+        publications_sql(features, scoped)
+    )
+}
 
 pub fn replication(call: Call, _args: super::health::NoArgs) -> BoxFuture<'static, Outcome> {
-    Box::pin(async move { run_catalog(&call, "replication", REPLICATION_SQL, 1_000).await })
+    Box::pin(async move {
+        let sql = replication_sql(call.engine().features(), &call.settings().schema.value);
+        run_catalog(&call, "replication", &sql, 1_000).await
+    })
 }
 
 fn wal_sql(features: crate::engine::Features) -> String {
@@ -164,7 +232,8 @@ fn wal_sql(features: crate::engine::Features) -> String {
     };
     format!(
         "SELECT * FROM ( \
-             SELECT 'wal' AS source, 'current lsn' AS metric, pg_catalog.pg_current_wal_lsn()::text AS value \
+             SELECT 'wal' AS source, CASE WHEN pg_catalog.pg_is_in_recovery() THEN 'replayed lsn' ELSE 'current lsn' END AS metric, \
+             (CASE WHEN pg_catalog.pg_is_in_recovery() THEN pg_catalog.pg_last_wal_replay_lsn() ELSE pg_catalog.pg_current_wal_lsn() END)::text AS value \
              UNION ALL SELECT 'wal', 'records', wal_records::text FROM pg_catalog.pg_stat_wal \
              UNION ALL SELECT 'wal', 'full page images', wal_fpi::text FROM pg_catalog.pg_stat_wal \
              UNION ALL SELECT 'wal', 'bytes', wal_bytes::text FROM pg_catalog.pg_stat_wal \
@@ -181,8 +250,13 @@ pub fn wal(call: Call, _args: super::health::NoArgs) -> BoxFuture<'static, Outco
     })
 }
 
-pub(crate) fn indexes_health_sql(schema: &str) -> String {
+pub(crate) fn indexes_health_sql(schema: &str, features: crate::engine::Features) -> String {
     let scoped = quote_literal(schema);
+    let same_nulls = if features.supports_nulls_not_distinct() {
+        " AND y.indnullsnotdistinct = x.indnullsnotdistinct"
+    } else {
+        ""
+    };
     format!(
         "SELECT * FROM ( \
              SELECT 'invalid' AS problem, c.relname::text AS table_name, i.relname::text AS index_name, \
@@ -196,10 +270,14 @@ pub(crate) fn indexes_health_sql(schema: &str) -> String {
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_catalog.pg_index y ON y.indrelid = x.indrelid AND y.indexrelid <> x.indexrelid \
                AND y.indkey::text = x.indkey::text AND y.indclass::text = x.indclass::text \
+               AND y.indcollation::text = x.indcollation::text AND i.relam = (SELECT relam FROM pg_catalog.pg_class WHERE oid = y.indexrelid){same_nulls} \
                AND COALESCE(pg_catalog.pg_get_expr(y.indpred, y.indrelid), '') = COALESCE(pg_catalog.pg_get_expr(x.indpred, x.indrelid), '') \
                AND COALESCE(pg_catalog.pg_get_expr(y.indexprs, y.indrelid), '') = COALESCE(pg_catalog.pg_get_expr(x.indexprs, x.indrelid), '') \
              JOIN pg_catalog.pg_class o ON o.oid = y.indexrelid \
-             WHERE n.nspname = {scoped} AND NOT x.indisprimary AND i.relname > o.relname \
+             WHERE n.nspname = {scoped} AND NOT x.indisprimary \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conindid = x.indexrelid) \
+               AND (y.indisprimary OR EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k WHERE k.conindid = y.indexrelid) \
+                 OR (y.indisunique AND NOT x.indisunique) OR (y.indisunique = x.indisunique AND i.relname > o.relname)) \
              GROUP BY c.relname, i.relname, i.oid \
              UNION ALL \
              SELECT 'unused', c.relname::text, i.relname::text, pg_catalog.pg_relation_size(i.oid)::int8, \
@@ -213,7 +291,7 @@ pub(crate) fn indexes_health_sql(schema: &str) -> String {
 
 pub fn indexes_health(call: Call, _args: super::health::NoArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
-        let sql = indexes_health_sql(&call.settings().schema.value);
+        let sql = indexes_health_sql(&call.settings().schema.value, call.engine().features());
         run_catalog(&call, "indexes_health", &sql, 1_000).await
     })
 }
@@ -276,8 +354,8 @@ fn exact_bloat_sql(extension_schema: &str, table: &crate::render::QualifiedName)
              FROM {extension}.pgstattuple({relation}::regclass) \
              UNION ALL \
              SELECT 'index', i.relname::text, s.index_size::int8, \
-             (s.leaf_pages * pg_catalog.current_setting('block_size')::int8 * (100 - s.avg_leaf_density) / 100)::int8, \
-             round((100 - s.avg_leaf_density)::numeric, 1), false \
+             CASE WHEN s.avg_leaf_density = 'NaN' THEN 0 ELSE (s.leaf_pages * pg_catalog.current_setting('block_size')::int8 * (100 - s.avg_leaf_density) / 100)::int8 END, \
+             CASE WHEN s.avg_leaf_density = 'NaN' THEN NULL ELSE round((100 - s.avg_leaf_density)::numeric, 1) END, s.avg_leaf_density = 'NaN' \
              FROM pg_catalog.pg_index x JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid \
              JOIN pg_catalog.pg_am am ON am.oid = i.relam \
              CROSS JOIN LATERAL {extension}.pgstatindex(i.oid::regclass) AS s \
@@ -361,7 +439,7 @@ pub(crate) fn bloat_sql(schema: &str) -> String {
                      LEFT JOIN pg_catalog.pg_attribute a2 ON ic.indkey[ic.attpos] = 0 AND a2.attrelid = ic.idxoid AND a2.attnum = ic.attpos \
                    ) i \
                    JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace \
-                   JOIN pg_catalog.pg_stats s ON s.schemaname = n.nspname AND s.tablename = i.attrelname AND s.attname = i.attname \
+                   JOIN pg_catalog.pg_stats s ON s.schemaname = n.nspname AND s.tablename = i.attrelname AND s.attname = i.attname AND NOT s.inherited \
                    WHERE n.nspname = {scoped} \
                    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8 \
                  ) AS rows_data_stats \
@@ -448,6 +526,26 @@ pub struct TopQueriesArgs {
     pub row_cap: u32,
 }
 
+fn top_queries_sql(extension_schema: &str, order_by: TopQueriesOrder) -> String {
+    let order = match order_by {
+        TopQueriesOrder::TotalTime => "total_exec_time_ms DESC NULLS LAST",
+        TopQueriesOrder::MeanTime => "mean_exec_time_ms DESC NULLS LAST",
+        TopQueriesOrder::Calls => "calls DESC",
+        TopQueriesOrder::Rows => "rows DESC",
+    };
+    format!(
+        "SELECT queryid::text, sum(calls)::int8 AS calls, round(sum(total_exec_time)::numeric, 2) AS total_exec_time_ms, \
+         round((sum(total_exec_time) / NULLIF(sum(calls), 0))::numeric, 3) AS mean_exec_time_ms, sum(rows)::int8 AS rows, \
+         sum(shared_blks_hit)::int8 AS shared_blks_hit, sum(shared_blks_read)::int8 AS shared_blks_read, \
+         min({}) AS query \
+         FROM {}.pg_stat_statements WHERE dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()) \
+         GROUP BY queryid \
+         ORDER BY {order}, queryid",
+        redacted_query_sql("query", 500),
+        crate::render::quote_ident(extension_schema)
+    )
+}
+
 pub fn top_queries(call: Call, args: TopQueriesArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let (extension_schema, installed) =
@@ -460,21 +558,7 @@ pub fn top_queries(call: Call, args: TopQueriesArgs) -> BoxFuture<'static, Outco
             }
             .into());
         }
-        let order = match args.order_by {
-            TopQueriesOrder::TotalTime => "total_exec_time DESC",
-            TopQueriesOrder::MeanTime => "mean_exec_time DESC",
-            TopQueriesOrder::Calls => "calls DESC",
-            TopQueriesOrder::Rows => "rows DESC",
-        };
-        let sql = format!(
-            "SELECT queryid::text, calls, round(total_exec_time::numeric, 2) AS total_exec_time_ms, \
-             round(mean_exec_time::numeric, 3) AS mean_exec_time_ms, rows, shared_blks_hit, shared_blks_read, \
-             {} AS query \
-             FROM {}.pg_stat_statements WHERE dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()) \
-             ORDER BY {order}, queryid",
-            redacted_query_sql("query", 500),
-            crate::render::quote_ident(&extension_schema)
-        );
+        let sql = top_queries_sql(&extension_schema, args.order_by);
         let mut classification = verify(&sql, &["SelectStmt"])?;
         classification.relations.clear();
         let mut facts = facts_for(&classification);
@@ -574,8 +658,11 @@ mod tests {
             old,
             new,
             locks_sql(),
-            REPLICATION_SQL.to_owned(),
-            indexes_health_sql("app"),
+            replication_sql(crate::engine::Features::from_version(140_000), "app"),
+            replication_sql(crate::engine::Features::from_version(180_000), "it's"),
+            top_queries_sql("public", TopQueriesOrder::MeanTime),
+            indexes_health_sql("app", crate::engine::Features::from_version(140_000)),
+            indexes_health_sql("app", crate::engine::Features::from_version(180_000)),
             bloat_sql("app"),
         ] {
             let parsed = verify(&statement, &["SelectStmt"]).unwrap();
@@ -602,5 +689,56 @@ mod tests {
         );
         let queries = redacted_query_sql("query", 500);
         assert!(queries.contains("a credential-bearing statement is withheld here"));
+    }
+
+    #[tokio::test]
+    async fn literals_are_masked_in_live_query_text_before_it_is_cut() {
+        let Some(dsn) = std::env::var("OWNPG_TEST_DSN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let cases = [
+            (
+                "SELECT * FROM t WHERE email = 'alice@example.com' AND id = 42",
+                "SELECT * FROM t WHERE email = ? AND id = ?",
+            ),
+            (
+                "UPDATE t SET note = 'it''s' WHERE code = E'a\\'b' AND flag = B'101'",
+                "UPDATE t SET note = ? WHERE code = ? AND flag = B?",
+            ),
+            (
+                "SELECT $$sec'ret$$, $tag$x $$ y$tag$, 'cost $$'",
+                "SELECT ?, ?, ?",
+            ),
+            (
+                "SELECT * FROM t WHERE token = 'abc-cut-by-the-server",
+                "SELECT * FROM t WHERE token = ?",
+            ),
+            (
+                "SELECT * FROM t WHERE body = $body$cut by the server",
+                "SELECT * FROM t WHERE body = ?",
+            ),
+            (
+                "SELECT * FROM t1 WHERE a = $1 AND b = 0x1F AND c = 1_000.5e3 AND d = .5 LIMIT 10",
+                "SELECT * FROM t1 WHERE a = $1 AND b = ? AND c = ? AND d = ? LIMIT ?",
+            ),
+        ];
+        for (input, expected) in cases {
+            let masked: String = client
+                .query_one(
+                    &format!("SELECT {}", masked_literals_sql("$1::text")),
+                    &[&input],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(masked, expected, "{input}");
+        }
     }
 }

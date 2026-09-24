@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8765";
 pub const DEFAULT_BODY_CAP: usize = 1024 * 1024;
-pub const DEFAULT_RATE_LIMIT: u32 = u32::MAX;
+pub const DEFAULT_RATE_LIMIT: u32 = 300;
 pub const DEFAULT_SHUTDOWN: Duration = Duration::from_secs(10);
 pub const DEFAULT_POOL_SIZE: u32 = 4;
 pub const MAX_POOL_SIZE: u32 = 64;
@@ -290,25 +290,17 @@ fn env_bool(env: &Environment, name: &str) -> Result<Option<bool>> {
     }
 }
 
-pub fn resolve_http(
-    flags: &HttpFlags,
+pub(crate) fn pick_bind(
+    flag: Option<&str>,
     env: &Environment,
-    profile: Option<&HttpEntry>,
-    mode: Mode,
-) -> Result<HttpSettings> {
-    let entry = profile.cloned().unwrap_or_default();
-    let bind = pick(
-        flags
-            .bind
-            .as_deref()
-            .map(|text| parse_bind("bind", text))
-            .transpose()?,
+    profile: Option<&str>,
+) -> Result<Resolved<SocketAddr>> {
+    Ok(pick(
+        flag.map(|text| parse_bind("bind", text)).transpose()?,
         env.var("OWNPG_BIND")
             .map(|text| parse_bind("OWNPG_BIND", text))
             .transpose()?,
-        entry
-            .bind
-            .as_deref()
+        profile
             .map(|text| parse_bind("http.bind", text))
             .transpose()?,
     )
@@ -318,7 +310,17 @@ pub fn resolve_http(
                 .parse()
                 .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 8765))),
         )
-    });
+    }))
+}
+
+pub fn resolve_http(
+    flags: &HttpFlags,
+    env: &Environment,
+    profile: Option<&HttpEntry>,
+    mode: Mode,
+) -> Result<HttpSettings> {
+    let entry = profile.cloned().unwrap_or_default();
+    let bind = pick_bind(flags.bind.as_deref(), env, entry.bind.as_deref())?;
     let public_url = pick(
         None,
         env.var("OWNPG_PUBLIC_URL")
@@ -424,13 +426,6 @@ pub fn resolve_http(
         entry.rate_limit_per_minute,
     )
     .unwrap_or_else(|| Resolved::preset(DEFAULT_RATE_LIMIT));
-    if rate_limit_per_minute.value == 0 {
-        return Err(invalid(
-            "http.rate_limit_per_minute",
-            "0",
-            "the rate limit must allow at least one call per minute",
-        ));
-    }
     let older_client_sessions = pick(
         None,
         env_bool(env, "OWNPG_OLDER_CLIENT_SESSIONS")?,
@@ -559,10 +554,7 @@ pub fn resolve_http(
             )
             .unwrap_or_else(|| Resolved::preset(public_url.value.clone()));
             AuthSettings::Oauth(OauthSettings {
-                issuer: Resolved::new(
-                    issuer.value.trim().trim_end_matches('/').to_owned(),
-                    issuer.origin,
-                ),
+                issuer: Resolved::new(issuer.value.trim().to_owned(), issuer.origin),
                 jwks_url,
                 audience,
             })
@@ -839,7 +831,7 @@ mod tests {
         let AuthSettings::Oauth(oauth) = &settings.auth else {
             panic!("oauth expected");
         };
-        assert_eq!(oauth.issuer.value, "https://auth.example.com");
+        assert_eq!(oauth.issuer.value, "https://auth.example.com/");
         assert_eq!(
             oauth.jwks_url.value,
             "https://auth.example.com/.well-known/jwks.json"

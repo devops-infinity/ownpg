@@ -12,7 +12,7 @@ use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::{CancelToken, Client};
 
 use crate::config::presets::{self, FALLBACK_TCP_HOST, FALLBACK_TCP_USER};
-use crate::config::{ChannelBinding, Origin, Settings, SslMode};
+use crate::config::{ChannelBinding, Origin, Settings, SslMode, SslNegotiation};
 use crate::error::{Error, Result};
 
 pub use tls::{Tls, TlsPlan, Verification};
@@ -95,7 +95,53 @@ pub struct Session {
     pub info: SessionInfo,
     tls: Arc<Tls>,
     driver: tokio::task::JoinHandle<()>,
+    reopen: Option<Arc<ssh::Reopen>>,
     kept_alive: Vec<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+#[derive(Clone)]
+pub struct Canceller {
+    token: CancelToken,
+    tls: Arc<Tls>,
+    reopen: Option<Arc<ssh::Reopen>>,
+    target: String,
+}
+
+impl fmt::Debug for Canceller {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Canceller")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Canceller {
+    pub async fn cancel(&self) -> Result<()> {
+        let failed = |error: tokio_postgres::Error| Error::ProtocolFailed {
+            detail: format!("the cancel request failed: {error}"),
+        };
+        let Some(reopen) = &self.reopen else {
+            return self
+                .token
+                .cancel_query(self.tls.connector.clone())
+                .await
+                .map_err(failed);
+        };
+        let stream = reopen.open(LIVENESS_TIMEOUT).await?;
+        let mut make = self.tls.connector.clone();
+        let connect = <tokio_postgres_rustls::MakeRustlsConnect as MakeTlsConnect<
+            TunnelStream,
+        >>::make_tls_connect(&mut make, reopen.target_host())
+        .map_err(|error| Error::TlsFailed {
+            target: self.target.clone(),
+            detail: error.to_string(),
+            source: None,
+        })?;
+        self.token
+            .cancel_query_raw(stream, connect)
+            .await
+            .map_err(failed)
+    }
 }
 
 impl fmt::Debug for Session {
@@ -125,13 +171,68 @@ impl Session {
         )
     }
 
+    pub async fn ready_for_reuse(&self) -> bool {
+        if self.client.is_closed() {
+            return false;
+        }
+        let probe = tokio::time::timeout(
+            LIVENESS_TIMEOUT,
+            self.client.simple_query(
+                "SELECT now() <> statement_timestamp(), EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE relnamespace = pg_catalog.pg_my_temp_schema())",
+            ),
+        )
+        .await;
+        let (open_block, temporary) = match probe {
+            Ok(Ok(messages)) => messages
+                .iter()
+                .find_map(|message| match message {
+                    tokio_postgres::SimpleQueryMessage::Row(row) => {
+                        Some((row.get(0) == Some("t"), row.get(1) == Some("t")))
+                    }
+                    _ => None,
+                })
+                .unwrap_or((false, false)),
+            Ok(Err(error))
+                if error.code()
+                    == Some(&tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION) =>
+            {
+                (true, true)
+            }
+            Ok(Err(_)) | Err(_) => return false,
+        };
+        let mut reset = Vec::new();
+        if open_block {
+            tracing::warn!(target = %self.info.target, "a pooled connection came back inside an open transaction; it is rolled back before reuse");
+            reset.push("ROLLBACK");
+        }
+        if temporary {
+            reset.push("DISCARD TEMP");
+        }
+        if reset.is_empty() {
+            return true;
+        }
+        matches!(
+            tokio::time::timeout(
+                LIVENESS_TIMEOUT,
+                self.client.batch_execute(&reset.join("; "))
+            )
+            .await,
+            Ok(Ok(()))
+        )
+    }
+
+    #[must_use]
+    pub fn canceller(&self) -> Canceller {
+        Canceller {
+            token: self.cancel.clone(),
+            tls: Arc::clone(&self.tls),
+            reopen: self.reopen.clone(),
+            target: self.info.target.clone(),
+        }
+    }
+
     pub async fn cancel_running_statement(&self) -> Result<()> {
-        self.cancel
-            .cancel_query(self.tls.connector.clone())
-            .await
-            .map_err(|error| Error::ProtocolFailed {
-                detail: format!("the cancel request failed: {error}"),
-            })
+        self.canceller().cancel().await
     }
 }
 
@@ -309,6 +410,26 @@ impl Connector {
         candidate: &Candidate,
         ssl_mode: SslMode,
     ) -> tokio_postgres::Config {
+        self.base_config(candidate, ssl_mode, true)
+    }
+
+    #[must_use]
+    pub fn admin_console_config(
+        &self,
+        candidate: &Candidate,
+        database: &str,
+    ) -> tokio_postgres::Config {
+        let mut config = self.base_config(candidate, self.settings.connection.sslmode.value, false);
+        config.dbname(database);
+        config
+    }
+
+    fn base_config(
+        &self,
+        candidate: &Candidate,
+        ssl_mode: SslMode,
+        session_options: bool,
+    ) -> tokio_postgres::Config {
         let settings = &self.settings;
         let connection = &settings.connection;
         let mut config = tokio_postgres::Config::new();
@@ -338,13 +459,22 @@ impl Connector {
         }
         config.user(&candidate.user);
         config.dbname(&settings.database.value);
-        if let Some(password) = &connection.password {
+        let password = if candidate.user == connection.user.value {
+            connection.password.as_ref()
+        } else {
+            connection.fallback_password.as_ref()
+        };
+        if let Some(password) = password {
             config.password(password.value.expose());
         }
         config.channel_binding(match connection.channel_binding.value {
             ChannelBinding::Disable => tokio_postgres::config::ChannelBinding::Disable,
             ChannelBinding::Prefer => tokio_postgres::config::ChannelBinding::Prefer,
             ChannelBinding::Require => tokio_postgres::config::ChannelBinding::Require,
+        });
+        config.ssl_negotiation(match connection.ssl_negotiation.value {
+            SslNegotiation::Postgres => tokio_postgres::config::SslNegotiation::Postgres,
+            SslNegotiation::Direct => tokio_postgres::config::SslNegotiation::Direct,
         });
         config.connect_timeout(connection.connect_timeout.value);
         config.application_name(&connection.application_name.value);
@@ -355,14 +485,14 @@ impl Connector {
         #[cfg(target_os = "linux")]
         config.tcp_user_timeout(connection.connect_timeout.value);
         let mut options = Vec::new();
-        if settings.connection.pooled.value != Some(true) {
+        if session_options && settings.connection.pooled.value != Some(true) {
             options.extend(
                 session_settings(settings, None)
                     .into_iter()
                     .map(|(name, value)| format!("-c {name}={value}")),
             );
         }
-        if let Some(extra) = &connection.options {
+        if let Some(extra) = connection.options.as_ref().filter(|_| session_options) {
             options.push(extra.value.clone());
         }
         if !options.is_empty() {
@@ -496,9 +626,10 @@ impl Connector {
             });
         };
         let tunnel = ssh::open(ssh, &target_host, target_port, &self.ssh_hints).await?;
-        let (stream, route, kept_alive) = tunnel.into_parts();
+        let (stream, route, reopen, kept_alive) = tunnel.into_parts();
         let target_name = format!("{target_host}:{target_port} via {}", route.join(" -> "));
         let mut session = self.connect_over(stream, &target_name, Via::Ssh).await?;
+        session.reopen = Some(Arc::new(reopen));
         session.kept_alive = kept_alive;
         Ok(session)
     }
@@ -632,6 +763,7 @@ impl Connector {
             },
             tls: Arc::clone(tls),
             driver,
+            reopen: None,
             kept_alive: Vec::new(),
         })
     }
@@ -654,7 +786,7 @@ pub fn session_settings(
         ),
         (
             "idle_in_transaction_session_timeout",
-            crate::engine::expiry_headroom(limits.handle_expiry.value)
+            crate::config::expiry_headroom(limits.handle_expiry.value)
                 .as_millis()
                 .to_string(),
         ),
@@ -726,11 +858,7 @@ mod tests {
 
     fn settings_for(flags: FlagLayer, env: &Environment) -> Settings {
         let dir = tempfile::tempdir().unwrap();
-        let paths = crate::config::AppPaths::from_base(
-            dir.path().join("c"),
-            dir.path().join("d"),
-            dir.path().join("k"),
-        );
+        let paths = crate::config::AppPaths::from_base(dir.path().join("c"), dir.path().join("d"));
         resolve(
             flags,
             Sources {

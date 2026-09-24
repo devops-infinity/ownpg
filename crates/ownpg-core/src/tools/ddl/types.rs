@@ -478,6 +478,14 @@ pub struct AvailableExtension {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ExtensionOutput {
+    Available(AvailableExtensions),
+    Rows(ResultSet),
+    DryRun(crate::tools::write::DryRun),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct AvailableExtensions {
     pub rows: Vec<AvailableExtension>,
     pub row_count: usize,
@@ -770,13 +778,21 @@ pub fn comment(call: Call, args: CommentArgs) -> BoxFuture<'static, Outcome> {
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<TypeArgs, ResultSet, _>(&tool_specs::PG_TYPE, TYPE_DESCRIPTION, type_tool)?,
-        route::<ExtensionArgs, ResultSet, _>(
+        route::<TypeArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_TYPE,
+            TYPE_DESCRIPTION,
+            type_tool,
+        )?,
+        route::<ExtensionArgs, ExtensionOutput, _>(
             &tool_specs::PG_EXTENSION,
             EXTENSION_DESCRIPTION,
             extension,
         )?,
-        route::<CommentArgs, ResultSet, _>(&tool_specs::PG_COMMENT, COMMENT_DESCRIPTION, comment)?,
+        route::<CommentArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_COMMENT,
+            COMMENT_DESCRIPTION,
+            comment,
+        )?,
     ])
 }
 

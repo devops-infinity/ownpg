@@ -12,10 +12,10 @@ pub struct Limiter {
 impl Limiter {
     #[must_use]
     pub fn new(calls_per_minute: u32) -> Self {
-        let burst = NonZeroU32::new(calls_per_minute.max(1)).unwrap_or(NonZeroU32::MIN);
+        let burst = NonZeroU32::new(calls_per_minute).unwrap_or(NonZeroU32::MAX);
         Self {
             limiter: DefaultKeyedRateLimiter::keyed(Quota::per_minute(burst)),
-            calls_per_minute: calls_per_minute.max(1),
+            calls_per_minute,
         }
     }
 
@@ -60,5 +60,14 @@ mod tests {
         let wait = limiter.check("a").unwrap_err();
         assert!(wait > Duration::ZERO && wait <= Duration::from_secs(1));
         assert!(limiter.check("b").is_ok());
+    }
+
+    #[test]
+    fn zero_turns_the_limit_off() {
+        let limiter = Limiter::new(0);
+        for _ in 0..10_000 {
+            assert!(limiter.check("a").is_ok());
+        }
+        assert_eq!(limiter.calls_per_minute(), 0);
     }
 }

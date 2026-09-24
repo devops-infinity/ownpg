@@ -7,7 +7,6 @@ use crate::error::{Error, Result};
 use crate::render::{
     expression, quote_ident, quote_literal, returns_type, type_name, validate_ident,
 };
-use crate::shape::ResultSet;
 use crate::tool_specs;
 use crate::tools::{Call, Outcome, Route, route};
 
@@ -245,6 +244,26 @@ fn config_clauses(field: &str, settings: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn definer_search_path(schema: &str, set_config: &[String]) -> Result<String> {
+    let overrides_path = set_config.iter().any(|setting| {
+        setting
+            .split_once('=')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("search_path"))
+    });
+    if overrides_path {
+        return Err(Error::ArgumentInvalid {
+            argument: "set_config".to_owned(),
+            detail: format!(
+                "a SECURITY DEFINER routine keeps the pinned search_path `{schema}, pg_temp`, so a caller cannot shadow the objects it uses; remove search_path from set_config"
+            ),
+        });
+    }
+    Ok(format!(
+        "SET search_path = {}, pg_temp",
+        quote_ident(schema)
+    ))
+}
+
 pub fn routine(call: Call, args: RoutineArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let name = scoped_name(&call, "name", &args.name)?;
@@ -304,10 +323,7 @@ pub fn routine(call: Call, args: RoutineArgs) -> BoxFuture<'static, Outcome> {
                     sql.push_str(" SECURITY DEFINER");
                     settings.insert(
                         0,
-                        format!(
-                            "SET search_path = {}, pg_temp",
-                            quote_ident(&call.settings().schema.value)
-                        ),
+                        definer_search_path(&call.settings().schema.value, &args.set_config)?,
                     );
                 }
                 for setting in settings {
@@ -357,6 +373,12 @@ pub fn routine(call: Call, args: RoutineArgs) -> BoxFuture<'static, Outcome> {
                     clauses.push(format!("ROWS {rows}"));
                 }
                 clauses.extend(config_clauses("set_config", &args.set_config)?);
+                if args.security_definer == Toggle::On {
+                    clauses.push(definer_search_path(
+                        &call.settings().schema.value,
+                        &args.set_config,
+                    )?);
+                }
                 if !args.owner.trim().is_empty() {
                     validate_ident("owner", args.owner.trim())?;
                     if !clauses.is_empty() {
@@ -718,8 +740,16 @@ pub fn trigger(call: Call, args: TriggerArgs) -> BoxFuture<'static, Outcome> {
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<RoutineArgs, ResultSet, _>(&tool_specs::PG_ROUTINE, ROUTINE_DESCRIPTION, routine)?,
-        route::<TriggerArgs, ResultSet, _>(&tool_specs::PG_TRIGGER, TRIGGER_DESCRIPTION, trigger)?,
+        route::<RoutineArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_ROUTINE,
+            ROUTINE_DESCRIPTION,
+            routine,
+        )?,
+        route::<TriggerArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_TRIGGER,
+            TRIGGER_DESCRIPTION,
+            trigger,
+        )?,
     ])
 }
 
@@ -751,6 +781,21 @@ mod tests {
         assert!(config_clauses("set_config", &["nonsense".to_owned()]).is_err());
         let quoted = config_clauses("set_config", &["x = 1; DROP TABLE t".to_owned()]).unwrap();
         assert_eq!(quoted[0], "SET \"x\" = '1; DROP TABLE t'");
+    }
+
+    #[test]
+    fn a_security_definer_routine_pins_its_search_path() {
+        assert_eq!(
+            definer_search_path("App", &["work_mem = 64MB".to_owned()]).unwrap(),
+            "SET search_path = \"App\", pg_temp"
+        );
+        for set_config in [
+            ["search_path = app".to_owned()],
+            ["SEARCH_PATH=public".to_owned()],
+        ] {
+            let error = definer_search_path("app", &set_config).unwrap_err();
+            assert!(error.to_string().contains("search_path"), "{error}");
+        }
     }
 
     #[test]

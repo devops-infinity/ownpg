@@ -2,8 +2,9 @@
 set -Eeuo pipefail
 
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
 source "$REPO/tools/lib.sh"
+require_bash 4.4 "$REPO/tools/release.sh" "$@"
+shopt -s inherit_errexit
 LIB_CRATE="ownpg-core"
 BIN_CRATE="ownpg"
 ROOT_MANIFEST="Cargo.toml"
@@ -21,9 +22,11 @@ RELEASE_URL_BASE="https://github.com/devops-infinity/ownpg-releases/releases/tag
 CRATES_API="https://crates.io/api/v1/crates"
 USER_AGENT="ownpg-release-script (+https://github.com/devops-infinity/ownpg-releases)"
 MINISIGN_KEY="${OWNPG_MINISIGN_KEY:-$HOME/.minisign/minisign.key}"
-AUDIT_EXEMPT=" release.sh "
 PROPAGATE_TRIES=30
 PROPAGATE_WAIT=10
+PROPAGATE_JITTER=5
+JQ_FLOOR="1.6"
+CURL_FLOOR="7.52.0"
 
 MODE="release"
 VERSION=""
@@ -38,6 +41,9 @@ MUTATED=0
 IRREVERSIBLE=0
 UPLOADED=0
 RESUMING=0
+RESUME_REQUESTED=0
+LIB_PUBLISHED=0
+BIN_PUBLISHED=0
 PUSHED=0
 CRATE_HTTP_STATUS=""
 CRATE_BODY_FILE=""
@@ -47,6 +53,7 @@ usage() {
 Usage: tools/release.sh --patch | --minor | --major [options]
        tools/release.sh --version X.Y.Z [options]
        tools/release.sh --dry-run --patch
+       tools/release.sh --resume --version X.Y.Z
        tools/release.sh --yank X.Y.Z | --unyank X.Y.Z
 
   --major          release the next major version, worked out from the current one
@@ -54,6 +61,10 @@ Usage: tools/release.sh --patch | --minor | --major [options]
   --patch          release the next patch version
   --version X.Y.Z  release this exact version instead of a computed one
   --dry-run        run every check and the bump, publish nothing, revert the bump
+  --resume         finish a release that stopped part way: every step that
+                   already happened (a crate on crates.io, the commit, the
+                   tag, a GitHub release, the npm version) is checked and
+                   skipped; needs --version X.Y.Z
   --yes            skip the typed confirmation, for unattended runs
   --yank X.Y.Z     yank that version from both crates, binary first
   --unyank X.Y.Z   put a yanked version back, library first
@@ -81,6 +92,8 @@ Environment:
   OWNPG_SKIP_TAP            set to 1 to leave the formula in target/distrib instead of pushing it
   OWNPG_SKIP_NPM            set to 1 to leave the npm package in target/distrib instead of publishing it
   OWNPG_ALLOW_PARTIAL       set to 1 to continue past a missing cross toolchain instead of stopping
+  OWNPG_TEST_DSN            the database tools/verify.sh runs the live tests against; see that script
+  OWNPG_SKIP_LIVE_TESTS     set to 1 to let tools/verify.sh skip the live tests when OWNPG_TEST_DSN is unset
 USAGE
 }
 
@@ -103,7 +116,8 @@ print_manual_binary_steps() {
 }
 
 print_manual_finish() {
-	say INFO "finish by hand with:"
+	say INFO "finish with: tools/release.sh --resume --version $VERSION"
+	say INFO "or by hand with:"
 	printf '  git add -- %s\n' "$(tracked_release_files | tr '\n' ' ')"
 	printf '  git commit -m "chore: release %s"\n' "$VERSION"
 	printf '  git tag %s v%s -m "OwnPG v%s"\n' "$(tag_flag)" "$VERSION" "$VERSION"
@@ -127,14 +141,15 @@ cleanup() {
 		print_manual_binary_steps
 	fi
 	if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+		rm -f -- "$WORK_DIR/windows-sign.pass"
 		if [[ $status -ne 0 ]]; then
 			say INFO "full logs kept at: $WORK_DIR"
 		else
 			rm -rf -- "$WORK_DIR"
 		fi
 	fi
-	if [[ -n "$LOCK_DIR" && -d "$LOCK_DIR" ]]; then
-		rmdir -- "$LOCK_DIR" 2>/dev/null || true
+	if [[ -n "$LOCK_DIR" ]]; then
+		release_pid_lock "$LOCK_DIR"
 	fi
 }
 
@@ -166,6 +181,17 @@ require_tools() {
 	for tool in "$@"; do
 		command -v "$tool" >/dev/null 2>&1 || die "$tool is not on PATH"
 	done
+}
+
+require_tool_version() {
+	local tool="$1" reported="$2" floor="$3" hint="$4" found=""
+	if [[ "$reported" =~ ([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
+		found="${BASH_REMATCH[1]}"
+	fi
+	[[ -n "$found" ]] || die "could not read a version number for $tool from: $reported"
+	version_at_least "$found" "$floor" ||
+		die "$tool $found is first on PATH, but this script needs $tool $floor or newer; $hint"
+	say SUCCESS "$tool $found"
 }
 
 require_credentials() {
@@ -252,8 +278,8 @@ fetch_crate() {
 	local name="$1"
 	CRATE_BODY_FILE="$WORK_DIR/crate-$name.json"
 	CRATE_HTTP_STATUS="$(curl -sS -A "$USER_AGENT" --connect-timeout 10 --max-time 30 \
-		--retry 3 --retry-delay 2 -o "$CRATE_BODY_FILE" \
-		-w '%{http_code}' "$CRATES_API/$name" 2>/dev/null || printf '000')"
+		--retry 3 --retry-delay 2 --retry-max-time 60 -o "$CRATE_BODY_FILE" \
+		-w '%{http_code}' "$CRATES_API/$name" 2>/dev/null)" || CRATE_HTTP_STATUS="000"
 }
 
 crate_has_version() {
@@ -281,123 +307,35 @@ published_already() {
 }
 
 check_registry_state() {
-	local lib_published=0 bin_published=0
-	if published_already "$LIB_CRATE"; then lib_published=1; fi
-	if published_already "$BIN_CRATE"; then bin_published=1; fi
+	if published_already "$LIB_CRATE"; then LIB_PUBLISHED=1; fi
+	if published_already "$BIN_CRATE"; then BIN_PUBLISHED=1; fi
 
-	if [[ $lib_published -eq 1 && $bin_published -eq 1 ]]; then
-		die "both crates are already on crates.io at $VERSION; a published version cannot be replaced"
-	fi
-	if [[ $bin_published -eq 1 ]]; then
+	if [[ $BIN_PUBLISHED -eq 1 && $LIB_PUBLISHED -eq 0 ]]; then
 		die "$BIN_CRATE $VERSION is on crates.io but $LIB_CRATE $VERSION is not; sort that out by hand"
 	fi
-	if [[ $lib_published -eq 1 ]]; then
+	if [[ $LIB_PUBLISHED -eq 1 ]]; then
+		[[ $RESUME_REQUESTED -eq 1 ]] ||
+			die "$VERSION is already on crates.io for $LIB_CRATE$([[ $BIN_PUBLISHED -eq 1 ]] && printf ' and %s' "$BIN_CRATE"); a published version cannot be replaced, so finish it with: tools/release.sh --resume --version $VERSION"
 		RESUMING=1
-		say WARNING "$LIB_CRATE $VERSION is already on crates.io; this run resumes a part-finished release"
+		IRREVERSIBLE=1
+		say WARNING "this run resumes a part-finished $VERSION release; steps that already happened are skipped"
 		return 0
 	fi
 	say SUCCESS "$VERSION is free on crates.io for both crates"
 }
 
-audit_files() {
-	git ls-files -- crates tools ':(top,glob)*.md' | sort -u
-}
-
-collect_scannable_files() {
-	local -n into="$1"
-	local file
-	while IFS= read -r file; do
-		[[ -f "$file" ]] || continue
-		[[ "$REPO/$file" != "$SELF" ]] || continue
-		grep -Iq . "$file" || continue
-		into+=("$file")
-	done < <(audit_files)
-}
-
-audit_scan() {
-	local -a files=()
-	collect_scannable_files files
-	[[ ${#files[@]} -gt 0 ]] || die "the house-rule audit found no files to scan"
-
-	awk -v exempt="$AUDIT_EXEMPT" '
-		function leaf(path,   parts, n) {
-			n = split(path, parts, "/")
-			return parts[n]
-		}
-		FNR == 1 { states_rule = index(exempt, " " leaf(FILENAME) " ") > 0 }
-		{
-			probe = tolower($0)
-			found = ""
-			if (!states_rule) {
-				if (probe ~ /legacy/) found = "legacy"
-				else if (probe ~ /backward.compat/) found = "backward compat"
-				else if (probe ~ /inspired by/) found = "inspired by"
-				else if (probe ~ /based on/) found = "based on"
-				else if (probe ~ /ported from/) found = "ported from"
-				else if (probe ~ /fork of/) found = "fork of"
-			}
-			if (found == "") next
-			text = $0
-			sub(/^[ \t]+/, "", text)
-			if (length(text) > 100) text = substr(text, 1, 100) "..."
-			printf "  %s:%d  %s  |  %s\n", FILENAME, FNR, found, text
-		}
-	' "${files[@]}"
-}
-
-house_rule_audit() {
-	say INFO "auditing every tracked file under crates/ and tools/ plus the markdown files at the root"
-	say INFO "these carry the rule text itself and are exempt from it:$AUDIT_EXEMPT"
-	local hits
-	hits="$(audit_scan)"
-	if [[ -n "$hits" ]]; then
-		printf '%s\n' "$hits"
-		die "the house-rule audit refuses this release; clear every line above first"
-	fi
-	say SUCCESS "nothing borrowed"
-	em_dash_audit
-}
-
-em_dash_audit() {
-	local em_dash
-	em_dash="$(printf '\342\200\224')"
-	local -a files=()
-	collect_scannable_files files
-	[[ ${#files[@]} -gt 0 ]] || die "the em dash audit found no files to scan"
-
-	local hits
-	hits="$(grep -rn -- "$em_dash" "${files[@]}" 2>/dev/null || true)"
-	if [[ -n "$hits" ]]; then
-		printf '%s\n' "$hits"
-		die "an em dash reached the release artifacts; clear every line above first"
-	fi
-	say SUCCESS "zero em dashes"
-}
-
-deny_reasons() {
-	local code="$1" names=""
-	if ((code & 1)); then names="$names advisories"; fi
-	if ((code & 2)); then names="$names bans"; fi
-	if ((code & 4)); then names="$names licenses"; fi
-	if ((code & 8)); then names="$names sources"; fi
-	if [[ -z "$names" ]]; then
-		printf 'unrecognized exit %s' "$code"
-	else
-		printf '%s (exit %s)' "${names# }" "$code"
-	fi
-}
-
-check_deny() {
-	STEP="cargo deny check"
-	local log code=0
-	log="$WORK_DIR/cargo-deny.log"
-	cargo deny check >"$log" 2>&1 || code=$?
-	if [[ $code -ne 0 ]]; then
-		say INFO "last 40 lines of output:"
-		tail -n 40 "$log" >&2
-		die "cargo deny check failed: $(deny_reasons "$code")"
-	fi
-	say SUCCESS "cargo deny check"
+only_release_files_changed() {
+	local line path allowed file
+	while IFS= read -r line; do
+		[[ -n "$line" ]] || continue
+		path="${line:3}"
+		allowed=0
+		while IFS= read -r file; do
+			[[ "$path" == "$file" ]] && allowed=1
+		done < <(tracked_release_files)
+		[[ $allowed -eq 1 ]] || return 1
+	done < <(git status --porcelain)
+	return 0
 }
 
 write_attribution() {
@@ -499,6 +437,11 @@ move_changelog_section() {
 	local today program="$WORK_DIR/changelog.awk"
 	if [[ ! -f "$CHANGELOG" ]]; then
 		say WARNING "$CHANGELOG does not exist; the release notes come from the commit subjects since the previous tag"
+		return 0
+	fi
+	if grep -qF "## [$VERSION]" "$CHANGELOG"; then
+		say INFO "$CHANGELOG already has a $VERSION section"
+		add_changelog_link
 		return 0
 	fi
 	today="$(date +%F)"
@@ -789,6 +732,13 @@ publish_npm_package() {
 	fi
 	[[ -f "$package" ]] || die "$package is missing; dist did not write the npm package"
 	require_tools npm
+	local package_name
+	package_name="$(tar -xOzf "$package" package/package.json | jq -r '.name')" ||
+		die "could not read the package name from $package"
+	if [[ "$(npm view "$package_name@$VERSION" version 2>/dev/null || true)" == "$VERSION" ]]; then
+		say INFO "$package_name $VERSION is already on npm"
+		return 0
+	fi
 	npm whoami >/dev/null 2>&1 || die "npm is not logged in: run 'npm login' first"
 	run "npm publish" npm publish "$package" --access public
 	say SUCCESS "npm package published"
@@ -960,6 +910,11 @@ publish_github_release() {
 		say WARNING "GitHub release v$VERSION on $where exists but its assets do not match what was just built"
 		say INFO "  on the release: ${have_names[*]:-none}"
 		say INFO "  built here:     ${want_names[*]}"
+		if [[ $RESUME_REQUESTED -eq 1 ]]; then
+			run "gh release upload v$VERSION on $where" gh release upload "v$VERSION" "${assets[@]}" "${repo_flag[@]}" --clobber
+			say SUCCESS "GitHub release v$VERSION on $where now carries the full set built here, checksums and signature included"
+			return 0
+		fi
 		die "refusing to leave a mismatched release in place on $where; settle it with 'gh release upload v$VERSION \$(find target/distrib -maxdepth 1 -type f) ${repo_flag[*]} --clobber' or delete v$VERSION there and rerun"
 	elif ! grep -qi 'release not found\|not found' "$view_err"; then
 		say INFO "last 40 lines of output:"
@@ -973,12 +928,12 @@ publish_github_release() {
 	run "$label" gh release create "v$VERSION" "${assets[@]}" "${repo_flag[@]}" \
 		--title "OwnPG $VERSION" --notes-file "$notes"
 	local release_url
-	release_url="$(grep -oE 'https://github\.com/[^[:space:]]+/releases/tag/[^[:space:]]+' "$log" | tail -n 1)"
+	release_url="$(grep -oE 'https://github\.com/[^[:space:]]+/releases/tag/[^[:space:]]+' "$log" | tail -n 1 || true)"
 	[[ -z "$release_url" ]] || say SUCCESS "release page: $release_url"
 }
 
 wait_for_crate() {
-	local name="$1" tries=0
+	local name="$1" tries=0 started=$SECONDS
 	say INFO "waiting for $name $VERSION to show up on crates.io"
 	while [[ $tries -lt $PROPAGATE_TRIES ]]; do
 		fetch_crate "$name"
@@ -987,9 +942,9 @@ wait_for_crate() {
 			return 0
 		fi
 		tries=$((tries + 1))
-		sleep "$PROPAGATE_WAIT"
+		sleep "$((PROPAGATE_WAIT + RANDOM % PROPAGATE_JITTER))"
 	done
-	die "$name $VERSION did not appear after $((PROPAGATE_TRIES * PROPAGATE_WAIT))s; publish $BIN_CRATE by hand once it does"
+	die "$name $VERSION did not appear after $((SECONDS - started))s; publish $BIN_CRATE by hand once it does"
 }
 
 check_semver() {
@@ -1054,6 +1009,10 @@ while [[ $# -gt 0 ]]; do
 		MODE="dry-run"
 		shift
 		;;
+	--resume)
+		RESUME_REQUESTED=1
+		shift
+		;;
 	--yes)
 		ASSUME_YES=1
 		shift
@@ -1088,9 +1047,10 @@ done
 
 cd "$REPO"
 
-LOCK_DIR="$REPO/.git/release.lock"
-mkdir "$LOCK_DIR" 2>/dev/null ||
-	die "another release.sh is already running (lock held: $LOCK_DIR); remove it by hand if you are sure none is running"
+RELEASE_LOCK="$REPO/.git/release.lock"
+acquire_pid_lock "$RELEASE_LOCK" ||
+	die "another release.sh is already running (lock held: $RELEASE_LOCK, process $(cat -- "$RELEASE_LOCK/pid" 2>/dev/null || printf 'unknown')); remove it by hand only if you are sure none is running"
+LOCK_DIR="$RELEASE_LOCK"
 
 if [[ -n "$BUMP" && "$MODE" != "release" && "$MODE" != "dry-run" ]]; then
 	die "--$BUMP names a new version, so it cannot be combined with --$MODE"
@@ -1104,6 +1064,10 @@ if [[ -z "$BUMP" && -z "$VERSION" ]]; then
 fi
 if [[ -n "$VERSION" ]]; then
 	valid_version "$VERSION" || die "not a semver triple: $VERSION"
+fi
+if [[ $RESUME_REQUESTED -eq 1 ]]; then
+	[[ "$MODE" == "release" ]] || die "--resume finishes a real release, so it cannot be combined with --$MODE"
+	[[ -n "$VERSION" ]] || die "--resume needs the version being finished: --resume --version X.Y.Z"
 fi
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ownpg-release.XXXXXX")"
@@ -1124,8 +1088,16 @@ esac
 
 step "pre-flight"
 require_tools git cargo curl jq awk shasum unzip tar cargo-nextest cargo-audit cargo-deny cargo-machete cargo-about cargo-auditable cargo-cyclonedx cargo-semver-checks dist gh minisign mcpb
-[[ -z "$(git status --porcelain)" ]] || die "the working tree is not clean; commit or stash first"
-say SUCCESS "working tree is clean"
+require_tool_version jq "$(jq --version)" "$JQ_FLOOR" "install it with: brew install jq"
+require_tool_version curl "$(curl --version | awk 'NR == 1 { print $2 }')" "$CURL_FLOOR" \
+	"install it with: brew install curl, then put \$(brew --prefix curl)/bin ahead of /usr/bin on PATH"
+if [[ -z "$(git status --porcelain)" ]]; then
+	say SUCCESS "working tree is clean"
+elif [[ $RESUME_REQUESTED -eq 1 ]] && only_release_files_changed; then
+	say WARNING "the working tree carries the uncommitted version bump from the stopped run"
+else
+	die "the working tree is not clean; commit or stash first"
+fi
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [[ "$CURRENT_BRANCH" == "$BRANCH" ]] || die "on branch $CURRENT_BRANCH; a release is cut from $BRANCH"
 say SUCCESS "on $BRANCH"
@@ -1153,24 +1125,17 @@ else
 	say SUCCESS "$CURRENT_VERSION -> $VERSION"
 fi
 
-step "house-rule audit"
-house_rule_audit
-
 step "verification gate"
-run "cargo fmt --all -- --check" cargo fmt --all -- --check
-run "cargo check" cargo check --workspace --all-targets --all-features --locked --color=never
-run "cargo clippy" cargo clippy --workspace --all-targets --all-features --locked --color=never -- -D warnings
-run "cargo nextest" cargo nextest run --workspace --all-features --locked --no-tests=warn --color=never
-run "cargo test --doc" cargo test --workspace --all-features --locked --doc
-run "cargo doc" env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-run "cargo audit" cargo audit --deny warnings
-check_deny
-run "cargo machete" cargo machete
+run "tools/verify.sh" "$REPO/tools/verify.sh"
 check_semver
 write_attribution
 
 step "packaging proof"
-run "cargo publish --dry-run -p $LIB_CRATE" cargo publish --dry-run -p "$LIB_CRATE" --locked --color=never
+if [[ $LIB_PUBLISHED -eq 1 ]]; then
+	say INFO "$LIB_CRATE $VERSION is already on crates.io, so its packaging proof is skipped"
+else
+	run "cargo publish --dry-run -p $LIB_CRATE" cargo publish --dry-run -p "$LIB_CRATE" --locked --color=never
+fi
 
 step "version bump"
 snapshot_tree
@@ -1183,7 +1148,15 @@ step "changelog"
 move_changelog_section
 
 step "release-profile rebuild"
-run "./tools/reinstall.sh" ./tools/reinstall.sh
+if [[ "$MODE" == "dry-run" ]]; then
+	run "cargo build --release" cargo build --release --locked --color=never
+	DRY_RUN_PRINTED="$("${CARGO_TARGET_DIR:-$REPO/target}/release/$BIN_CRATE" --version 2>&1 || true)"
+	[[ "$DRY_RUN_PRINTED" == "$BIN_CRATE $VERSION ("* ]] ||
+		die "the release build prints '$DRY_RUN_PRINTED', expected '$BIN_CRATE $VERSION (commit ..., built ...)'"
+	say SUCCESS "the release build runs and reports $VERSION; the dry run installs nothing"
+else
+	run "./tools/reinstall.sh --skip-gate" ./tools/reinstall.sh --skip-gate
+fi
 
 if [[ "$MODE" == "dry-run" ]]; then
 	step "dist rehearsal"
@@ -1214,7 +1187,7 @@ if [[ "$MODE" == "dry-run" ]]; then
 	fi
 
 	restore_tree
-	say INFO "dry run: the bump was written to disk, built, and then reverted"
+	say INFO "dry run: the bump was written to disk, built without installing, and then reverted"
 	say INFO "$ROOT_MANIFEST, $CLI_MANIFEST, $LOCK_FILE, and $CHANGELOG are back on $CURRENT_VERSION"
 	say SUCCESS "dry run finished; nothing was published, tagged, or pushed"
 	exit 0
@@ -1234,11 +1207,19 @@ confirm "$VERSION"
 
 step "publish"
 IRREVERSIBLE=1
-publish_crate "$LIB_CRATE"
-wait_for_crate "$LIB_CRATE"
-run "packaging proof for $BIN_CRATE" cargo publish --dry-run --locked --allow-dirty -p "$BIN_CRATE"
-publish_crate "$BIN_CRATE"
-wait_for_crate "$BIN_CRATE"
+if [[ $LIB_PUBLISHED -eq 1 ]]; then
+	say INFO "$LIB_CRATE $VERSION is already on crates.io, skipping its upload"
+else
+	publish_crate "$LIB_CRATE"
+	wait_for_crate "$LIB_CRATE"
+fi
+if [[ $BIN_PUBLISHED -eq 1 ]]; then
+	say INFO "$BIN_CRATE $VERSION is already on crates.io, skipping its upload"
+else
+	run "packaging proof for $BIN_CRATE" cargo publish --dry-run --locked --allow-dirty -p "$BIN_CRATE"
+	publish_crate "$BIN_CRATE"
+	wait_for_crate "$BIN_CRATE"
+fi
 
 step "commit, tag, push"
 tracked_release_files | xargs git add -- || die "git add failed"

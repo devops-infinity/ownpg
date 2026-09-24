@@ -383,9 +383,10 @@ impl JwksClient {
             return Ok(());
         }
         if current.is_throttled() {
-            return if current.keys.is_empty() {
+            return if current.keys.is_empty() || current.is_stale() {
                 Err(JwksError::Unreachable(
-                    "the last fetch failed less than a minute ago".to_owned(),
+                    "the last fetch failed less than a minute ago and no usable keys are cached"
+                        .to_owned(),
                 ))
             } else {
                 Ok(())
@@ -447,6 +448,26 @@ impl JwksClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn keys_past_the_stale_limit_are_not_served_while_a_refetch_is_throttled() {
+        let client = JwksClient::new("https://127.0.0.1:9/jwks.json".to_owned()).unwrap();
+        let mut keys = HashMap::new();
+        keys.insert(
+            "k1".to_owned(),
+            Arc::new(VerifyingKey::Ed25519(vec![0; 32])),
+        );
+        client.store(|cache| {
+            cache.keys = Arc::new(keys);
+            cache.fetched_at = None;
+            cache.last_attempt = Some(Instant::now());
+        });
+        assert!(matches!(
+            client.key("k1").await,
+            Err(JwksError::Unreachable(_))
+        ));
+        assert!(client.ready().await.is_err());
+    }
 
     #[test]
     fn max_age_is_read_from_cache_control() {

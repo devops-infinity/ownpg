@@ -36,7 +36,86 @@ pub struct Hints {
 pub struct Tunnel {
     pub stream: TunnelStream,
     pub route: Vec<String>,
+    reopen: Reopen,
     kept_alive: Vec<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+pub struct Reopen {
+    path: ReopenPath,
+    target_host: String,
+    target_port: u16,
+}
+
+enum ReopenPath {
+    Channel(Arc<Vec<Handle<HostKeyHandler>>>),
+    #[cfg(unix)]
+    Unix(PathBuf),
+}
+
+impl std::fmt::Debug for Reopen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reopen")
+            .field("target_host", &self.target_host)
+            .field("target_port", &self.target_port)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Reopen {
+    #[must_use]
+    pub fn target_host(&self) -> &str {
+        &self.target_host
+    }
+
+    pub async fn open(&self, timeout: Duration) -> Result<TunnelStream> {
+        match &self.path {
+            ReopenPath::Channel(handles) => {
+                let last = handles
+                    .last()
+                    .ok_or_else(|| ssh_error(&self.target_host, "no hop"))?;
+                let channel = tokio::time::timeout(
+                    timeout,
+                    last.channel_open_direct_tcpip(
+                        self.target_host.as_str(),
+                        u32::from(self.target_port),
+                        "127.0.0.1",
+                        0,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    ssh_error(&self.target_host, "the cancel channel did not open in time")
+                })?
+                .map_err(|error| {
+                    ssh_error(
+                        &self.target_host,
+                        format!("the cancel channel could not open: {error}"),
+                    )
+                })?;
+                Ok(TunnelStream::Channel {
+                    inner: channel.into_stream(),
+                })
+            }
+            #[cfg(unix)]
+            ReopenPath::Unix(path) => {
+                let stream = tokio::time::timeout(timeout, tokio::net::UnixStream::connect(path))
+                    .await
+                    .map_err(|_| {
+                        ssh_error(
+                            &self.target_host,
+                            "the forward socket did not answer in time",
+                        )
+                    })?
+                    .map_err(|error| {
+                        ssh_error(
+                            &self.target_host,
+                            format!("the forward socket did not answer: {error}"),
+                        )
+                    })?;
+                Ok(TunnelStream::Unix { inner: stream })
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for Tunnel {
@@ -53,9 +132,10 @@ impl Tunnel {
     ) -> (
         TunnelStream,
         Vec<String>,
+        Reopen,
         Vec<Box<dyn std::any::Any + Send + Sync>>,
     ) {
-        (self.stream, self.route, self.kept_alive)
+        (self.stream, self.route, self.reopen, self.kept_alive)
     }
 }
 
@@ -271,7 +351,8 @@ async fn open_in_process(
     });
     let mut route = Vec::new();
     let mut handles: Vec<Handle<HostKeyHandler>> = Vec::new();
-    for hop in &hops {
+    let last_hop = hops.len().saturating_sub(1);
+    for (index, hop) in hops.iter().enumerate() {
         let verdict = Arc::new(Mutex::new(None));
         let handler = HostKeyHandler {
             host: hop.host.clone(),
@@ -323,7 +404,17 @@ async fn open_in_process(
                 ));
             }
         };
-        authenticate(&mut handle, hop, settings, hints, &keys, timeout).await?;
+        let offer_password = index == last_hop;
+        authenticate(
+            &mut handle,
+            hop,
+            settings,
+            offer_password,
+            hints,
+            &keys,
+            timeout,
+        )
+        .await?;
         route.push(format!("{}@{}:{}", hop.user, hop.host, hop.port));
         handles.push(handle);
     }
@@ -350,9 +441,15 @@ async fn open_in_process(
     let stream = TunnelStream::Channel {
         inner: channel.into_stream(),
     };
+    let handles = Arc::new(handles);
     Ok(Tunnel {
         stream,
         route,
+        reopen: Reopen {
+            path: ReopenPath::Channel(Arc::clone(&handles)),
+            target_host: target_host.to_owned(),
+            target_port,
+        },
         kept_alive: vec![Box::new(handles)],
     })
 }
@@ -385,10 +482,8 @@ fn host_key_error(
 type LoadedKeys = HashMap<PathBuf, std::result::Result<Arc<PrivateKey>, String>>;
 
 fn read_private_key(path: &Path) -> std::result::Result<String, String> {
-    let mut file = crate::config::profile::open_private(path).map_err(|error| error.to_string())?;
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut file, &mut text).map_err(|error| error.to_string())?;
-    Ok(text)
+    let file = crate::config::profile::open_private(path).map_err(|error| error.to_string())?;
+    crate::config::profile::read_capped_handle(file, path).map_err(|error| error.to_string())
 }
 
 async fn load_keys(hops: &[Hop], settings: &SshSettings) -> Result<LoadedKeys> {
@@ -449,6 +544,7 @@ async fn authenticate(
     handle: &mut Handle<HostKeyHandler>,
     hop: &Hop,
     settings: &SshSettings,
+    offer_password: bool,
     hints: &Hints,
     keys: &LoadedKeys,
     timeout: Duration,
@@ -531,7 +627,7 @@ async fn authenticate(
         }
     }
 
-    if let Some(password) = &settings.password {
+    if let Some(password) = settings.password.as_ref().filter(|_| offer_password) {
         let outcome = tokio::time::timeout(
             timeout,
             handle.authenticate_password(hop.user.clone(), password.value.expose().to_owned()),
@@ -626,31 +722,35 @@ async fn open_system(
     {
         builder.config_file(&config.value);
     }
-    let session = builder
-        .connect(&bastion.host)
-        .await
-        .map_err(|error| ssh_error(&bastion.host, format!("the system ssh failed: {error}")))?;
     let mut socket_dir = tempfile::Builder::new();
-    socket_dir.prefix("ownpg-ssh-");
+    socket_dir.prefix(SOCKET_DIR_PREFIX);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         socket_dir.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    let socket_dir = tokio::task::spawn_blocking(move || socket_dir.tempdir())
+    let socket_dir = tokio::task::spawn_blocking(move || {
+        sweep_stale_socket_dirs(&std::env::temp_dir());
+        socket_dir.tempdir()
+    })
+    .await
+    .map_err(|error| {
+        ssh_error(
+            &bastion.host,
+            format!("the socket directory setup panicked: {error}"),
+        )
+    })?
+    .map_err(|error| {
+        ssh_error(
+            &bastion.host,
+            format!("no directory for the ssh sockets: {error}"),
+        )
+    })?;
+    builder.control_directory(socket_dir.path());
+    let session = builder
+        .connect(&bastion.host)
         .await
-        .map_err(|error| {
-            ssh_error(
-                &bastion.host,
-                format!("the socket directory setup panicked: {error}"),
-            )
-        })?
-        .map_err(|error| {
-            ssh_error(
-                &bastion.host,
-                format!("no directory for the forward socket: {error}"),
-            )
-        })?;
+        .map_err(|error| ssh_error(&bastion.host, format!("the system ssh failed: {error}")))?;
     let socket_path = socket_dir.path().join("forward.sock");
     session
         .request_port_forward(
@@ -686,8 +786,51 @@ async fn open_system(
     Ok(Tunnel {
         stream: TunnelStream::Unix { inner: stream },
         route,
+        reopen: Reopen {
+            path: ReopenPath::Unix(socket_path),
+            target_host: target_host.to_owned(),
+            target_port,
+        },
         kept_alive: vec![Box::new(session), Box::new(socket_dir)],
     })
+}
+
+#[cfg(unix)]
+const SOCKET_DIR_PREFIX: &str = "ownpg-ssh-";
+#[cfg(unix)]
+const STALE_SOCKET_DIR_AGE: Duration = Duration::from_secs(86_400);
+
+#[cfg(unix)]
+fn sweep_stale_socket_dirs(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SOCKET_DIR_PREFIX)
+        {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_SOCKET_DIR_AGE);
+        let live =
+            std::os::unix::net::UnixStream::connect(entry.path().join("forward.sock")).is_ok();
+        if stale
+            && !live
+            && metadata.is_dir()
+            && let Err(error) = std::fs::remove_dir_all(entry.path())
+        {
+            tracing::debug!(%error, path = %entry.path().display(), "a stale ssh socket directory could not be removed");
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -716,6 +859,34 @@ pub fn agent_socket_from(value: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn only_old_socket_directories_without_a_listener_are_swept() {
+        let parent = tempfile::tempdir().unwrap();
+        let old = parent.path().join(format!("{SOCKET_DIR_PREFIX}old"));
+        let live = parent.path().join(format!("{SOCKET_DIR_PREFIX}live"));
+        let fresh = parent.path().join(format!("{SOCKET_DIR_PREFIX}fresh"));
+        let other = parent.path().join("someone-else");
+        for dir in [&old, &live, &fresh, &other] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let listener = std::os::unix::net::UnixListener::bind(live.join("forward.sock")).unwrap();
+        let long_ago =
+            std::time::SystemTime::now() - STALE_SOCKET_DIR_AGE - Duration::from_secs(60);
+        for dir in [&old, &live, &other] {
+            std::fs::File::open(dir)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        sweep_stale_socket_dirs(parent.path());
+        assert!(!old.exists());
+        assert!(live.exists());
+        assert!(fresh.exists());
+        assert!(other.exists());
+        drop(listener);
+    }
     use crate::config::{Origin, Resolved, Secret};
 
     fn settings(host: &str, jump: Vec<String>, config_file: Option<PathBuf>) -> SshSettings {

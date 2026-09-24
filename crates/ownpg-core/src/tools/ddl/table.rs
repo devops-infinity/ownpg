@@ -10,7 +10,6 @@ use crate::error::{Error, Result};
 use crate::render::{
     expression, ident_list, operator, partition_bound, quote_ident, type_name, validate_ident,
 };
-use crate::shape::ResultSet;
 use crate::tool_specs;
 use crate::tools::ddl::index::index_element;
 use crate::tools::{Call, Outcome, Route, route};
@@ -242,12 +241,16 @@ pub fn table(call: Call, args: TableArgs) -> BoxFuture<'static, Outcome> {
                         ident_list("primary_key", &args.primary_key)?
                     ));
                 }
+                let target = if args.temporary {
+                    crate::render::quote_ident(&name.name)
+                } else {
+                    name.sql()
+                };
                 let mut sql = format!(
-                    "CREATE{}{} TABLE{} {} ({})",
+                    "CREATE{}{} TABLE{} {target} ({})",
                     if args.temporary { " TEMPORARY" } else { "" },
                     if args.unlogged { " UNLOGGED" } else { "" },
                     if_not_exists_clause(args.if_not_exists),
-                    name.sql(),
                     items.join(", ")
                 );
                 if !args.inherits.is_empty() {
@@ -999,9 +1002,17 @@ pub fn constraint(call: Call, args: ConstraintArgs) -> BoxFuture<'static, Outcom
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<TableArgs, ResultSet, _>(&tool_specs::PG_TABLE, TABLE_DESCRIPTION, table)?,
-        route::<ColumnArgs, ResultSet, _>(&tool_specs::PG_COLUMN, COLUMN_DESCRIPTION, column)?,
-        route::<ConstraintArgs, ResultSet, _>(
+        route::<TableArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_TABLE,
+            TABLE_DESCRIPTION,
+            table,
+        )?,
+        route::<ColumnArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_COLUMN,
+            COLUMN_DESCRIPTION,
+            column,
+        )?,
+        route::<ConstraintArgs, crate::tools::write::StatementOutput, _>(
             &tool_specs::PG_CONSTRAINT,
             CONSTRAINT_DESCRIPTION,
             constraint,

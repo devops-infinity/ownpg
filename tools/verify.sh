@@ -5,17 +5,21 @@ REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 source "$REPO/tools/lib.sh"
+require_bash 4.4 "$REPO/tools/verify.sh" "$@"
+shopt -s inherit_errexit
 
 SHELL_FILES=(tools/*.sh .githooks/pre-commit .githooks/pre-push)
 LOG="$(mktemp)"
 STEP="startup"
 
-on_interrupt() {
+on_signal() {
 	say FAILED "interrupted during: $STEP"
-	exit "$1"
+	rm -f "$LOG"
+	trap - "$1"
+	kill -s "$1" "$$"
 }
-trap 'on_interrupt 130' INT
-trap 'on_interrupt 143' TERM
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 trap 'rm -f "$LOG"' EXIT
 
 run_check() {
@@ -33,6 +37,15 @@ bash -n "${SHELL_FILES[@]}" || die "a shell script has a syntax error"
 say SUCCESS "syntax"
 
 command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH"
+for tool in shellcheck shfmt bats; do
+	command -v "$tool" >/dev/null 2>&1 && continue
+	case "$tool" in
+	bats) die "bats is not installed; install it with: brew install bats-core" ;;
+	*) die "$tool is not installed; install it with: brew install $tool" ;;
+	esac
+done
+LIVE_TESTS=1
+live_tests_enabled || LIVE_TESTS=0
 
 say INFO "running the verification gate"
 run_check "formatting" "formatting is not clean; run: cargo fmt --all" \
@@ -52,6 +65,9 @@ else
 		cargo test --workspace --all-features --locked
 fi
 say SUCCESS "tests"
+if [[ $LIVE_TESTS -eq 0 ]]; then
+	say WARNING "OWNPG_SKIP_LIVE_TESTS=1, so the live database tests were skipped"
+fi
 run_check "doc tests" "doc tests failed; run: cargo test --workspace --all-features --doc" \
 	cargo test --workspace --all-features --locked --doc
 say SUCCESS "doc tests"
@@ -82,27 +98,18 @@ run_check "no unused dependency" "cargo machete found an unused dependency; run:
 	cargo machete
 say SUCCESS "no unused dependency"
 
-if command -v shellcheck >/dev/null 2>&1 && command -v shfmt >/dev/null 2>&1; then
-	run_check "shell scripts" "shellcheck found a problem; run: shellcheck -x -P . ${SHELL_FILES[*]}" \
-		shellcheck -x -P . "${SHELL_FILES[@]}"
-	run_check "shell scripts" "shfmt found unformatted shell; run: shfmt -w ${SHELL_FILES[*]}" \
-		shfmt -d "${SHELL_FILES[@]}"
-	say SUCCESS "shell scripts"
-else
-	say WARNING "shellcheck or shfmt is not installed, so the shell scripts were not checked"
-fi
+run_check "shell scripts" "shellcheck found a problem; run: shellcheck -x -P . ${SHELL_FILES[*]}" \
+	shellcheck -x -P . "${SHELL_FILES[@]}"
+run_check "shell scripts" "shfmt found unformatted shell; run: shfmt -w ${SHELL_FILES[*]}" \
+	shfmt -d "${SHELL_FILES[@]}"
+say SUCCESS "shell scripts"
 
-if command -v bats >/dev/null 2>&1; then
-	run_check "shell script tests" "the bats suite failed; run: bats tools/tests/toolset.bats" \
-		bats tools/tests/toolset.bats
-	say SUCCESS "shell script tests"
-else
-	say WARNING "bats is not installed, so tools/tests/toolset.bats was not run"
-fi
+run_check "shell script tests" "the bats suite failed; run: bats tools/tests/toolset.bats" \
+	bats tools/tests/toolset.bats
+say SUCCESS "shell script tests"
 
 hits=$(git ls-files -z -- crates tools ':(top,glob)*.md' ':(exclude)**/LICENSE-*' |
 	xargs -0 grep -niIE 'legacy|backward.compat|inspired by|based on|ported from|fork of' 2>/dev/null |
-	grep -v '^tools/release\.sh:' |
 	grep -v '^tools/verify\.sh:' |
 	grep -v -i 'with_legacy_session_mode' || true)
 if [[ -n "$hits" ]]; then
@@ -140,9 +147,15 @@ if [[ -n "$hits" ]]; then
 fi
 say SUCCESS "no markdown table"
 
-hits=$(git ls-files -z -- '*.rs' | xargs -0 grep -nE '^\s*//|[[:space:]]//' 2>/dev/null || true)
+hits=$(git ls-files -z -- '*.rs' | rust_comment_lines)
 if [[ -n "$hits" ]]; then
 	printf '%s\n' "$hits"
 	die "a code comment was found in Rust source"
+fi
+hits=$(git ls-files -z -- 'tools/*.sh' '.githooks/*' '*.toml' '*.yml' '*.yaml' ':(glob).github/**/*.yml' Dockerfile |
+	hash_comment_lines)
+if [[ -n "$hits" ]]; then
+	printf '%s\n' "$hits"
+	die "a code comment was found in a shell, TOML, YAML, or Docker file"
 fi
 say SUCCESS "no code comment"

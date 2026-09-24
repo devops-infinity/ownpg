@@ -2,7 +2,7 @@ pub mod auth;
 pub mod jwks;
 pub mod limit;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,10 +26,53 @@ use crate::error::{Error, ExitClass, Result};
 
 pub const LIVE_PATH: &str = "/healthz/live";
 pub const READY_PATH: &str = "/healthz/ready";
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[must_use]
+pub fn probe_url(bind: SocketAddr, path: &str) -> String {
+    let host = match bind.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    format!("http://{}{path}", SocketAddr::new(host, bind.port()))
+}
+
+pub async fn probe(bind: SocketAddr, path: &str, timeout: Duration) -> Result<String> {
+    super::ensure_tls_provider();
+    let url = probe_url(bind, path);
+    let not_ready = |detail: String| Error::ServerNotReady {
+        url: url.clone(),
+        detail,
+    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| not_ready(format!("the probe client could not be built: {error}")))?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| not_ready(format!("no answer: {error}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| not_ready(format!("{status} with an unreadable body: {error}")))?;
+    let body = body.trim().to_owned();
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err(not_ready(format!("{status} {body}")))
+    }
+}
 pub const METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
 pub const HEADER_MCP_METHOD: &str = "mcp-method";
 pub const HEADER_MCP_NAME: &str = "mcp-name";
-const READINESS_CALLS_PER_MINUTE: u32 = u32::MAX;
+pub const HEADER_MCP_SESSION: &str = "mcp-session-id";
+const READINESS_CALLS_PER_MINUTE: u32 = 0;
 
 pub struct Gatekeeper {
     pub server: Arc<Server>,
@@ -46,6 +89,8 @@ pub struct Gatekeeper {
     pub max_connections: usize,
     pub header_timeout: Duration,
     pub body_timeout: Duration,
+    pub sessions: Arc<LocalSessionManager>,
+    session_owners: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for Gatekeeper {
@@ -58,13 +103,43 @@ impl std::fmt::Debug for Gatekeeper {
 }
 
 impl Gatekeeper {
-    fn challenge(&self, rejection: &Rejection) -> Response {
+    fn challenge(&self, rejection: &Rejection, client: IpAddr) -> Response {
+        let reason = rejection.error.unwrap_or(if rejection.status == 503 {
+            "key_endpoint_unavailable"
+        } else {
+            "missing_token"
+        });
+        tracing::info!(%client, status = rejection.status, reason, detail = %rejection.description, "an HTTP request was refused");
+        self.server.note_http_rejection(reason);
+        let mut body = serde_json::Map::new();
+        if let Some(error) = rejection.error {
+            body.insert("error".to_owned(), serde_json::json!(error));
+        }
+        body.insert(
+            "error_description".to_owned(),
+            serde_json::json!(rejection.description),
+        );
+        if let Some(seconds) = rejection.retry_after_seconds {
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::Value::Object(body)),
+            )
+                .into_response();
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return response;
+        }
         let mut parts = vec![format!("resource_metadata=\"{}\"", self.metadata_url)];
-        if self.authenticator.requires_token() {
-            parts.push(format!("error=\"{}\"", rejection.error));
+        body.insert(
+            "resource_metadata".to_owned(),
+            serde_json::json!(self.metadata_url),
+        );
+        if let Some(error) = rejection.error {
+            parts.push(format!("error=\"{error}\""));
             parts.push(format!(
                 "error_description=\"{}\"",
-                rejection.description.replace('"', "'")
+                header_text(&rejection.description)
             ));
         }
         let scope = rejection
@@ -72,22 +147,45 @@ impl Gatekeeper {
             .clone()
             .unwrap_or_else(|| crate::tool_specs::SCOPE_READ.to_owned());
         parts.push(format!("scope=\"{scope}\""));
-        let body = serde_json::json!({
-            "error": rejection.error,
-            "error_description": rejection.description,
-            "resource_metadata": self.metadata_url,
-        });
         let mut response = (
             StatusCode::from_u16(rejection.status).unwrap_or(StatusCode::UNAUTHORIZED),
-            axum::Json(body),
+            axum::Json(serde_json::Value::Object(body)),
         )
             .into_response();
-        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", parts.join(", "))) {
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, value);
-        }
+        let value = HeaderValue::from_str(&format!("Bearer {}", parts.join(", ")))
+            .unwrap_or_else(|_| HeaderValue::from_static("Bearer"));
         response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+        response
+    }
+
+    fn session_owner(&self, session: &str) -> Option<String> {
+        self.session_owners
+            .lock()
+            .ok()
+            .and_then(|owners| owners.get(session).cloned())
+    }
+
+    async fn bind_session(&self, session: &str, owner: &str) {
+        let live: std::collections::HashSet<String> = self
+            .sessions
+            .sessions
+            .read()
+            .await
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        if let Ok(mut owners) = self.session_owners.lock() {
+            owners.retain(|id, _| live.contains(id));
+            owners.insert(session.to_owned(), owner.to_owned());
+        }
+    }
+
+    fn unbind_session(&self, session: &str) {
+        if let Ok(mut owners) = self.session_owners.lock() {
+            owners.remove(session);
+        }
     }
 
     fn metadata(&self) -> serde_json::Value {
@@ -147,6 +245,8 @@ impl Gatekeeper {
             max_connections: usize::try_from(http.max_connections.value).unwrap_or(usize::MAX),
             header_timeout: crate::config::http::DEFAULT_HEADER_TIMEOUT,
             body_timeout: crate::config::http::DEFAULT_BODY_TIMEOUT,
+            sessions: Arc::new(LocalSessionManager::default()),
+            session_owners: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 }
@@ -184,6 +284,14 @@ fn retry_after_seconds(wait: Duration) -> u64 {
     }
 }
 
+impl Gatekeeper {
+    fn rate_limited(&self, wait: Duration, client: IpAddr) -> Response {
+        tracing::info!(%client, wait_seconds = retry_after_seconds(wait), "a request was rate limited");
+        self.server.note_http_rejection("rate_limited");
+        too_many_requests(wait)
+    }
+}
+
 fn too_many_requests(wait: Duration) -> Response {
     let seconds = retry_after_seconds(wait);
     let mut response = (
@@ -205,16 +313,44 @@ fn too_many_requests(wait: Duration) -> Response {
     response
 }
 
-fn method_not_allowed() -> Response {
-    let mut response = (
-        StatusCode::METHOD_NOT_ALLOWED,
-        "only POST is accepted on the MCP endpoint",
-    )
-        .into_response();
+fn header_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '"' && c != '\\' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+fn principal_key(principal: &Principal) -> String {
+    format!("{:?}:{}", principal.kind, principal.name)
+}
+
+fn method_not_allowed(older_client_sessions: bool) -> Response {
+    let (allowed, text) = if older_client_sessions {
+        (
+            "GET, POST, DELETE",
+            "only GET, POST, and DELETE are accepted on the MCP endpoint",
+        )
+    } else {
+        ("POST", "only POST is accepted on the MCP endpoint")
+    };
+    let mut response = (StatusCode::METHOD_NOT_ALLOWED, text).into_response();
     response
         .headers_mut()
-        .insert(header::ALLOW, HeaderValue::from_static("POST"));
+        .insert(header::ALLOW, HeaderValue::from_static(allowed));
     response
+}
+
+fn session_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "the session is not known to this caller; start a new session",
+    )
+        .into_response()
 }
 
 #[must_use]
@@ -249,16 +385,18 @@ pub async fn guard(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !gatekeeper.older_client_sessions
-        && matches!(*request.method(), Method::GET | Method::DELETE)
-    {
-        return method_not_allowed();
-    }
-    if !matches!(
-        *request.method(),
-        Method::POST | Method::GET | Method::DELETE
-    ) {
-        return method_not_allowed();
+    let allowed = if gatekeeper.older_client_sessions {
+        matches!(
+            *request.method(),
+            Method::POST | Method::GET | Method::DELETE
+        )
+    } else {
+        *request.method() == Method::POST
+    };
+    if !allowed {
+        tracing::debug!(method = %request.method(), "a request used a method the MCP endpoint does not accept");
+        gatekeeper.server.note_http_rejection("method_not_allowed");
+        return method_not_allowed(gatekeeper.older_client_sessions);
     }
     let client = client_address(peer, request.headers(), &gatekeeper.trusted_proxies);
     let authorization = request
@@ -266,7 +404,7 @@ pub async fn guard(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let (principal, fingerprint) = match gatekeeper
+    let principal = match gatekeeper
         .authenticator
         .authenticate(authorization.as_deref(), &gatekeeper.anonymous)
         .await
@@ -274,9 +412,9 @@ pub async fn guard(
         Ok(found) => found,
         Err(rejection) => {
             if let Err(wait) = gatekeeper.limiter.check(&format!("auth-fail:{client}")) {
-                return too_many_requests(wait);
+                return gatekeeper.rate_limited(wait, client);
             }
-            return gatekeeper.challenge(&rejection);
+            return gatekeeper.challenge(&rejection, client);
         }
     };
     let method_header = request
@@ -293,7 +431,7 @@ pub async fn guard(
         && let Some(route) = gatekeeper.server.route(name)
         && !principal.allows(route.spec.scope)
     {
-        return gatekeeper.challenge(&Rejection::insufficient(route.spec.scope));
+        return gatekeeper.challenge(&Rejection::insufficient(route.spec.scope), client);
     }
     if matches!(
         method_header.as_str(),
@@ -308,18 +446,53 @@ pub async fn guard(
             | "completion/complete"
     ) && !principal.allows(crate::tool_specs::SCOPE_READ)
     {
-        return gatekeeper.challenge(&Rejection::insufficient(crate::tool_specs::SCOPE_READ));
+        return gatekeeper.challenge(
+            &Rejection::insufficient(crate::tool_specs::SCOPE_READ),
+            client,
+        );
     }
-    let bucket = if fingerprint.is_empty() {
-        format!("addr:{client}")
+    let owner = principal_key(&principal);
+    let bucket = if gatekeeper.authenticator.requires_token() {
+        format!("principal:{owner}")
     } else {
-        format!("token:{fingerprint}")
+        format!("addr:{client}")
     };
     if let Err(wait) = gatekeeper.limiter.check(&bucket) {
-        return too_many_requests(wait);
+        return gatekeeper.rate_limited(wait, client);
     }
+    let session = request
+        .headers()
+        .get(HEADER_MCP_SESSION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    if gatekeeper.older_client_sessions
+        && let Some(id) = &session
+        && gatekeeper.session_owner(id).as_deref() != Some(owner.as_str())
+    {
+        tracing::info!(%client, principal = %principal.name, "a request named a session that belongs to another caller or does not exist");
+        gatekeeper.server.note_http_rejection("session_not_found");
+        return session_not_found();
+    }
+    let closing = *request.method() == Method::DELETE;
     request.extensions_mut().insert(principal);
     let mut response = next.run(request).await;
+    if gatekeeper.older_client_sessions {
+        match &session {
+            None => {
+                if let Some(created) = response
+                    .headers()
+                    .get(HEADER_MCP_SESSION)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    gatekeeper.bind_session(created, &owner).await;
+                }
+            }
+            Some(id) if closing && response.status().is_success() => {
+                gatekeeper.unbind_session(id);
+            }
+            Some(_) => {}
+        }
+    }
     response.headers_mut().insert(
         header::HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
@@ -341,12 +514,22 @@ async fn ready(
         .readiness_limiter
         .check(&format!("ready:{client}"))
     {
-        return too_many_requests(wait);
+        return gatekeeper.rate_limited(wait, client);
     }
     if !gatekeeper.server.engine().is_alive().await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "not ready: PostgreSQL is not reachable",
+        )
+            .into_response();
+    }
+    if gatekeeper.server.audit().on_failure() == crate::config::AuditFailure::RefuseAll
+        && let Err(error) = gatekeeper.server.audit_admits(true).await
+    {
+        tracing::warn!(%error, "the audit log is not ready");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: the audit log cannot be written",
         )
             .into_response();
     }
@@ -382,7 +565,7 @@ pub fn router(gatekeeper: Arc<Gatekeeper>, settings: &Settings) -> Router {
         .with_max_request_body_bytes(http.body_cap.value);
     let mcp = StreamableHttpService::new(
         move || Ok(Arc::clone(&server)),
-        Arc::new(LocalSessionManager::default()),
+        Arc::clone(&gatekeeper.sessions),
         config,
     );
     let body_timeout = gatekeeper.body_timeout;
@@ -556,6 +739,64 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wildcard_bind_is_probed_on_loopback_of_the_same_family() {
+        let parse = |text: &str| text.parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            probe_url(parse("0.0.0.0:8765"), READY_PATH),
+            "http://127.0.0.1:8765/healthz/ready"
+        );
+        assert_eq!(
+            probe_url(parse("[::]:8765"), LIVE_PATH),
+            "http://[::1]:8765/healthz/live"
+        );
+        assert_eq!(
+            probe_url(parse("10.0.0.5:9000"), READY_PATH),
+            "http://10.0.0.5:9000/healthz/ready"
+        );
+    }
+
+    async fn health_stub(status: StatusCode, body: &'static str) -> SocketAddr {
+        let app = Router::new().route(READY_PATH, get(move || async move { (status, body) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn the_probe_passes_on_200_and_names_the_reason_on_503() {
+        let ready = health_stub(StatusCode::OK, "ready").await;
+        assert_eq!(
+            probe(ready, READY_PATH, PROBE_TIMEOUT).await.unwrap(),
+            "ready"
+        );
+        let waiting = health_stub(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: PostgreSQL is not reachable",
+        )
+        .await;
+        let error = probe(waiting, READY_PATH, PROBE_TIMEOUT).await.unwrap_err();
+        assert_eq!(error.id(), crate::error::ErrorId::ServerNotReady);
+        assert_eq!(error.exit_class(), ExitClass::Runtime);
+        assert!(
+            error.to_string().contains("PostgreSQL is not reachable"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_probe_fails_when_nothing_listens() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = probe(address, READY_PATH, PROBE_TIMEOUT).await.unwrap_err();
+        assert_eq!(error.id(), crate::error::ErrorId::ServerNotReady);
+        assert!(error.to_string().contains("no answer"), "{error}");
+    }
 
     #[tokio::test]
     async fn a_rate_limited_response_carries_a_schema_valid_id() {

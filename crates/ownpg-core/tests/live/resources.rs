@@ -10,7 +10,7 @@ use ownpg_core::connect::ssh::Hints;
 use ownpg_core::engine::Engine;
 use ownpg_core::server::{Principal, Server, resources, stdio};
 use rmcp::model::{
-    CacheScope, CallToolRequestParams, ClientInfo, CompletionContext, ErrorCode,
+    CacheScope, CallToolRequestParams, ClientConfig, CompletionContext, ErrorCode,
     GetPromptRequestParams, ProtocolVersion, ReadResourceRequestParams,
     ResourceUpdatedNotificationParam, ServerNotification, SubscriptionFilter,
 };
@@ -37,8 +37,8 @@ impl ClientHandler for ResourceWatcher {
         self.list_changed_count.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::default()
     }
 }
 
@@ -531,5 +531,44 @@ async fn a_ddl_call_reaches_a_subscription_stream_on_the_current_protocol() {
     );
     assert!(rig.handler.updated_uris.lock().unwrap().is_empty());
     subscription.cancel().await.unwrap();
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resources_list_pages_past_the_cap_instead_of_dropping_tables() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute(
+            "CREATE SCHEMA app; \
+             DO $$ BEGIN FOR i IN 1..1001 LOOP EXECUTE format('CREATE TABLE app.t%s (id int)', lpad(i::text, 4, '0')); END LOOP; END $$;",
+        )
+        .await
+        .unwrap();
+    let rig = rig(&scratch, ClientLifecycleMode::Initialize).await;
+    let first = rig.client.list_resources(None).await.unwrap();
+    assert_eq!(first.resources.len(), 1001);
+    let cursor = first.next_cursor.clone().expect("a second page");
+    let second = rig
+        .client
+        .list_resources(Some(
+            rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.resources.len(), 1);
+    assert_eq!(second.resources[0].name, "t1001");
+    assert!(second.next_cursor.is_none());
+    let bad = rig
+        .client
+        .list_resources(Some(
+            rmcp::model::PaginatedRequestParams::default()
+                .with_cursor(Some("not-a-cursor".to_owned())),
+        ))
+        .await;
+    assert!(bad.is_err());
     rig.finish().await;
 }

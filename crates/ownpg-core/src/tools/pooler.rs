@@ -3,7 +3,6 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio_postgres::Config;
 
 use super::{AuditFacts, Call, Outcome, Route, ToolFailure, ToolOutput, route};
 use crate::config::presets::is_socket_directory;
@@ -79,33 +78,43 @@ pub fn pool_status(call: Call, args: PoolStatusArgs) -> BoxFuture<'static, Outco
                 })?
                 .map_err(ToolFailure::from)?
         };
-        let mut config = Config::new();
-        config.host(&host);
-        config.port(connection.port.value);
-        if let Some(hostaddr) = &connection.hostaddr
-            && let Ok(address) = hostaddr.value.parse()
-        {
-            config.hostaddr(address);
-        }
-        config.dbname("pgbouncer");
-        config.user(&connection.user.value);
-        if let Some(password) = &connection.password {
-            config.password(password.value.expose());
-        }
-        config.ssl_mode(built_tls.plan.driver_mode);
-        config.connect_timeout(connection.connect_timeout.value);
-        let (client, wire) = config
-            .connect(built_tls.connector)
-            .await
+        let connector =
+            crate::connect::Connector::new(std::sync::Arc::clone(call.engine().settings()));
+        let config = connector.admin_console_config(
+            &crate::connect::Candidate {
+                endpoint: crate::connect::Endpoint::Tcp {
+                    host: host.clone(),
+                    port: connection.port.value,
+                },
+                user: connection.user.value.clone(),
+            },
+            "pgbouncer",
+        );
+        let budget = connection.connect_timeout.value.max(Duration::from_secs(5));
+        let connected = tokio::select! {
+            connected = tokio::time::timeout(budget, config.connect(built_tls.connector)) => connected,
+            () = call.cancel.cancelled() => return Err(ToolFailure::from(Error::CallCancelled)),
+        };
+        let (client, wire) = connected
+            .map_err(|_| {
+                ToolFailure::from(Error::ProtocolFailed {
+                    detail: format!(
+                        "PgBouncer at {host} did not accept the connection within {} seconds",
+                        budget.as_secs()
+                    ),
+                })
+            })?
             .map_err(|error| ToolFailure::from(describe_sqlstate(&error)))?;
         tokio::spawn(async move {
             if let Err(error) = wire.await {
                 tracing::warn!(%error, "the pool status connection ended");
             }
         });
-        let budget = connection.connect_timeout.value.max(Duration::from_secs(5));
-        let messages = tokio::time::timeout(budget, client.simple_query(args.command.sql()))
-            .await
+        let answered = tokio::select! {
+            answered = tokio::time::timeout(budget, client.simple_query(args.command.sql())) => answered,
+            () = call.cancel.cancelled() => return Err(ToolFailure::from(Error::CallCancelled)),
+        };
+        let messages = answered
             .map_err(|_| {
                 ToolFailure::from(Error::ProtocolFailed {
                     detail: format!(

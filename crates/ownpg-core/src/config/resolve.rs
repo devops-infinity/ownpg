@@ -1,15 +1,19 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::KeychainScope;
 use super::environment::Environment;
+use super::keychain::{self, Target};
 use super::libpq::{self, LibpqLayer, PasswordFileOutcome};
+use super::presets;
 use super::profile::{ProfileEntry, ProfileFile};
 use super::{
-    AppPaths, AuditSettings, ChannelBinding, ConnectionSettings, DEFAULT_AUDIT_MAX_BYTES,
-    DEFAULT_BYTE_CAP, DEFAULT_CONNECT_TIMEOUT, DEFAULT_CURSOR_EXPIRY, DEFAULT_HANDLE_EXPIRY,
-    DEFAULT_LOCK_TIMEOUT, DEFAULT_PORT, DEFAULT_ROW_CAP, DEFAULT_SCHEMA, DEFAULT_STATEMENT_TIMEOUT,
-    DEFAULT_TRANSACTION_TIMEOUT, LimitSettings, MAX_ROW_CAP, Mode, Origin, Resolved, Secret,
-    Settings, SshSettings, SshTransport, SslMode, ToolGroup,
+    AppPaths, AuditFailure, AuditSettings, ChannelBinding, ConnectionSettings,
+    DEFAULT_AUDIT_KEEP_DAYS, DEFAULT_AUDIT_MAX_BYTES, DEFAULT_BYTE_CAP, DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_CURSOR_EXPIRY, DEFAULT_HANDLE_EXPIRY, DEFAULT_LOCK_TIMEOUT, DEFAULT_PORT,
+    DEFAULT_ROW_CAP, DEFAULT_SCHEMA, DEFAULT_STATEMENT_TIMEOUT, DEFAULT_TRANSACTION_TIMEOUT,
+    LimitSettings, MAX_ROW_CAP, Mode, Origin, Resolved, ResultText, Secret, Settings, SshSettings,
+    SshTransport, SslMode, SslNegotiation, ToolGroup,
 };
 use crate::error::{Error, Result};
 
@@ -130,6 +134,10 @@ fn env_u64(env: &Environment, name: &str) -> Result<Option<u64>> {
         })
 }
 
+pub fn no_input_from_env(env: &Environment) -> Result<Option<bool>> {
+    Ok(env_bool(env, "OWNPG_NO_INPUT")?.or(ci_no_input(env)))
+}
+
 #[must_use]
 pub fn ci_no_input(env: &Environment) -> Option<bool> {
     let raw = env.var("CI")?;
@@ -239,16 +247,15 @@ fn seconds(value: Option<u64>) -> Option<Duration> {
     value.map(Duration::from_secs)
 }
 
-pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<Warning>)> {
-    let env = sources.env;
-    let mut warnings = Vec::new();
-
-    let profile_name = flags
-        .profile
-        .clone()
-        .or_else(|| env.var("OWNPG_PROFILE").map(str::to_owned));
+fn selected_profile(
+    flag: Option<&str>,
+    sources: &Sources<'_>,
+) -> Result<(Option<String>, ProfileEntry)> {
+    let name = flag
+        .map(str::to_owned)
+        .or_else(|| sources.env.var("OWNPG_PROFILE").map(str::to_owned));
     let file = ProfileFile::load(&sources.paths.config_file)?;
-    let profile: ProfileEntry = match (&profile_name, &file) {
+    let profile = match (&name, &file) {
         (Some(name), Some(file)) => file.profile(name, &sources.paths.config_file)?.clone(),
         (Some(name), None) => {
             return Err(Error::ProfileUnknown {
@@ -259,8 +266,29 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
         }
         (None, _) => ProfileEntry::default(),
     };
+    Ok((name, profile))
+}
 
-    let env_layer = LibpqLayer::from_environment(env);
+pub fn resolve_bind(flags: &FlagLayer, sources: &Sources<'_>) -> Result<std::net::SocketAddr> {
+    let (_, profile) = selected_profile(flags.profile.as_deref(), sources)?;
+    Ok(super::http::pick_bind(
+        flags.http.bind.as_deref(),
+        sources.env,
+        profile
+            .http
+            .as_ref()
+            .and_then(|entry| entry.bind.as_deref()),
+    )?
+    .value)
+}
+
+pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<Warning>)> {
+    let env = sources.env;
+    let mut warnings = Vec::new();
+
+    let (profile_name, profile) = selected_profile(flags.profile.as_deref(), &sources)?;
+
+    let env_layer = LibpqLayer::from_environment(env)?;
     let service_name = Pick::new(None, None, profile.service.clone())
         .with_libpq(env_layer.service.clone())
         .resolve();
@@ -355,6 +383,55 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
                     .to_owned(),
         });
     }
+    let keychain_scope = Pick::new(
+        None,
+        env_parsed(
+            env,
+            "OWNPG_KEYCHAIN_SCOPE",
+            KeychainScope::parse,
+            "file or target",
+        )?,
+        profile.keychain_scope,
+    )
+    .or_preset(KeychainScope::File);
+    let result_text = Pick::new(
+        None,
+        env_parsed(
+            env,
+            "OWNPG_RESULT_TEXT",
+            ResultText::parse,
+            "full or summary",
+        )?,
+        profile.result_text,
+    )
+    .or_preset(ResultText::Full);
+    let mut ssh = resolve_ssh(&flags, env, &profile)?;
+    if let (Some(name), Some(ssh_settings)) = (&profile_name, ssh.as_mut())
+        && ssh_settings.password.is_none()
+        && profile
+            .ssh
+            .as_ref()
+            .and_then(|entry| entry.passphrase_keychain)
+            == Some(true)
+        && let Some(lookup) = sources.keychain
+    {
+        let account = keychain::ssh_secret_account(
+            keychain_scope.value,
+            &sources.paths.config_file,
+            ssh_settings,
+        );
+        match lookup(&account)? {
+            Some(value) => {
+                ssh_settings.password = Some(Resolved::new(Secret::new(value), Origin::Profile));
+            }
+            None => warnings.push(missing_keychain_entry(
+                name,
+                &account,
+                "ssh.passphrase_keychain",
+                "set-ssh-passphrase",
+            )),
+        }
+    }
     let mut password = Pick::new(
         None,
         env.var("OWNPG_PASSWORD")
@@ -373,8 +450,25 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
         && profile.password_keychain == Some(true)
         && let (Some(name), Some(lookup)) = (&profile_name, sources.keychain)
     {
-        password = lookup(&super::keychain_account(name))?
-            .map(|value| Resolved::new(Secret::new(value), Origin::Profile));
+        let account = keychain::password_account(
+            keychain_scope.value,
+            &sources.paths.config_file,
+            Target {
+                user: &user.value,
+                host: host.as_ref().map(|host| host.value.as_str()),
+                port: port.value,
+            },
+            ssh.as_ref(),
+        );
+        match lookup(&account)? {
+            Some(value) => password = Some(Resolved::new(Secret::new(value), Origin::Profile)),
+            None => warnings.push(missing_keychain_entry(
+                name,
+                &account,
+                "password_keychain",
+                "set-password",
+            )),
+        }
     }
     if password.is_none() {
         password = libpq_layer
@@ -382,11 +476,13 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
             .clone()
             .map(|value| Resolved::new(value, Origin::Libpq));
     }
+    let password_file = libpq::password_file_path(env, libpq_layer.passfile.as_deref());
+    let mut from_password_file = false;
     if password.is_none()
-        && let Some(path) = libpq::password_file_path(env, libpq_layer.passfile.as_deref())
+        && let Some(path) = &password_file
     {
         match libpq::password_from_file(
-            &path,
+            path,
             host.as_ref().map(|host| host.value.as_str()),
             port.value,
             &database.value,
@@ -394,6 +490,7 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
         )? {
             PasswordFileOutcome::Found(secret) => {
                 password = Some(Resolved::new(secret, Origin::Libpq));
+                from_password_file = true;
             }
             PasswordFileOutcome::IgnoredPermissions { path, mode } => warnings.push(Warning {
                 code: "password_file_ignored",
@@ -405,6 +502,30 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
             PasswordFileOutcome::NoMatch | PasswordFileOutcome::Missing => {}
         }
     }
+    let tries_fallback = user.origin == Origin::Preset
+        && host.is_none()
+        && hostaddr.is_none()
+        && ssh.is_none()
+        && user.value != presets::FALLBACK_TCP_USER;
+    let fallback_password = if !tries_fallback {
+        None
+    } else if password.is_some() && !from_password_file {
+        password.clone()
+    } else {
+        match &password_file {
+            Some(path) => match libpq::password_from_file(
+                path,
+                Some(presets::FALLBACK_TCP_HOST),
+                port.value,
+                &database.value,
+                presets::FALLBACK_TCP_USER,
+            )? {
+                PasswordFileOutcome::Found(secret) => Some(Resolved::new(secret, Origin::Libpq)),
+                _ => None,
+            },
+            None => None,
+        }
+    };
 
     let sslmode = Pick::new(
         flags.sslmode,
@@ -438,6 +559,30 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
     let channel_binding = Pick::new(None, None, profile.channel_binding)
         .with_libpq(libpq_layer.channel_binding)
         .or_preset(ChannelBinding::Prefer);
+    let ssl_negotiation = Pick::new(None, None, profile.sslnegotiation)
+        .with_libpq(libpq_layer.sslnegotiation)
+        .or_preset(SslNegotiation::Postgres);
+    if ssl_negotiation.value == SslNegotiation::Direct
+        && matches!(
+            sslmode.value,
+            SslMode::Disable | SslMode::Allow | SslMode::Prefer
+        )
+    {
+        return Err(Error::ConfigInvalid {
+            setting: "sslnegotiation".to_owned(),
+            value: SslNegotiation::Direct.as_str().to_owned(),
+            detail: format!(
+                "direct TLS needs sslmode require, verify-ca, or verify-full; sslmode {} could fall back to plaintext authentication",
+                sslmode.value
+            ),
+        });
+    }
+    for keyword in &libpq_layer.ignored {
+        warnings.push(Warning {
+            code: "libpq_setting_ignored",
+            message: format!("the libpq setting `{keyword}` has no effect in OwnPG and is ignored"),
+        });
+    }
     let connect_timeout = Pick::new(
         None,
         seconds(env_u64(env, "OWNPG_CONNECT_TIMEOUT")?),
@@ -554,14 +699,6 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
         }
     }
 
-    let ssh = resolve_ssh(
-        &flags,
-        env,
-        &profile,
-        profile_name.as_deref(),
-        sources.keychain,
-    )?;
-
     if cfg!(windows)
         && (profile.password.is_some()
             || profile.sslkey.is_some()
@@ -600,14 +737,33 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
             profile.audit_keep_files,
         )
         .or_preset(0),
+        keep_days: Pick::new(
+            None,
+            env_u32(env, "OWNPG_AUDIT_KEEP_DAYS")?,
+            profile.audit_keep_days,
+        )
+        .or_preset(DEFAULT_AUDIT_KEEP_DAYS),
+        on_failure: Pick::new(
+            None,
+            env_parsed(
+                env,
+                "OWNPG_AUDIT_ON_FAILURE",
+                AuditFailure::parse,
+                "continue, refuse-writes, or refuse-all",
+            )?,
+            profile.audit_on_failure,
+        )
+        .or_preset(AuditFailure::RefuseWrites),
     };
+    if audit.enabled.value && audit.on_failure.value == AuditFailure::Continue {
+        warnings.push(Warning {
+            code: "audit_failure_ignored",
+            message: "audit_on_failure = continue: tool calls keep running while the audit log cannot be written, so changes can go unrecorded".to_owned(),
+        });
+    }
 
-    let no_input = Pick::new(
-        flags.no_input,
-        env_bool(env, "OWNPG_NO_INPUT")?.or(ci_no_input(env)),
-        profile.no_input,
-    )
-    .or_preset(false);
+    let no_input =
+        Pick::new(flags.no_input, no_input_from_env(env)?, profile.no_input).or_preset(false);
 
     let pg_bindir = Pick::new(
         flags.pg_bindir.clone(),
@@ -651,11 +807,13 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
             port,
             user,
             password,
+            fallback_password,
             sslmode,
             sslrootcert,
             sslcert,
             sslkey,
             channel_binding,
+            ssl_negotiation,
             connect_timeout,
             application_name,
             options,
@@ -664,7 +822,9 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
         limits,
         strict_role,
         tools,
+        result_text,
         ssh,
+        keychain_scope,
         audit,
         pg_bindir,
         output_dir,
@@ -675,12 +835,20 @@ pub fn resolve(flags: FlagLayer, sources: Sources<'_>) -> Result<(Settings, Vec<
     Ok((settings, warnings))
 }
 
+fn missing_keychain_entry(profile: &str, account: &str, setting: &str, command: &str) -> Warning {
+    Warning {
+        code: "keychain_entry_missing",
+        message: format!(
+            "profile `{profile}` sets {setting} = true, but the keychain has no entry for service `{}`, account `{account}`; the target, the SSH route, or the profile file changed since the secret was saved. Run: ownpg config {command} {profile}",
+            keychain::SERVICE
+        ),
+    }
+}
+
 fn resolve_ssh(
     flags: &FlagLayer,
     env: &Environment,
     profile: &ProfileEntry,
-    profile_name: Option<&str>,
-    keychain: Option<KeychainLookup<'_>>,
 ) -> Result<Option<SshSettings>> {
     let target = Pick::new(
         flags.ssh.as_deref().map(parse_ssh_target).transpose()?,
@@ -697,19 +865,12 @@ fn resolve_ssh(
     };
     let entry = profile.ssh.clone().unwrap_or_default();
     let origin = target.origin;
-    let mut password = entry
+    let password = entry
         .password_env
         .as_deref()
         .and_then(|variable| env.var(variable))
         .map(|value| Resolved::new(Secret::new(value.to_owned()), Origin::Profile));
-    if password.is_none()
-        && entry.passphrase_keychain == Some(true)
-        && let (Some(name), Some(lookup)) = (profile_name, keychain)
-    {
-        password = lookup(&super::ssh_keychain_account(name))?
-            .map(|value| Resolved::new(Secret::new(value), Origin::Profile));
-    }
-    Ok(Some(SshSettings {
+    let resolved = SshSettings {
         host: Resolved::new(target.value.host, origin),
         port: target
             .value
@@ -766,7 +927,15 @@ fn resolve_ssh(
             .map_or(Resolved::preset(Duration::from_secs(10)), |seconds| {
                 Resolved::new(Duration::from_secs(seconds), Origin::Profile)
             }),
-    }))
+    };
+    if resolved.transport.value == SshTransport::System && resolved.trust_new_host.value {
+        return Err(Error::ConfigInvalid {
+            setting: "ssh.trust_new_host".to_owned(),
+            value: "true".to_owned(),
+            detail: "the system ssh command keeps its own known hosts, so trust_new_host has no effect with it; drop trust_new_host or use the in-process transport".to_owned(),
+        });
+    }
+    Ok(Some(resolved))
 }
 
 #[cfg(test)]
@@ -777,7 +946,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn paths_under(dir: &std::path::Path) -> AppPaths {
-        AppPaths::from_base(dir.join("config"), dir.join("data"), dir.join("cache"))
+        AppPaths::from_base(dir.join("config"), dir.join("data"))
     }
 
     fn resolve_with(
@@ -825,6 +994,23 @@ mod tests {
         assert!(!settings.strict_role.value);
         assert_eq!(settings.limits.cursor_expiry.value.as_secs(), 30);
         assert_eq!(settings.loaded_groups(), Vec::new());
+        assert_eq!(settings.result_text.value, ResultText::Full);
+    }
+
+    #[test]
+    fn the_result_text_setting_reads_full_or_summary_and_refuses_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let flags = || FlagLayer {
+            database: Some("app".to_owned()),
+            ..FlagLayer::default()
+        };
+        let summary = Environment::default().with_var("OWNPG_RESULT_TEXT", "summary");
+        let (settings, _) = resolve_with(flags(), &summary, paths_under(dir.path())).unwrap();
+        assert_eq!(settings.result_text.value, ResultText::Summary);
+        assert_eq!(settings.result_text.origin, Origin::Environment);
+        let wrong = Environment::default().with_var("OWNPG_RESULT_TEXT", "json");
+        let error = resolve_with(flags(), &wrong, paths_under(dir.path())).unwrap_err();
+        assert_eq!(error.id(), ErrorId::ConfigInvalid);
     }
 
     #[test]
@@ -1028,6 +1214,120 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_postgres_fallback_gets_its_own_password_file_entry_but_shares_a_plain_password() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pgpass = dir.path().join("pgpass");
+        std::fs::write(
+            &pgpass,
+            "localhost:*:*:alice:for-alice\n127.0.0.1:*:*:postgres:for-postgres\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&pgpass, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let env = Environment::default()
+            .with_var("PGPASSFILE", pgpass.to_str().unwrap())
+            .with_var("PGDATABASE", "app")
+            .with_os_user("alice");
+        let paths = paths_under(dir.path());
+        let (settings, _) = resolve_with(FlagLayer::default(), &env, paths.clone()).unwrap();
+        let expose = |value: &Option<Resolved<Secret>>| {
+            value.as_ref().map(|value| value.value.expose().to_owned())
+        };
+        assert_eq!(
+            expose(&settings.connection.password).as_deref(),
+            Some("for-alice")
+        );
+        assert_eq!(
+            expose(&settings.connection.fallback_password).as_deref(),
+            Some("for-postgres")
+        );
+        let plain = env.clone().with_var("PGPASSWORD", "shared");
+        let (settings, _) = resolve_with(FlagLayer::default(), &plain, paths.clone()).unwrap();
+        assert_eq!(
+            expose(&settings.connection.fallback_password).as_deref(),
+            Some("shared")
+        );
+        let explicit = env
+            .with_var("PGUSER", "alice")
+            .with_var("PGHOST", "db.internal");
+        let (settings, _) = resolve_with(FlagLayer::default(), &explicit, paths).unwrap();
+        assert!(settings.connection.fallback_password.is_none());
+    }
+
+    #[test]
+    fn a_keychain_secret_is_never_released_to_another_profile_file_or_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Environment::default().with_os_user("alice");
+        let owner = paths_under(&dir.path().join("owner"));
+        let foreign = paths_under(&dir.path().join("foreign"));
+        let entry = |host: &str| ProfileEntry {
+            database: Some("app".to_owned()),
+            host: Some(host.to_owned()),
+            password_keychain: Some(true),
+            ..ProfileEntry::default()
+        };
+        let mut file = ProfileFile::default();
+        file.profiles
+            .insert("prod".to_owned(), entry("db.internal"));
+        write_profiles(&owner, &file);
+        let owner_settings = resolve_with(
+            FlagLayer {
+                profile: Some("prod".to_owned()),
+                ..FlagLayer::default()
+            },
+            &env,
+            owner.clone(),
+        )
+        .unwrap()
+        .0;
+        let stored = super::keychain::password_account_for(&owner_settings);
+        let lookup = |account: &str| -> Result<Option<String>> {
+            Ok((account == stored).then(|| "owner-secret".to_owned()))
+        };
+        let resolve_profile = |paths: AppPaths| {
+            resolve(
+                FlagLayer {
+                    profile: Some("prod".to_owned()),
+                    ..FlagLayer::default()
+                },
+                Sources {
+                    env: &env,
+                    paths,
+                    keychain: Some(&lookup),
+                },
+            )
+            .unwrap()
+        };
+        let (released, _) = resolve_profile(owner.clone());
+        assert_eq!(
+            released.connection.password.unwrap().value.expose(),
+            "owner-secret"
+        );
+        let mut foreign_file = ProfileFile::default();
+        foreign_file
+            .profiles
+            .insert("prod".to_owned(), entry("attacker.example"));
+        write_profiles(&foreign, &foreign_file);
+        let (withheld, warnings) = resolve_profile(foreign.clone());
+        assert!(withheld.connection.password.is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.code == "keychain_entry_missing"),
+            "{warnings:?}"
+        );
+        write_profiles(&foreign, &file);
+        let (same_host_other_file, _) = resolve_profile(foreign);
+        assert!(same_host_other_file.connection.password.is_none());
+        file.profiles
+            .insert("prod".to_owned(), entry("moved.internal"));
+        write_profiles(&owner, &file);
+        let (moved, _) = resolve_profile(owner);
+        assert!(moved.connection.password.is_none());
+    }
+
     #[test]
     fn a_profile_password_and_a_password_env_and_the_keychain_are_all_honored() {
         let dir = tempfile::tempdir().unwrap();
@@ -1088,10 +1388,12 @@ mod tests {
             "from-env"
         );
         let lookup = |account: &str| -> Result<Option<String>> {
-            Ok(match account {
-                "profile:chain" => Some("from-keychain".to_owned()),
-                "ssh:chain" => Some("key-phrase".to_owned()),
-                _ => None,
+            Ok(if account.starts_with("pg:") {
+                Some("from-keychain".to_owned())
+            } else if account.starts_with("ssh:") {
+                Some("key-phrase".to_owned())
+            } else {
+                None
             })
         };
         let flags = FlagLayer {
@@ -1232,6 +1534,49 @@ mod tests {
         assert_eq!(ipv6.host, "fe80::1");
         assert!(parse_ssh_target("deploy@").is_err());
         assert!(parse_ssh_target("host:0").is_err());
+    }
+
+    #[test]
+    fn the_system_ssh_transport_refuses_trust_on_first_use_from_any_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_under(dir.path());
+        let mut file = ProfileFile::default();
+        file.profiles.insert(
+            "staging".to_owned(),
+            ProfileEntry {
+                ssh: Some(super::super::profile::SshEntry {
+                    host: "bastion".to_owned(),
+                    trust_new_host: Some(true),
+                    ..Default::default()
+                }),
+                ..ProfileEntry::default()
+            },
+        );
+        write_profiles(&paths, &file);
+        let env = Environment::default()
+            .with_var("OWNPG_DATABASE", "app")
+            .with_var("OWNPG_PROFILE", "staging")
+            .with_var("OWNPG_SSH_TRANSPORT", "system");
+        let refused = resolve_with(FlagLayer::default(), &env, paths.clone()).unwrap_err();
+        assert_eq!(refused.id().as_str(), "config.invalid");
+        assert!(
+            refused.to_string().contains("ssh.trust_new_host"),
+            "{refused}"
+        );
+        let flagged = FlagLayer {
+            ssh_transport: Some(SshTransport::System),
+            ssh_trust_new_host: Some(true),
+            ..FlagLayer::default()
+        };
+        let plain_env = Environment::default()
+            .with_var("OWNPG_DATABASE", "app")
+            .with_var("OWNPG_PROFILE", "staging");
+        assert!(resolve_with(flagged, &plain_env, paths.clone()).is_err());
+        let in_process = FlagLayer {
+            ssh_transport: Some(SshTransport::InProcess),
+            ..FlagLayer::default()
+        };
+        assert!(resolve_with(in_process, &plain_env, paths).is_ok());
     }
 
     #[test]

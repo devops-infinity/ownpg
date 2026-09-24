@@ -11,7 +11,7 @@ use rustls::{
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-use crate::config::{ConnectionSettings, SslMode};
+use crate::config::{ConnectionSettings, SslMode, SslNegotiation};
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,8 @@ impl std::fmt::Debug for Tls {
         f.debug_struct("Tls").field("plan", &self.plan).finish()
     }
 }
+
+const POSTGRESQL_ALPN: &[u8] = b"postgresql";
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
@@ -155,7 +157,7 @@ pub fn build(connection: &ConnectionSettings, target: &str) -> Result<Tls> {
         }
     };
 
-    let config = match (&connection.sslcert, &connection.sslkey) {
+    let mut config = match (&connection.sslcert, &connection.sslkey) {
         (Some(cert), Some(key)) => {
             let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert.value)
                 .map_err(|error| {
@@ -193,6 +195,9 @@ pub fn build(connection: &ConnectionSettings, target: &str) -> Result<Tls> {
         }
         (None, None) => with_verifier.with_no_client_auth(),
     };
+    if connection.ssl_negotiation.value == SslNegotiation::Direct {
+        config.alpn_protocols = vec![POSTGRESQL_ALPN.to_vec()];
+    }
 
     Ok(Tls {
         connector: MakeRustlsConnect::new(config),
@@ -377,11 +382,13 @@ mod tests {
             port: Resolved::preset(5432),
             user: Resolved::preset("u".to_owned()),
             password: None,
+            fallback_password: None,
             sslmode: Resolved::new(mode, Origin::Flag),
             sslrootcert: rootcert.map(|path| Resolved::new(path.into(), Origin::Flag)),
             sslcert: None,
             sslkey: None,
             channel_binding: Resolved::preset(ChannelBinding::Prefer),
+            ssl_negotiation: Resolved::preset(SslNegotiation::Postgres),
             connect_timeout: Resolved::preset(Duration::from_secs(5)),
             application_name: Resolved::preset("ownpg".to_owned()),
             options: None,

@@ -359,6 +359,35 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
     )
     .await;
     rig.ok(
+        "pg_routine",
+        json!({
+            "operation": "alter", "name": "touch_note", "security_definer": "on",
+            "confirm": true
+        }),
+    )
+    .await;
+    let pinned: Vec<String> = scratch
+        .client()
+        .await
+        .query_one(
+            "SELECT coalesce(proconfig, '{}') FROM pg_proc WHERE proname = 'touch_note'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(pinned, ["search_path=app, pg_temp"]);
+    let shadowed = rig
+        .failed(
+            "pg_routine",
+            json!({
+                "operation": "alter", "name": "touch_note", "security_definer": "on",
+                "set_config": ["search_path = public"], "confirm": true
+            }),
+        )
+        .await;
+    assert_eq!(shadowed["code"], "argument.invalid");
+    rig.ok(
         "pg_trigger",
         json!({"operation": "create", "name": "orders_touch", "table": "orders", "timing": "before", "events": ["insert", "update"], "for_each_row": true, "function": "touch_note"}),
     )
@@ -619,10 +648,17 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
         json!({"operation": "set_owner", "name": "orders_pub_v2", "owner": scratch.user.clone()}),
     )
     .await;
-    let all_tables = rig
+    let unconfirmed = rig
         .failed(
             "pg_publication",
             json!({"operation": "create", "name": "everything_pub", "for_all_tables": true}),
+        )
+        .await;
+    assert_eq!(unconfirmed["code"], "confirmation.required");
+    let all_tables = rig
+        .failed(
+            "pg_publication",
+            json!({"operation": "create", "name": "everything_pub", "for_all_tables": true, "confirm": true}),
         )
         .await;
     assert_eq!(all_tables["code"], "sql.failed");
@@ -656,5 +692,176 @@ async fn the_ddl_tools_build_a_schema_end_to_end() {
         .failed("pg_describe", json!({"name": "customers"}))
         .await;
     assert_eq!(gone["code"], "argument.invalid");
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cascade_lists_its_dependents_and_refuses_to_reach_outside_the_schema() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let rig = rig(&scratch).await;
+    scratch
+        .client()
+        .await
+        .batch_execute(
+            "CREATE TABLE app.t (id int, note text); \
+             CREATE VIEW app.v AS SELECT id FROM app.t; \
+             CREATE VIEW app.vv AS SELECT id FROM app.v; \
+             CREATE VIEW other.w AS SELECT note FROM app.t;",
+        )
+        .await
+        .unwrap();
+
+    let refused = rig
+        .failed(
+            "pg_table",
+            json!({"operation": "drop", "name": "t", "cascade": true, "dry_run": true}),
+        )
+        .await;
+    assert_eq!(refused["code"], "statement.refused", "{refused}");
+    let rule = refused["rule"].as_str().unwrap();
+    assert!(rule.contains("view other.w"), "{rule}");
+    assert!(!rule.contains("app.v"), "{rule}");
+    let raw = rig
+        .failed(
+            "pg_run_write",
+            json!({"sql": "DROP TABLE app.t CASCADE", "confirm": true}),
+        )
+        .await;
+    assert_eq!(raw["code"], "statement.refused", "{raw}");
+    assert!(
+        raw["rule"]
+            .as_str()
+            .unwrap()
+            .contains("belongs to the ddl tools"),
+        "{raw}"
+    );
+    let column = rig
+        .failed(
+            "pg_column",
+            json!({"operation": "drop", "table": "t", "column": "note", "cascade": true, "confirm": true}),
+        )
+        .await;
+    assert!(
+        column["rule"].as_str().unwrap().contains("other.w"),
+        "{column}"
+    );
+    rig.ok(
+        "pg_column",
+        json!({"operation": "drop", "table": "t", "column": "id", "cascade": true, "dry_run": true}),
+    )
+    .await;
+
+    scratch
+        .client()
+        .await
+        .batch_execute("DROP VIEW other.w")
+        .await
+        .unwrap();
+    let dry = rig
+        .ok(
+            "pg_table",
+            json!({"operation": "drop", "name": "t", "cascade": true, "dry_run": true}),
+        )
+        .await;
+    let listed: Vec<&str> = dry["cascades_to"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item.as_str().unwrap())
+        .collect();
+    assert_eq!(listed, ["view app.v", "view app.vv"], "{dry}");
+    rig.ok(
+        "pg_table",
+        json!({"operation": "drop", "name": "t", "cascade": true, "confirm": true}),
+    )
+    .await;
+    let remaining: i64 = scratch
+        .client()
+        .await
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'app'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 0);
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_temporary_table_is_created_without_the_schema_prefix() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let rig = rig(&scratch).await;
+    let sql = rig
+        .dry_run_sql(
+            "pg_table",
+            json!({"operation": "create", "name": "scratch_rows", "temporary": true, "columns": [{"name": "id", "data_type": "integer"}]}),
+        )
+        .await;
+    assert_eq!(
+        sql,
+        "CREATE TEMPORARY TABLE \"scratch_rows\" (\"id\" integer)"
+    );
+    rig.ok(
+        "pg_table",
+        json!({"operation": "create", "name": "scratch_rows", "temporary": true, "columns": [{"name": "id", "data_type": "integer"}]}),
+    )
+    .await;
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trailing_comment_in_a_view_query_never_hides_its_options() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let rig = rig(&scratch).await;
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE TABLE app.t (id int)")
+        .await
+        .unwrap();
+    rig.ok(
+        "pg_view",
+        json!({"operation": "create", "name": "checked", "query": "SELECT id FROM app.t WHERE id > 0 -- positive only", "check_option": "local"}),
+    )
+    .await;
+    rig.ok(
+        "pg_view",
+        json!({"operation": "create", "name": "empty_mv", "materialized": true, "with_data": false, "query": "SELECT id FROM app.t -- none yet"}),
+    )
+    .await;
+    let client = scratch.client().await;
+    let option: String = client
+        .query_one(
+            "SELECT check_option::text FROM information_schema.views WHERE table_schema = 'app' AND table_name = 'checked'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(option, "LOCAL");
+    let populated: bool = client
+        .query_one(
+            "SELECT ispopulated FROM pg_catalog.pg_matviews WHERE schemaname = 'app' AND matviewname = 'empty_mv'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!populated);
+    let unnamed = rig
+        .failed(
+            "pg_index",
+            json!({"operation": "create", "table": "t", "columns": ["id"], "if_not_exists": true}),
+        )
+        .await;
+    assert_eq!(unnamed["code"], "argument.invalid");
     rig.finish().await;
 }

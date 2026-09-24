@@ -3,11 +3,12 @@ set -Eeuo pipefail
 
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO/tools/lib.sh"
+require_bash 4.4 "$REPO/tools/reinstall.sh" "$@"
+shopt -s inherit_errexit
 BIN="ownpg"
 PROFILE="release"
 INSTALL_DIR="${OWNPG_INSTALL_DIR:-$HOME/.local/bin}"
 SKIP_GATE=0
-KEEP_CACHE=0
 FULL_CLEAN=0
 KEEP_BUILD=0
 STALE_DAYS="${OWNPG_STALE_DAYS:-7}"
@@ -22,7 +23,6 @@ Usage: tools/reinstall.sh [options]
   --debug           build the debug profile instead of release
   --dir <path>      install into this directory (default ~/.local/bin)
   --skip-gate       install without running the verification gate first
-  --keep-cache      leave the OwnPG cache directory in place
   --full-clean      empty target/ first, so the next build starts cold
   --keep-build      leave target/ alone this run
   --stale-days <n>  drop unused build data older than this (default 7)
@@ -51,10 +51,6 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--skip-gate)
 		SKIP_GATE=1
-		shift
-		;;
-	--keep-cache)
-		KEEP_CACHE=1
 		shift
 		;;
 	--full-clean)
@@ -94,44 +90,23 @@ cleanup_tmp() {
 		rm -f "$INSTALL_TMP"
 	fi
 }
+on_signal() {
+	say FAILED "interrupted"
+	cleanup_tmp
+	trap - "$1"
+	kill -s "$1" "$$"
+}
 trap cleanup_tmp EXIT
-trap 'say FAILED "interrupted"; exit 130' INT
-trap 'say FAILED "interrupted"; exit 143' TERM
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 
 command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH"
 
 say INFO "repository $REPO"
 say INFO "profile $PROFILE, installing into $INSTALL_DIR"
 
-REMOVED=0
-for CANDIDATE in "$INSTALL_DIR/$BIN" /usr/local/bin/"$BIN" "$HOME/.cargo/bin/$BIN"; do
-	if [[ -e "$CANDIDATE" ]]; then
-		if rm -f "$CANDIDATE"; then
-			say INFO "removed $CANDIDATE"
-		else
-			say WARNING "could not remove $CANDIDATE"
-		fi
-		REMOVED=$((REMOVED + 1))
-	fi
-done
-if command -v cargo-uninstall >/dev/null 2>&1 || cargo uninstall --help >/dev/null 2>&1; then
-	cargo uninstall "$BIN" >/dev/null 2>&1 && say INFO "removed the cargo-installed copy" || true
-fi
-[[ $REMOVED -eq 0 ]] && say INFO "no previously installed copy found"
-
-if [[ $KEEP_CACHE -eq 0 ]]; then
-	for CACHE in \
-		"${XDG_CACHE_HOME:-$HOME/.cache}/ownpg" \
-		"${LOCALAPPDATA:-$HOME/AppData/Local}/devops/ownpg/cache"; do
-		if [[ -d "$CACHE" ]]; then
-			if rm -rf "$CACHE"; then
-				say INFO "cleared cache $CACHE"
-			else
-				say WARNING "could not clear cache $CACHE"
-			fi
-		fi
-	done
-fi
+sweep_stale_install_temps "$INSTALL_DIR" "$BIN" ||
+	say WARNING "could not clear stale temp files from $INSTALL_DIR"
 
 if [[ "$(stat -f '%m' . 2>/dev/null)" =~ ^[0-9]+$ ]]; then
 	mtimes() { stat -f '%Fm %N' "$@"; }
@@ -441,6 +416,27 @@ BUILT_SUM="$(checksum "$BUILT")"
 INSTALLED_SUM="$(checksum "$INSTALL_DIR/$BIN")"
 [[ "$BUILT_SUM" == "$INSTALLED_SUM" ]] || die "the installed binary does not match the built one"
 say SUCCESS "installed copy matches the build"
+
+REMOVED=0
+for CANDIDATE in /usr/local/bin/"$BIN" "$HOME/.cargo/bin/$BIN"; do
+	if [[ ! -e "$CANDIDATE" || "$CANDIDATE" -ef "$INSTALL_DIR/$BIN" ]]; then
+		continue
+	fi
+	if rm -f "$CANDIDATE"; then
+		say INFO "removed $CANDIDATE"
+	else
+		say WARNING "could not remove $CANDIDATE"
+	fi
+	REMOVED=$((REMOVED + 1))
+done
+if [[ "${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin" -ef "$INSTALL_DIR" ]]; then
+	say INFO "left cargo's record of $BIN alone, since $INSTALL_DIR is cargo's own bin directory"
+elif command -v cargo-uninstall >/dev/null 2>&1 || cargo uninstall --help >/dev/null 2>&1; then
+	cargo uninstall "${BIN%.exe}" >/dev/null 2>&1 && say INFO "removed the cargo-installed copy" || true
+fi
+if [[ $REMOVED -eq 0 ]]; then
+	say INFO "no other installed copy found"
+fi
 
 RESOLVED="$(command -v "$BIN" 2>/dev/null || true)"
 if [[ -z "$RESOLVED" ]]; then

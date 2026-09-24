@@ -7,16 +7,16 @@ use super::ddl::{Missing, Toggle, cascade_suffix, if_exists_clause, number, run_
 use super::{AuditFacts, Call, Outcome, Route, ToolOutput, route, text_rows};
 use crate::error::{Error, Result};
 use crate::render::{expression, ident_list, quote_ident, quote_literal, validate_ident};
-use crate::shape::{ResultSet, UNTRUSTED_NOTICE};
+use crate::shape::UNTRUSTED_NOTICE;
 use crate::tool_specs;
 
-const ROLE_DESCRIPTION: &str = "Create, alter, rename, or drop a role, grant or revoke membership in another role, and set or reset a configuration parameter for a role. Attributes cover login, createdb, createrole, inherit, replication, bypassrls, superuser, connection limit, password, and validity. The password never appears in logs or the audit trail. drop is destructive and needs confirm: true or the confirmation prompt.";
+const ROLE_DESCRIPTION: &str = "Create, alter, rename, or drop a role, grant or revoke membership in another role, and set or reset a configuration parameter for a role. Attributes cover login, createdb, createrole, inherit, replication, bypassrls, superuser, connection limit, password, and validity. A password is hashed on this side with the server's password_encryption method (SCRAM-SHA-256, or MD5 where the server still uses it) before it is sent, so the clear text never reaches the server, its logs, or the audit trail; a value that is already a SCRAM or MD5 hash is stored as given. drop is destructive and needs confirm: true or the confirmation prompt.";
 
 const GRANT_DESCRIPTION: &str = "Grant or revoke privileges on tables, sequences, routines, the scoped schema, the served database, or configuration parameters, including every table or sequence in the scoped schema, and set default privileges for objects created later. revoke can cascade to dependent grants.";
 
 const POLICY_DESCRIPTION: &str = "Manage row-level security on a table in the scoped schema: create, alter, rename, or drop a policy, and enable, disable, force, or unforce row-level security on the table. A policy names the command it covers, the roles it applies to, whether it is permissive or restrictive, and its USING and WITH CHECK expressions.";
 
-const PRIVILEGES_DESCRIPTION: &str = "List privileges, or apply a least-privilege template. object lists the grants on one table, view, or sequence; role lists what a role can do on every table in the scoped schema and which roles it belongs to; template applies the read_only, write_only, or read_write set to a role in one statement (schema usage, table and sequence privileges, default privileges, and the read-only session default), with dry_run showing the statements first.";
+const PRIVILEGES_DESCRIPTION: &str = "List privileges, or apply a least-privilege template. object lists the grants on one table, view, or sequence; role lists what a role can do on every table in the scoped schema and which roles it belongs to; defaults lists the default privileges that apply to new objects in the scoped schema, including those set for every schema, optionally for one creating role named in name; template applies the read_only, write_only, or read_write set to a role in one statement (schema usage, table and sequence privileges, default privileges, and the read-only session default), with dry_run showing the statements first.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -56,7 +56,7 @@ pub struct RoleArgs {
     pub connection_limit: String,
     #[serde(default)]
     #[schemars(
-        description = "create and alter: the password; it is sent to PostgreSQL and never logged."
+        description = "create and alter: the password; it is hashed before it is sent and never logged."
     )]
     pub password: String,
     #[serde(default)]
@@ -103,7 +103,46 @@ pub struct RoleArgs {
     pub transaction: String,
 }
 
-fn role_options(args: &RoleArgs) -> Result<Vec<String>> {
+const REDACTED_PASSWORD: &str = "'***'";
+
+fn is_stored_form(password: &str) -> bool {
+    password.starts_with("SCRAM-SHA-256$")
+        || (password.len() == 35
+            && password.starts_with("md5")
+            && password
+                .get(3..)
+                .is_some_and(|hex| hex.bytes().all(|byte| byte.is_ascii_hexdigit())))
+}
+
+async fn password_literal(call: &Call, args: &RoleArgs) -> Result<Option<String>> {
+    if args.clear_password || args.password.is_empty() {
+        return Ok(None);
+    }
+    if args.dry_run {
+        return Ok(Some(REDACTED_PASSWORD.to_owned()));
+    }
+    if is_stored_form(&args.password) {
+        return Ok(Some(quote_literal(&args.password)));
+    }
+    let rows = call
+        .engine()
+        .catalog_rows(
+            "SELECT pg_catalog.current_setting('password_encryption')",
+            &[],
+        )
+        .await?;
+    let method: String = rows
+        .first()
+        .map_or(Ok(String::new()), |row| super::catalog::read_column(row, 0))?;
+    let stored = if method == "md5" {
+        postgres_protocol::password::md5(args.password.as_bytes(), &args.name)
+    } else {
+        postgres_protocol::password::scram_sha_256(args.password.as_bytes())
+    };
+    Ok(Some(quote_literal(&stored)))
+}
+
+fn role_options(args: &RoleArgs, password: Option<&str>) -> Result<Vec<String>> {
     let mut parts = Vec::new();
     let flag = |value: Toggle, yes: &str, no: &str| -> Option<String> {
         value
@@ -122,8 +161,8 @@ fn role_options(args: &RoleArgs) -> Result<Vec<String>> {
     }
     if args.clear_password {
         parts.push("PASSWORD NULL".to_owned());
-    } else if !args.password.is_empty() {
-        parts.push(format!("PASSWORD {}", quote_literal(&args.password)));
+    } else if let Some(password) = password {
+        parts.push(format!("PASSWORD {password}"));
     }
     if !args.valid_until.trim().is_empty() {
         parts.push(format!(
@@ -138,9 +177,14 @@ pub fn role(call: Call, args: RoleArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         validate_ident("name", &args.name)?;
         let name = quote_ident(&args.name);
+        let password = if matches!(args.operation, RoleOperation::Create | RoleOperation::Alter) {
+            password_literal(&call, &args).await?
+        } else {
+            None
+        };
         let (sql, kinds): (String, &[&str]) = match args.operation {
             RoleOperation::Create => {
-                let mut options = role_options(&args)?;
+                let mut options = role_options(&args, password.as_deref())?;
                 if !args.in_roles.is_empty() {
                     options.push(format!(
                         "IN ROLE {}",
@@ -157,7 +201,7 @@ pub fn role(call: Call, args: RoleArgs) -> BoxFuture<'static, Outcome> {
                 )
             }
             RoleOperation::Alter => {
-                let options = role_options(&args)?;
+                let options = role_options(&args, password.as_deref())?;
                 if options.is_empty() {
                     return Err(Error::ArgumentInvalid {
                         argument: "operation".to_owned(),
@@ -260,15 +304,6 @@ pub fn role(call: Call, args: RoleArgs) -> BoxFuture<'static, Outcome> {
                     &["AlterRoleSetStmt"],
                 )
             }
-        };
-        let sql = if args.dry_run && !args.password.is_empty() && !args.clear_password {
-            sql.replacen(
-                &format!("PASSWORD {}", quote_literal(&args.password)),
-                "PASSWORD '***'",
-                1,
-            )
-        } else {
-            sql
         };
         run_ddl(
             &call,
@@ -728,6 +763,7 @@ pub fn policy(call: Call, args: PolicyArgs) -> BoxFuture<'static, Outcome> {
 pub enum PrivilegesOperation {
     ListObject,
     ListRole,
+    ListDefaults,
     ApplyTemplate,
 }
 
@@ -746,7 +782,9 @@ pub enum Template {
 pub struct PrivilegesArgs {
     pub operation: PrivilegesOperation,
     #[serde(default)]
-    #[schemars(description = "object: the table, view, or sequence; role and template: the role.")]
+    #[schemars(
+        description = "object: the table, view, or sequence; role and template: the role; defaults: the creating role, or empty for every role."
+    )]
     pub name: String,
     #[serde(default)]
     #[schemars(description = "template: read_only, write_only, or read_write.")]
@@ -764,11 +802,29 @@ pub struct RolePrivilegeRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum PrivilegesOutput {
+    Object(ObjectPrivileges),
+    Role(RolePrivileges),
+    Defaults(DefaultPrivileges),
+    Rows(crate::shape::ResultSet),
+    DryRun(crate::tools::write::DryRun),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct RolePrivileges {
     pub role: String,
     pub has_schema_usage: bool,
     pub member_of: Vec<String>,
     pub tables: Vec<RolePrivilegeRow>,
+    pub notice: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DefaultPrivileges {
+    pub schema: String,
+    pub defaults: Vec<catalog::DefaultPrivilegeRow>,
+    pub row_count: usize,
     pub notice: &'static str,
 }
 
@@ -964,6 +1020,53 @@ pub fn privileges(call: Call, args: PrivilegesArgs) -> BoxFuture<'static, Outcom
                     })
                     .into())
             }
+            PrivilegesOperation::ListDefaults => {
+                let creator = args.name.trim();
+                if !creator.is_empty() {
+                    validate_ident("name", creator)?;
+                }
+                let mut defaults =
+                    catalog::describe_default_privileges(call.engine(), &scoped).await?;
+                defaults.retain(|row| creator.is_empty() || row.for_role == creator);
+                let text = text_rows(
+                    &[
+                        ("for_role", "text"),
+                        ("schema", "text"),
+                        ("object_type", "text"),
+                        ("grantee", "text"),
+                        ("privilege", "text"),
+                        ("grantable", "bool"),
+                    ],
+                    defaults
+                        .iter()
+                        .map(|row| {
+                            vec![
+                                Some(row.for_role.clone()),
+                                row.schema.clone(),
+                                Some(row.object_type.clone()),
+                                Some(row.grantee.clone()),
+                                Some(row.privilege.clone()),
+                                Some(row.grantable.to_string()),
+                            ]
+                        })
+                        .collect(),
+                    None,
+                    None,
+                );
+                let result = DefaultPrivileges {
+                    schema: scoped,
+                    row_count: defaults.len(),
+                    defaults,
+                    notice: UNTRUSTED_NOTICE,
+                };
+                Ok(ToolOutput::structured(&result, text)?
+                    .with_facts(AuditFacts {
+                        operation: Some("defaults".to_owned()),
+                        row_count: Some(result.row_count as u64),
+                        ..AuditFacts::default()
+                    })
+                    .into())
+            }
             PrivilegesOperation::ApplyTemplate => {
                 if args.template == Template::Unset {
                     return Err(Error::ArgumentInvalid {
@@ -992,10 +1095,22 @@ pub fn privileges(call: Call, args: PrivilegesArgs) -> BoxFuture<'static, Outcom
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<RoleArgs, ResultSet, _>(&tool_specs::PG_ROLE, ROLE_DESCRIPTION, role)?,
-        route::<GrantArgs, ResultSet, _>(&tool_specs::PG_GRANT, GRANT_DESCRIPTION, grant)?,
-        route::<PolicyArgs, ResultSet, _>(&tool_specs::PG_POLICY, POLICY_DESCRIPTION, policy)?,
-        route::<PrivilegesArgs, ResultSet, _>(
+        route::<RoleArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_ROLE,
+            ROLE_DESCRIPTION,
+            role,
+        )?,
+        route::<GrantArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_GRANT,
+            GRANT_DESCRIPTION,
+            grant,
+        )?,
+        route::<PolicyArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_POLICY,
+            POLICY_DESCRIPTION,
+            policy,
+        )?,
+        route::<PrivilegesArgs, PrivilegesOutput, _>(
             &tool_specs::PG_PRIVILEGES,
             PRIVILEGES_DESCRIPTION,
             privileges,
@@ -1006,6 +1121,24 @@ pub fn routes() -> Result<Vec<Route>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ready_hash_is_recognized_and_a_plain_password_is_not() {
+        let scram = postgres_protocol::password::scram_sha_256(b"s3cret");
+        assert!(scram.starts_with("SCRAM-SHA-256$4096:"), "{scram}");
+        assert!(is_stored_form(&scram));
+        let md5 = postgres_protocol::password::md5(b"s3cret", "app_reader");
+        assert_eq!(md5.len(), 35);
+        assert!(is_stored_form(&md5));
+        for plain in [
+            "s3cret",
+            "md5",
+            "md5-not-a-hash-of-the-right-length",
+            "scram-sha-256$lower",
+        ] {
+            assert!(!is_stored_form(plain), "{plain}");
+        }
+    }
 
     #[test]
     fn privilege_and_role_lists_are_validated() {

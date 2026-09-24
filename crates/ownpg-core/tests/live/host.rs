@@ -190,7 +190,7 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
         .map(|value| value.as_str().unwrap())
         .collect();
     assert!(arguments.contains(&format!("--dbname={}", rig.database).as_str()));
-    assert!(arguments.contains(&"--schema=app"));
+    assert!(arguments.contains(&"--schema=\"app\""), "{arguments:?}");
     assert!(arguments.contains(&"--format=custom"));
     assert!(arguments.contains(&"--table=\"app\".\"items\""));
     assert!(arguments.contains(&"--no-password"));
@@ -273,6 +273,10 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
     let dump_file = rig.output_dir.join("app.dump");
     assert!(dumped["output_bytes"].as_u64().unwrap() > 0);
     assert_eq!(dumped["output"], dump_file.display().to_string());
+    assert_eq!(
+        dumped["output_sha256"],
+        ownpg_core::audit::sha256_hex(&std::fs::read(&dump_file).unwrap())
+    );
     assert!(!rig.output_dir.join("app.dump.ownpg-partial").exists());
     #[cfg(unix)]
     assert_eq!(permission_bits(&dump_file), 0o600);
@@ -303,6 +307,54 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
             .iter()
             .any(|argument| argument.contains('"')),
         "{restore_arguments:?}"
+    );
+    assert!(
+        restore_arguments.contains(&"--single-transaction"),
+        "{restore_arguments:?}"
+    );
+    assert!(
+        !restore_arguments.contains(&"--exit-on-error"),
+        "{restore_arguments:?}"
+    );
+    let clean_dry = rig
+        .ok(
+            "pg_restore",
+            json!({"file": "app.dump", "clean": true, "dry_run": true}),
+        )
+        .await;
+    let clean_arguments = clean_dry["arguments"].to_string();
+    assert!(clean_arguments.contains("--if-exists"), "{clean_arguments}");
+    let batched_dry = rig
+        .ok(
+            "pg_restore",
+            json!({"file": "app.dump", "transaction_size": "100", "dry_run": true}),
+        )
+        .await;
+    let batched_arguments = batched_dry["arguments"].to_string();
+    assert!(
+        batched_arguments.contains("--transaction-size=100")
+            && batched_arguments.contains("--exit-on-error")
+            && !batched_arguments.contains("--single-transaction"),
+        "{batched_arguments}"
+    );
+    let conflicting = rig
+        .failed(
+            "pg_restore",
+            json!({"file": "app.dump", "transaction_size": "100", "single_transaction": "on"}),
+        )
+        .await;
+    assert_eq!(conflicting["code"], "argument.invalid", "{conflicting}");
+    let globals_dry = rig
+        .ok(
+            "pg_dumpall_globals",
+            json!({"file": "globals.sql", "dry_run": true}),
+        )
+        .await;
+    assert!(
+        globals_dry["arguments"]
+            .to_string()
+            .contains("--no-role-passwords"),
+        "{globals_dry}"
     );
 
     let plain = rig
@@ -343,7 +395,7 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
     let cleaned = rig
         .ok(
             "pg_restore",
-            json!({"file": "app.dump", "clean": true, "if_exists": true, "confirm": true}),
+            json!({"file": "app.dump", "clean": true, "confirm": true}),
         )
         .await;
     assert_eq!(cleaned["exit_code"], 0, "{cleaned}");

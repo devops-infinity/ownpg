@@ -52,6 +52,8 @@ pub struct Check {
 pub struct HealthReport {
     pub database: String,
     pub server_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_warning: Option<String>,
     pub status: Status,
     pub checks: Vec<Check>,
     pub notice: &'static str,
@@ -249,7 +251,7 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
         .catalog_rows(
             &format!(
                 "SELECT count(*)::int8, COALESCE(sum(size_bytes), 0)::int8 FROM ({}) AS findings WHERE problem = 'unused'",
-                monitoring::indexes_health_sql(&scoped)
+                monitoring::indexes_health_sql(&scoped, engine.features())
             ),
             &[],
         )
@@ -390,6 +392,7 @@ pub async fn health_report(engine: &Engine) -> Result<HealthReport> {
     }
 
     Ok(HealthReport {
+        server_warning: engine.features().version_warning(&info.server_version),
         database: info.database,
         server_version: info.server_version,
         status: worst(&checks),
@@ -443,6 +446,8 @@ pub struct DoctorReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_warning: Option<String>,
     pub server_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_warning: Option<String>,
     pub role: String,
     pub role_attributes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -520,6 +525,7 @@ pub async fn doctor_report(
         tls,
         tls_warning: info.tls_warning(),
         server_version: info.server_version.clone(),
+        server_warning: engine.features().version_warning(&info.server_version),
         role: role.name.clone(),
         role_attributes: attributes,
         role_warning: role.warning(),
@@ -553,15 +559,35 @@ pub async fn doctor_report(
     })
 }
 
+fn hide_local_paths(report: &mut DoctorReport) {
+    let hidden = crate::config::describe::MASKED;
+    for line in &mut report.settings {
+        if std::path::Path::new(&line.value).is_absolute() {
+            hidden.clone_into(&mut line.value);
+        }
+    }
+    if report.audit_path.is_some() {
+        report.audit_path = Some(hidden.to_owned());
+    }
+    for program in &mut report.host_programs {
+        if program.path.is_some() {
+            program.path = Some(hidden.to_owned());
+        }
+    }
+}
+
 pub fn doctor(call: Call, _args: NoArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let context = call.context.clone();
-        let report = doctor_report(
+        let mut report = doctor_report(
             &context.engine,
             context.audit.path(),
             context.audit.warning(),
         )
         .await?;
+        if context.transport == crate::audit::Transport::Http {
+            hide_local_paths(&mut report);
+        }
         let text = render_doctor(&report);
         Ok(ToolOutput::structured(&report, text)?
             .with_facts(AuditFacts {
@@ -582,6 +608,9 @@ pub fn render_doctor(report: &DoctorReport) -> String {
         text.push_str(&format!("warning: {warning}\n"));
     }
     text.push_str(&format!("server: PostgreSQL {}\n", report.server_version));
+    if let Some(warning) = &report.server_warning {
+        text.push_str(&format!("warning: {warning}\n"));
+    }
     text.push_str(&format!(
         "role: {}{}\n",
         report.role,
@@ -681,6 +710,7 @@ mod tests {
             tls: "not applicable (socket)".to_owned(),
             tls_warning: None,
             server_version: "18.6".to_owned(),
+            server_warning: None,
             role: "app".to_owned(),
             role_attributes: Vec::new(),
             role_warning: None,
@@ -700,6 +730,34 @@ mod tests {
             host_programs: Vec::new(),
             version: "0.1.0".to_owned(),
         }
+    }
+
+    #[test]
+    fn remote_callers_see_that_a_path_is_set_but_not_where_it_is() {
+        let mut shown = report(None);
+        shown.settings = vec![
+            crate::config::describe::SettingLine {
+                name: "config_file".to_owned(),
+                value: "/home/alice/.config/ownpg/profiles.toml".to_owned(),
+                origin: "preset".to_owned(),
+            },
+            crate::config::describe::SettingLine {
+                name: "mode".to_owned(),
+                value: "read-only".to_owned(),
+                origin: "flag".to_owned(),
+            },
+        ];
+        shown.host_programs = vec![super::super::host::HostProgram {
+            name: "pg_dump".to_owned(),
+            path: Some("/opt/pg/bin/pg_dump".to_owned()),
+            version: Some("18.6".to_owned()),
+        }];
+        hide_local_paths(&mut shown);
+        assert_eq!(shown.settings[0].value, "set");
+        assert_eq!(shown.settings[1].value, "read-only");
+        assert_eq!(shown.audit_path.as_deref(), Some("set"));
+        assert_eq!(shown.host_programs[0].path.as_deref(), Some("set"));
+        assert_eq!(shown.host_programs[0].version.as_deref(), Some("18.6"));
     }
 
     #[test]

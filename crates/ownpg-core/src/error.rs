@@ -62,6 +62,11 @@ pub enum ErrorId {
     ArgumentInvalid,
     ConfirmationRequired,
     ScopeInsufficient,
+    CallCancelled,
+    CommitOutcomeUnknown,
+    PoolExhausted,
+    AuditDegraded,
+    ServerNotReady,
 }
 
 impl ErrorId {
@@ -101,6 +106,11 @@ impl ErrorId {
             Self::ArgumentInvalid => "argument.invalid",
             Self::ConfirmationRequired => "confirmation.required",
             Self::ScopeInsufficient => "scope.insufficient",
+            Self::CallCancelled => "call.cancelled",
+            Self::CommitOutcomeUnknown => "commit.outcome_unknown",
+            Self::PoolExhausted => "pool.exhausted",
+            Self::AuditDegraded => "audit.degraded",
+            Self::ServerNotReady => "server.not_ready",
         }
     }
 }
@@ -269,6 +279,27 @@ pub enum Error {
 
     #[error("the token does not carry the `{scope}` scope this tool needs")]
     ScopeInsufficient { scope: String },
+
+    #[error(
+        "the call was cancelled before its next statement started, so that statement did not run"
+    )]
+    CallCancelled,
+
+    #[error(
+        "the connection closed while `{operation}` was finishing, so whether it committed is unknown"
+    )]
+    CommitOutcomeUnknown { operation: String },
+
+    #[error("every pooled connection stayed busy for {waited_seconds} seconds")]
+    PoolExhausted { waited_seconds: u64 },
+
+    #[error(
+        "the audit log cannot be written, so this call is refused under audit_on_failure = {policy}"
+    )]
+    AuditDegraded { policy: String, detail: String },
+
+    #[error("the server at {url} is not ready: {detail}")]
+    ServerNotReady { url: String, detail: String },
 }
 
 impl Error {
@@ -308,6 +339,11 @@ impl Error {
             Self::ArgumentInvalid { .. } => ErrorId::ArgumentInvalid,
             Self::ConfirmationRequired { .. } => ErrorId::ConfirmationRequired,
             Self::ScopeInsufficient { .. } => ErrorId::ScopeInsufficient,
+            Self::CallCancelled => ErrorId::CallCancelled,
+            Self::CommitOutcomeUnknown { .. } => ErrorId::CommitOutcomeUnknown,
+            Self::PoolExhausted { .. } => ErrorId::PoolExhausted,
+            Self::AuditDegraded { .. } => ErrorId::AuditDegraded,
+            Self::ServerNotReady { .. } => ErrorId::ServerNotReady,
         }
     }
 
@@ -333,20 +369,25 @@ impl Error {
             | Self::ProtocolFailed { .. }
             | Self::SqlFailed { .. }
             | Self::ExtensionMissing { .. }
-            | Self::ExtensionOutdated { .. } => ExitClass::Runtime,
+            | Self::ExtensionOutdated { .. }
+            | Self::CommitOutcomeUnknown { .. }
+            | Self::ServerNotReady { .. } => ExitClass::Runtime,
             Self::StatementUnparsable { .. }
             | Self::StatementMultiple { .. }
             | Self::StatementRefused { .. }
             | Self::RoleRefused { .. }
             | Self::SshHostKeyUnknown { .. }
             | Self::ConfirmationRequired { .. }
-            | Self::ScopeInsufficient { .. } => ExitClass::Refused,
+            | Self::ScopeInsufficient { .. }
+            | Self::AuditDegraded { .. } => ExitClass::Refused,
             Self::ConnectFailed { .. }
             | Self::TlsFailed { .. }
             | Self::SshFailed { .. }
             | Self::AuditUnwritable { .. }
             | Self::HostBinaryMissing { .. }
-            | Self::SubprocessFailed { .. } => ExitClass::External,
+            | Self::SubprocessFailed { .. }
+            | Self::PoolExhausted { .. } => ExitClass::External,
+            Self::CallCancelled => ExitClass::Interrupted,
         }
     }
 
@@ -473,6 +514,21 @@ impl Error {
             }
             Self::ScopeInsufficient { scope } => {
                 format!("Ask the identity provider for a token that carries the `{scope}` scope, or use a bearer token bound to a mode that allows this tool.")
+            }
+            Self::CallCancelled => {
+                "Call the tool again if the work is still wanted; statements that finished before the cancel keep their effect.".to_owned()
+            }
+            Self::CommitOutcomeUnknown { .. } => {
+                "Read the affected rows before you retry: the transaction may have committed, and running it again could apply it twice.".to_owned()
+            }
+            Self::PoolExhausted { .. } => {
+                "Retry in a moment, close transaction handles that are no longer needed, or raise the pool size.".to_owned()
+            }
+            Self::AuditDegraded { detail, .. } => {
+                format!("Fix the audit log ({detail}); calls resume on their own once a line can be written. Reads still run.")
+            }
+            Self::ServerNotReady { .. } => {
+                "Start `ownpg serve --http`, or point --bind or OWNPG_BIND at the address it listens on; a 503 answer names the part that is not ready.".to_owned()
             }
         }
     }
@@ -616,6 +672,19 @@ mod tests {
             Error::ScopeInsufficient {
                 scope: "ownpg:write".to_owned(),
             },
+            Error::CallCancelled,
+            Error::CommitOutcomeUnknown {
+                operation: "COMMIT".to_owned(),
+            },
+            Error::PoolExhausted { waited_seconds: 10 },
+            Error::AuditDegraded {
+                policy: "refuse-writes".to_owned(),
+                detail: "no space left on device".to_owned(),
+            },
+            Error::ServerNotReady {
+                url: "http://127.0.0.1:8765/healthz/ready".to_owned(),
+                detail: "503 not ready: PostgreSQL is not reachable".to_owned(),
+            },
         ]
     }
 
@@ -687,20 +756,25 @@ mod tests {
                 | ErrorId::ProtocolFailed
                 | ErrorId::SqlFailed
                 | ErrorId::ExtensionMissing
-                | ErrorId::ExtensionOutdated => ExitClass::Runtime,
+                | ErrorId::ExtensionOutdated
+                | ErrorId::CommitOutcomeUnknown
+                | ErrorId::ServerNotReady => ExitClass::Runtime,
                 ErrorId::StatementUnparsable
                 | ErrorId::StatementMultiple
                 | ErrorId::StatementRefused
                 | ErrorId::RoleRefused
                 | ErrorId::SshHostKeyUnknown
                 | ErrorId::ConfirmationRequired
-                | ErrorId::ScopeInsufficient => ExitClass::Refused,
+                | ErrorId::ScopeInsufficient
+                | ErrorId::AuditDegraded => ExitClass::Refused,
                 ErrorId::ConnectFailed
                 | ErrorId::TlsFailed
                 | ErrorId::SshFailed
                 | ErrorId::AuditUnwritable
                 | ErrorId::HostBinaryMissing
-                | ErrorId::SubprocessFailed => ExitClass::External,
+                | ErrorId::SubprocessFailed
+                | ErrorId::PoolExhausted => ExitClass::External,
+                ErrorId::CallCancelled => ExitClass::Interrupted,
             };
             assert_eq!(case.exit_class(), expected, "{case:?}");
         }

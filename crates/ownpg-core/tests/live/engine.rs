@@ -76,6 +76,46 @@ async fn a_large_select_is_paged_through_a_cursor_in_order() {
 }
 
 #[tokio::test]
+async fn a_failing_fetch_closes_only_its_own_cursor() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let engine = engine_with_rows(&scratch, 250).await;
+    let caps = Caps {
+        row_cap: 100,
+        byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    let kept = engine
+        .run_read_paged("SELECT id FROM big ORDER BY id", true, caps, "alice")
+        .await
+        .unwrap()
+        .cursor
+        .expect("alice holds a cursor");
+    let failing = engine
+        .run_read_paged(
+            "SELECT 1 / (id - 150) FROM big ORDER BY id",
+            true,
+            caps,
+            "bob",
+        )
+        .await
+        .unwrap()
+        .cursor
+        .expect("bob holds a cursor");
+    assert_eq!(engine.open_cursors().await.len(), 2);
+    let error = engine.fetch(&failing, caps, "bob").await.unwrap_err();
+    assert_eq!(error.id(), ErrorId::SqlFailed);
+    let gone = engine.fetch(&failing, caps, "bob").await.unwrap_err();
+    assert_eq!(gone.id(), ErrorId::HandleState);
+    let next = engine.fetch(&kept, caps, "alice").await.unwrap();
+    assert_eq!(
+        next.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("101")
+    );
+}
+
+#[tokio::test]
 async fn a_small_select_leaves_no_cursor_and_the_transaction_ends() {
     let Some(scratch) = support::scratch().await else {
         return;
@@ -168,6 +208,75 @@ async fn a_lost_connection_is_reconnected_once_and_cursors_are_gone() {
     let gone = engine.fetch(&cursor, caps, "tester").await.unwrap_err();
     assert_eq!(gone.id(), ErrorId::HandleState);
     assert_eq!(info.database, scratch.database);
+}
+
+#[tokio::test]
+async fn a_connection_lost_during_commit_reports_the_server_side_rollback() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let client = scratch.client().await;
+    client
+        .batch_execute(
+            "CREATE SCHEMA app; CREATE TABLE app.slow (id int); CREATE FUNCTION app.pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(5); RETURN NULL; END $$; CREATE CONSTRAINT TRIGGER pause_at_commit AFTER INSERT ON app.slow DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION app.pause();",
+        )
+        .await
+        .unwrap();
+    let settings = scratch.settings(FlagLayer {
+        schema: Some("app".to_owned()),
+        ..FlagLayer::default()
+    });
+    let engine = Engine::start(Arc::new(settings), Hints::default())
+        .await
+        .expect("the engine starts");
+    let caps = Caps {
+        row_cap: 100,
+        byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    let handle = engine.begin_transaction("tester").await.unwrap();
+    engine
+        .run_write(
+            "INSERT INTO app.slow VALUES (1)",
+            caps,
+            "tester",
+            Some(&handle.id),
+            false,
+        )
+        .await
+        .unwrap();
+    let application = info_application_name(&engine);
+    let terminate = async {
+        for _ in 0..100 {
+            let killed: i64 = client
+                .query_one(
+                    "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name = $1 AND datname = $2 AND wait_event = 'PgSleep'",
+                    &[&application, &scratch.database],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if killed > 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    };
+    let (outcome, terminated) = tokio::join!(engine.commit(&handle.id, "tester"), terminate);
+    assert!(terminated, "the COMMIT never reached the deferred trigger");
+    let error = outcome.unwrap_err();
+    assert_eq!(error.id(), ErrorId::HandleState, "{error}");
+    assert!(
+        error.to_string().contains("the server aborted transaction"),
+        "{error}"
+    );
+    let rows: i64 = client
+        .query_one("SELECT count(*) FROM app.slow", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 0);
 }
 
 fn info_application_name(engine: &Engine) -> String {
@@ -696,4 +805,203 @@ async fn abandoned_pooled_cursors_are_released_by_the_sweep() {
     let handle = engine.begin_transaction("a").await.unwrap();
     engine.rollback(&handle.id, "a").await.unwrap();
     engine.release_everything().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_call_with_its_own_timeout_outlives_a_shorter_transaction_timeout() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app")
+        .await
+        .unwrap();
+    let settings = scratch.settings_with(
+        FlagLayer {
+            schema: Some("app".to_owned()),
+            ..FlagLayer::default()
+        },
+        &[("OWNPG_TRANSACTION_TIMEOUT", "1")],
+    );
+    let engine = Engine::start(Arc::new(settings), Hints::default())
+        .await
+        .expect("the engine starts");
+    if !engine.features().supports_transaction_timeout() {
+        return;
+    }
+    let caps = Caps {
+        row_cap: 10,
+        byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    engine
+        .run_write_reporting_pid(
+            "SELECT pg_sleep(2)",
+            caps,
+            "tester",
+            None,
+            false,
+            Some(std::time::Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect("the per-call timeout lifts the transaction timeout for this call");
+    let restored = engine
+        .run_read("SHOW transaction_timeout", caps)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.rows[0][0].as_ref().map(Cell::text).as_deref(),
+        Some("1s")
+    );
+}
+
+async fn engine_with_transaction_timeout(scratch: &support::Scratch, seconds: &str) -> Engine {
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app; CREATE TABLE app.t (id int)")
+        .await
+        .unwrap();
+    let settings = scratch.settings_with(
+        FlagLayer {
+            schema: Some("app".to_owned()),
+            ..FlagLayer::default()
+        },
+        &[("OWNPG_TRANSACTION_TIMEOUT", seconds)],
+    );
+    Engine::start(Arc::new(settings), Hints::default())
+        .await
+        .expect("the engine starts")
+}
+
+#[tokio::test]
+async fn a_busy_handle_still_expires_at_the_transaction_timeout() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let engine = engine_with_transaction_timeout(&scratch, "1").await;
+    let caps = Caps {
+        row_cap: 10,
+        byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    let handle = engine.begin_transaction("tester").await.unwrap();
+    for id in 1..=2 {
+        engine
+            .run_write(
+                &format!("INSERT INTO app.t VALUES ({id})"),
+                caps,
+                "tester",
+                Some(&handle.id),
+                false,
+            )
+            .await
+            .expect("the handle is inside its lifetime");
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    }
+    let late = engine
+        .run_write(
+            "INSERT INTO app.t VALUES (3)",
+            caps,
+            "tester",
+            Some(&handle.id),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(late.id(), ErrorId::HandleState, "{late}");
+    assert!(late.to_string().contains("expired"), "{late}");
+    let rows: i64 = scratch
+        .client()
+        .await
+        .query_one("SELECT count(*) FROM app.t", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn a_long_call_inside_a_handle_leaves_time_to_commit() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    let engine = engine_with_transaction_timeout(&scratch, "1").await;
+    let caps = Caps {
+        row_cap: 10,
+        byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    let handle = engine.begin_transaction("tester").await.unwrap();
+    engine
+        .run_write_reporting_pid(
+            "INSERT INTO app.t SELECT 1 FROM pg_sleep(2)",
+            caps,
+            "tester",
+            Some(&handle.id),
+            false,
+            Some(std::time::Duration::from_secs(10)),
+            None,
+        )
+        .await
+        .expect("the per-call timeout lifts the transaction timeout for this call");
+    let committed = engine.commit(&handle.id, "tester").await.unwrap();
+    assert_eq!(committed.state, ownpg_core::engine::HandleState::Committed);
+    let rows: i64 = scratch
+        .client()
+        .await
+        .query_one("SELECT count(*) FROM app.t", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 1);
+}
+
+#[tokio::test]
+async fn open_handles_leave_one_pooled_connection_free_for_other_calls() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app")
+        .await
+        .unwrap();
+    let settings = scratch.settings_with(
+        FlagLayer {
+            schema: Some("app".to_owned()),
+            mode: Some(ownpg_core::config::Mode::ReadWrite),
+            http: ownpg_core::config::HttpFlags {
+                enabled: true,
+                bind: Some("127.0.0.1:0".to_owned()),
+                auth: None,
+            },
+            ..FlagLayer::default()
+        },
+        &[("OWNPG_POOL_SIZE", "2")],
+    );
+    let engine = Engine::start_pooled(Arc::new(settings), Hints::default())
+        .await
+        .expect("the pooled engine starts");
+    assert_eq!(engine.pool_size(), Some(2));
+    let at_rest = engine
+        .pool_status()
+        .expect("a pooled engine reports its pool");
+    assert_eq!((at_rest.max, at_rest.used, at_rest.waiting), (2, 0, 0));
+    let caps = Caps {
+        row_cap: 10,
+        byte_cap: 1_000_000,
+        cell_cap: ownpg_core::shape::CELL_CAP_BYTES,
+    };
+    engine.begin_transaction("alice").await.unwrap();
+    let holding = engine.pool_status().unwrap();
+    assert_eq!(holding.used, 1, "{holding:?}");
+    let refused = engine.begin_transaction("bob").await.unwrap_err();
+    assert_eq!(refused.id(), ErrorId::HandleState);
+    let read = engine.run_read("SELECT 1", caps).await.unwrap();
+    assert_eq!(read.row_count, 1);
 }

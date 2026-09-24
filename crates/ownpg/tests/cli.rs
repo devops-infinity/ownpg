@@ -70,30 +70,43 @@ struct Live {
     port: String,
     user: String,
     database: String,
+    password: Option<String>,
 }
 
 fn live() -> Option<Live> {
-    let dsn = std::env::var("OWNPG_TEST_DSN").ok()?;
-    let trimmed = dsn.strip_prefix("postgresql://")?;
-    let (credentials, rest) = trimmed.split_once('@')?;
-    let (address, database) = rest.split_once('/')?;
-    let (host, port) = address.split_once(':').unwrap_or((address, "5432"));
-    let user = credentials.split(':').next()?.to_owned();
+    let dsn = std::env::var("OWNPG_TEST_DSN")
+        .ok()
+        .filter(|dsn| !dsn.trim().is_empty())?;
+    let layer = ownpg_core::config::libpq::parse_dsn(&dsn)
+        .expect("OWNPG_TEST_DSN is a libpq connection string or URI");
     Some(Live {
-        host: host.to_owned(),
-        port: port.to_owned(),
-        user,
-        database: database.to_owned(),
+        host: layer.host.unwrap_or_else(|| "localhost".to_owned()),
+        port: layer.port.unwrap_or(5432).to_string(),
+        user: layer.user.expect("OWNPG_TEST_DSN names a user"),
+        database: layer.dbname.expect("OWNPG_TEST_DSN names a database"),
+        password: layer.password.map(|secret| secret.expose().to_owned()),
     })
+}
+
+impl Live {
+    fn vars(&self) -> Vec<(&'static str, String)> {
+        let mut vars = vec![
+            ("OWNPG_HOST", self.host.clone()),
+            ("OWNPG_PORT", self.port.clone()),
+            ("OWNPG_USER", self.user.clone()),
+            ("OWNPG_DATABASE", self.database.clone()),
+        ];
+        if let Some(password) = &self.password {
+            vars.push(("OWNPG_PASSWORD", password.clone()));
+        }
+        vars
+    }
 }
 
 fn connected(live: &Live, home: &Home) -> Command {
     let mut command = ownpg();
     home.apply(&mut command);
-    command.env("OWNPG_HOST", &live.host);
-    command.env("OWNPG_PORT", &live.port);
-    command.env("OWNPG_USER", &live.user);
-    command.env("OWNPG_DATABASE", &live.database);
+    command.envs(live.vars());
     command
 }
 
@@ -204,7 +217,7 @@ fn config_path_and_init_write_under_the_config_directory() {
     let text = String::from_utf8_lossy(&printed.get_output().stdout).into_owned();
     assert!(text.contains("profiles.toml"), "{text}");
     assert!(text.contains("data:"), "{text}");
-    assert!(text.contains("cache:"), "{text}");
+    assert!(!text.contains("cache:"), "{text}");
     assert!(text.contains("logs:"), "{text}");
     let profiles_line = text
         .lines()
@@ -395,10 +408,7 @@ fn serve_answers_a_client_over_stdio_and_stops_on_eof() {
         command.env("PATH", path);
     }
     home.apply_std(&mut command);
-    command.env("OWNPG_HOST", &live.host);
-    command.env("OWNPG_PORT", &live.port);
-    command.env("OWNPG_USER", &live.user);
-    command.env("OWNPG_DATABASE", &live.database);
+    command.envs(live.vars());
     command.args(["serve", "--mode", "read-only"]);
     command.stdin(std::process::Stdio::piped());
     command.stdout(std::process::Stdio::piped());
@@ -462,7 +472,7 @@ fn serve_answers_a_client_over_stdio_and_stops_on_eof() {
     };
     assert_eq!(by_id(1)["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(by_id(2)["result"]["tools"].as_array().unwrap().len(), 7);
-    assert_eq!(by_id(3)["result"]["structuredContent"]["rows"][0][0], "1");
+    assert_eq!(by_id(3)["result"]["structuredContent"]["rows"][0][0], 1);
     let data = std::fs::read_dir(home.dir.path().join("data").join("ownpg")).unwrap();
     let audit = data
         .flatten()
@@ -521,9 +531,84 @@ fn an_unknown_manual_command_carries_its_error_id_and_the_usage_class() {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("error: `nope` is not a command"))
         .stderr(predicate::str::contains(
-            "try: Use one of: serve, doctor, config, audit, man, completions.",
+            "try: Use one of: serve, doctor, health, config, audit, man, completions.",
         ))
         .stderr(predicate::str::contains("code: command.unknown"));
+}
+
+#[test]
+fn health_exits_one_when_no_server_answers() {
+    let home = Home::new();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut command = ownpg();
+    home.apply(&mut command);
+    command
+        .args([
+            "health",
+            "--bind",
+            &format!("127.0.0.1:{port}"),
+            "--timeout",
+            "2",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("code: server.not_ready"));
+}
+
+#[test]
+fn health_reports_a_running_http_server_as_ready() {
+    let Some(live) = live() else {
+        return;
+    };
+    let home = Home::new();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let bind = format!("127.0.0.1:{port}");
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("ownpg"));
+    command.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    home.apply_std(&mut command);
+    command.envs(live.vars());
+    command.args(["serve", "--http", "--auth", "none", "--bind", &bind]);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    let mut child = command.spawn().expect("the server starts");
+    let probe = |extra: &[&str]| {
+        let mut health = ownpg();
+        home.apply(&mut health);
+        health
+            .args(["health", "--bind", &bind, "--timeout", "2"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let mut answer = None;
+    for _ in 0..100 {
+        let output = probe(&[]);
+        if output.status.success() {
+            answer = Some(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            break;
+        }
+        assert_eq!(output.status.code(), Some(1));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let live_only = probe(&["--live"]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(answer.as_deref(), Some("ready"));
+    assert!(live_only.status.success());
+    assert_eq!(String::from_utf8_lossy(&live_only.stdout).trim(), "live");
 }
 
 #[test]
@@ -538,10 +623,7 @@ fn the_first_discover_answer_arrives_quickly() {
         command.env("PATH", path);
     }
     home.apply_std(&mut command);
-    command.env("OWNPG_HOST", &live.host);
-    command.env("OWNPG_PORT", &live.port);
-    command.env("OWNPG_USER", &live.user);
-    command.env("OWNPG_DATABASE", &live.database);
+    command.envs(live.vars());
     command.arg("serve");
     command.stdin(std::process::Stdio::piped());
     command.stdout(std::process::Stdio::piped());

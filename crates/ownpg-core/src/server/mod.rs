@@ -5,7 +5,7 @@ pub mod resources;
 pub mod stdio;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -15,17 +15,18 @@ use rmcp::model::{
     ErrorData, ExtensionCapabilities, GetPromptRequestParams, GetPromptResponse, Implementation,
     InitializeResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
     ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ServerCapabilities, ServerInfo, SubscribeRequestParams,
+    ReadResourceResponse, ServerCapabilities, ServerConfig, SubscribeRequestParams,
     SubscriptionFilter, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::{
     NotificationContext, Peer, RequestContext, SubscriptionContext, SubscriptionSink,
 };
 use rmcp::{RoleServer, ServerHandler};
+use tracing::Instrument as _;
 
 use crate::audit::{Decision, Entry, PrincipalKind, Sink, Transport};
 use crate::config::ToolGroup;
-use crate::engine::Engine;
+use crate::engine::{EndedHandle, Engine};
 use crate::error::Result;
 use crate::tool_specs;
 use crate::tools::{self, Call, Context, Outcome, Reply, Route};
@@ -113,9 +114,98 @@ pub struct Server {
     parked_invalidations: std::sync::Mutex<std::collections::VecDeque<(String, Vec<String>)>>,
     sweeper: tokio::task::JoinHandle<()>,
     metrics: Option<metrics::Metrics>,
+    writer: AuditWriter,
 }
 
 const PARKED_INVALIDATION_CAP: usize = 64;
+const HANDLE_OWNER_CAP: usize = 256;
+const SERVER_REQUEST_ID: &str = "server";
+
+#[derive(Clone)]
+struct AuditWriter {
+    sink: Arc<Sink>,
+    writes: tokio_util::task::TaskTracker,
+    handle_owners: Arc<std::sync::Mutex<VecDeque<(String, PrincipalKind)>>>,
+    settings: Arc<crate::config::Settings>,
+    transport: Transport,
+    superuser: bool,
+    fallback_kind: PrincipalKind,
+}
+
+impl AuditWriter {
+    fn write(&self, entry: Entry) {
+        let sink = Arc::clone(&self.sink);
+        self.writes.spawn_blocking(move || {
+            if let Err(error) = sink.record(&entry) {
+                tracing::error!(%error, "the audit line could not be written");
+            }
+        });
+    }
+
+    fn follow_transaction(&self, outcome: &Outcome, kind: PrincipalKind) {
+        let facts = match outcome {
+            Ok(Reply::Output(output)) => &output.facts,
+            Ok(Reply::InputRequired(_)) => return,
+            Err(failure) => failure.facts(),
+        };
+        let Some(handle) = &facts.handle_id else {
+            return;
+        };
+        let Ok(mut owners) = self.handle_owners.lock() else {
+            return;
+        };
+        match facts.operation.as_deref() {
+            Some("begin") if outcome.is_ok() => {
+                while owners.len() >= HANDLE_OWNER_CAP {
+                    owners.pop_front();
+                }
+                owners.push_back((handle.clone(), kind));
+            }
+            Some("commit" | "rollback") => owners.retain(|(id, _)| id != handle),
+            _ => {}
+        }
+    }
+
+    fn record_ended(&self, ended: Vec<EndedHandle>) {
+        for handle in ended {
+            let kind = self
+                .handle_owners
+                .lock()
+                .ok()
+                .and_then(|mut owners| {
+                    let position = owners.iter().position(|(id, _)| *id == handle.id)?;
+                    owners.remove(position).map(|(_, kind)| kind)
+                })
+                .unwrap_or(self.fallback_kind);
+            self.write(Entry {
+                request_id: SERVER_REQUEST_ID.to_owned(),
+                call_id: None,
+                tool: tool_specs::PG_TRANSACTION.name.to_owned(),
+                operation: Some(handle.state.as_str().to_owned()),
+                mode: self.settings.mode.value,
+                transport: self.transport,
+                principal: handle.principal,
+                principal_kind: kind,
+                database: self.settings.database.value.clone(),
+                schema: self.settings.schema.value.clone(),
+                statement_class: None,
+                statement_hash: None,
+                statement: None,
+                relations: Vec::new(),
+                decision: Decision::Allowed,
+                rule: Some(handle.reason.as_str().to_owned()),
+                handle_id: Some(handle.id),
+                cursor_id: None,
+                duration_ms: 0,
+                row_count: None,
+                rows_affected: None,
+                truncated: false,
+                outcome: None,
+                superuser: self.superuser,
+            });
+        }
+    }
+}
 
 impl Drop for Server {
     fn drop(&mut self) {
@@ -171,12 +261,27 @@ impl Server {
         };
         let info = build_info(&settings, &routes, context.engine.features().as_map());
         let metrics = match (&settings.http.otel_endpoint, transport) {
-            (Some(endpoint), Transport::Http) => Some(metrics::Metrics::start(&endpoint.value)?),
+            (Some(endpoint), Transport::Http) => Some(metrics::Metrics::start(
+                &endpoint.value,
+                Arc::clone(&audit),
+                Arc::clone(&context.engine),
+            )?),
             _ => None,
+        };
+        let writer = AuditWriter {
+            sink: Arc::clone(&audit),
+            writes: tokio_util::task::TaskTracker::new(),
+            handle_owners: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            settings: Arc::clone(&settings),
+            transport,
+            superuser,
+            fallback_kind: principal.kind,
         };
         let sweeper = {
             let engine = Arc::clone(&context.engine);
             let interval = engine.sweep_interval();
+            let gauge = metrics.as_ref().map(metrics::Metrics::open_handles_gauge);
+            let writer = writer.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -186,9 +291,17 @@ impl Server {
                     match engine.sweep().await {
                         Ok(0) => {}
                         Ok(swept) => {
-                            tracing::debug!(swept, "expired cursors and handles were released")
+                            tracing::debug!(swept, "expired cursors and handles were released");
                         }
-                        Err(error) => tracing::debug!(%error, "the sweep did not complete"),
+                        Err(error) => {
+                            tracing::warn!(%error, "part of the sweep failed; the rest of it ran");
+                        }
+                    }
+                    writer.record_ended(engine.take_ended_handles());
+                    if let Some(gauge) = &gauge {
+                        let open = engine.open_cursors().await.len()
+                            + engine.open_transaction_count().await;
+                        gauge.store(open as u64, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             })
@@ -206,7 +319,36 @@ impl Server {
             parked_invalidations: std::sync::Mutex::new(std::collections::VecDeque::new()),
             sweeper,
             metrics,
+            writer,
         })
+    }
+
+    fn write_audit(&self, entry: Entry) {
+        self.writer.write(entry);
+    }
+
+    pub fn note_http_rejection(&self, reason: &'static str) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_http_rejection(reason);
+        }
+    }
+
+    #[must_use]
+    pub fn audit(&self) -> &Arc<Sink> {
+        &self.audit
+    }
+
+    pub async fn audit_admits(&self, read_only: bool) -> crate::error::Result<()> {
+        if !self.audit.is_degraded() {
+            return Ok(());
+        }
+        let audit = Arc::clone(&self.audit);
+        tokio::task::spawn_blocking(move || audit.admit(read_only))
+            .await
+            .map_err(|error| crate::error::Error::AuditDegraded {
+                policy: self.audit.on_failure().as_str().to_owned(),
+                detail: format!("the audit check did not finish: {error}"),
+            })?
     }
 
     #[must_use]
@@ -281,8 +423,10 @@ impl Server {
         outcome: Option<String>,
     ) {
         let settings = self.context.settings();
+        let entry_outcome = outcome.clone();
         let entry = Entry {
             request_id,
+            call_id: None,
             tool: request.to_owned(),
             operation: None,
             mode: settings.mode.value,
@@ -294,8 +438,9 @@ impl Server {
             statement_class: None,
             statement_hash: None,
             statement: None,
+            relations: Vec::new(),
             decision,
-            rule: rule.clone(),
+            rule,
             handle_id: None,
             cursor_id: None,
             duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -305,14 +450,9 @@ impl Server {
             outcome,
             superuser: self.superuser,
         };
-        let audit = Arc::clone(&self.audit);
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = audit.record(&entry) {
-                tracing::error!(%error, "the audit line could not be written");
-            }
-        });
+        self.write_audit(entry);
         if let Some(metrics) = &self.metrics {
-            metrics.record_call(request, decision, rule.as_deref(), duration);
+            metrics.record_call(request, decision, entry_outcome.as_deref(), duration);
         }
     }
 
@@ -326,6 +466,7 @@ impl Server {
     ) -> Option<Outcome> {
         let route = self.route(name)?;
         let started = Instant::now();
+        let call_id = NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed);
         let RoundTrip {
             request_state,
             input_responses,
@@ -339,7 +480,26 @@ impl Server {
                 scope: route.spec.scope.to_owned(),
             }
             .into());
-            self.record_tool_call(name, &outcome, request_id, started.elapsed(), &principal);
+            self.record_tool_call(
+                name,
+                &outcome,
+                request_id,
+                call_id,
+                started.elapsed(),
+                &principal,
+            );
+            return Some(outcome);
+        }
+        if let Err(error) = self.audit_admits(route.spec.read_only).await {
+            let outcome: Outcome = Err(error.into());
+            self.record_tool_call(
+                name,
+                &outcome,
+                request_id,
+                call_id,
+                started.elapsed(),
+                &principal,
+            );
             return Some(outcome);
         }
         let call = Call {
@@ -353,7 +513,6 @@ impl Server {
             progress,
             cancel: cancel.clone(),
         };
-        let call_id = NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed);
         let mut work = std::pin::pin!(crate::engine::CALL_ID.scope(call_id, (route.handler)(call)));
         let outcome = tokio::select! {
             outcome = &mut work => outcome,
@@ -364,16 +523,34 @@ impl Server {
                 work.await
             }
         };
-        self.record_tool_call(name, &outcome, request_id, started.elapsed(), &principal);
+        self.context.engine.forget_call(call_id);
+        self.record_tool_call(
+            name,
+            &outcome,
+            request_id,
+            call_id,
+            started.elapsed(),
+            &principal,
+        );
+        if route.spec.group == Some(ToolGroup::Transactions) {
+            self.writer.follow_transaction(&outcome, principal.kind);
+        }
+        self.writer
+            .record_ended(self.context.engine.take_ended_handles());
         self.refresh_handle_gauge().await;
         if let Ok(Reply::Output(output)) = &outcome
             && output.facts.decision != Some(Decision::DryRun)
         {
+            let changes_objects =
+                matches!(route.spec.group, Some(ToolGroup::Ddl | ToolGroup::Roles));
             match route.spec.group {
-                Some(ToolGroup::Ddl) => match &output.facts.handle_id {
+                _ if name == "pg_restore" => {
+                    self.invalidate_resources(&[], older_peer, true).await;
+                }
+                _ if changes_objects => match &output.facts.handle_id {
                     Some(handle) => self.park_invalidation(handle, &output.facts.relations),
                     None => {
-                        self.invalidate_resources(&output.facts.relations, older_peer)
+                        self.invalidate_resources(&output.facts.relations, older_peer, false)
                             .await;
                     }
                 },
@@ -384,7 +561,7 @@ impl Server {
                     {
                         let parked = self.take_parked_invalidation(handle);
                         if operation == Some("commit") && !parked.is_empty() {
-                            self.invalidate_resources(&parked, older_peer).await;
+                            self.invalidate_resources(&parked, older_peer, false).await;
                         }
                     }
                 }
@@ -425,8 +602,10 @@ impl Server {
         &self,
         relations: &[String],
         older_peer: Option<Peer<RoleServer>>,
+        everything: bool,
     ) {
         let scoped = self.context.settings().schema.value.clone();
+        let table_prefix = format!("{}/", self.schema_resource_uri());
         let mut uris = vec![self.schema_resource_uri()];
         for relation in relations {
             let (schema, name) = relation
@@ -446,6 +625,17 @@ impl Server {
         let mut dead = Vec::new();
         for sink in &sinks {
             let accepted = sink.accepted();
+            let subscribed_tables: Vec<String> = if everything {
+                accepted
+                    .resource_subscriptions
+                    .iter()
+                    .flatten()
+                    .filter(|uri| uri.starts_with(&table_prefix))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let wanted: Vec<&String> = uris
                 .iter()
                 .filter(|uri| {
@@ -454,6 +644,7 @@ impl Server {
                         .as_ref()
                         .is_some_and(|subscribed| subscribed.contains(uri))
                 })
+                .chain(subscribed_tables.iter())
                 .collect();
             let mut closed = false;
             for uri in wanted {
@@ -520,6 +711,7 @@ impl Server {
         tool: &str,
         outcome: &Outcome,
         request_id: String,
+        call_id: u64,
         duration: Duration,
         principal: &Principal,
     ) {
@@ -528,11 +720,12 @@ impl Server {
             .route(tool)
             .is_some_and(|route| route.spec.deprecated.is_some())
             .then(|| "deprecated".to_owned());
-        let (facts, decision, rule, result) = match outcome {
+        let (facts, decision, rule, result, code) = match outcome {
             Ok(Reply::Output(output)) => (
                 &output.facts,
                 output.facts.decision.unwrap_or(Decision::Allowed),
                 deprecated.clone(),
+                None,
                 None,
             ),
             Ok(Reply::InputRequired(_)) => {
@@ -550,10 +743,12 @@ impl Server {
                     .unwrap_or_else(|| failure.decision()),
                 failure.rule().or(deprecated),
                 Some(failure.audit_outcome()),
+                Some(failure.error().id().as_str()),
             ),
         };
         let entry = Entry {
             request_id,
+            call_id: Some(call_id),
             tool: tool.to_owned(),
             operation: facts.operation.clone(),
             mode: settings.mode.value,
@@ -565,8 +760,9 @@ impl Server {
             statement_class: facts.statement_class.clone(),
             statement_hash: facts.statement_hash.clone(),
             statement: facts.statement.clone(),
+            relations: facts.relations.clone(),
             decision,
-            rule: rule.clone(),
+            rule,
             handle_id: facts.handle_id.clone(),
             cursor_id: facts.cursor_id.clone(),
             duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -576,14 +772,9 @@ impl Server {
             outcome: result,
             superuser: self.superuser,
         };
-        let audit = Arc::clone(&self.audit);
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = audit.record(&entry) {
-                tracing::error!(%error, "the audit line could not be written");
-            }
-        });
+        self.write_audit(entry);
         if let Some(metrics) = &self.metrics {
-            metrics.record_call(tool, decision, rule.as_deref(), duration);
+            metrics.record_call(tool, decision, code, duration);
         }
     }
 
@@ -606,6 +797,7 @@ impl Server {
             if let Err(error) = engine.release_everything().await {
                 tracing::warn!(%error, "open handles could not be rolled back");
             }
+            self.writer.record_ended(engine.take_ended_handles());
         };
         if tokio::time::timeout(SHUTDOWN_DEADLINE, release)
             .await
@@ -613,11 +805,22 @@ impl Server {
         {
             tracing::warn!("the shutdown deadline passed before the handles were released");
         }
+        self.writer.writes.close();
+        if tokio::time::timeout(SHUTDOWN_DEADLINE, self.writer.writes.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!("the shutdown deadline passed before every audit line was written");
+        }
         if let Err(error) = self.audit.flush() {
             tracing::error!(%error, "the audit log could not be flushed");
         }
-        if let Some(metrics) = &self.metrics {
-            metrics.shutdown().await;
+        if let Some(metrics) = &self.metrics
+            && tokio::time::timeout(metrics::EXPORT_TIMEOUT, metrics.shutdown())
+                .await
+                .is_err()
+        {
+            tracing::warn!("the last metrics export did not finish in time; it was dropped");
         }
     }
 }
@@ -687,7 +890,7 @@ fn request_id_from(context: &RequestContext<RoleServer>) -> String {
 }
 
 impl ServerHandler for Server {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.info.clone()
     }
 
@@ -717,54 +920,61 @@ impl ServerHandler for Server {
         let name = request.name.to_string();
         let request_id = request_id_from(&context);
         let span = tracing::info_span!("tool", tool = ?name, request_id = %request_id);
-        let _guard = span.enter();
-        let arguments = request.arguments.unwrap_or_default();
-        let can_elicit = context
-            .protocol_version()
-            .is_some_and(|version| version.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
-            && context
-                .client_capabilities()
-                .is_some_and(|capabilities| capabilities.elicitation.is_some());
-        let progress = context
-            .meta
-            .get_progress_token()
-            .map(|token| tools::Progress {
-                peer: context.peer.clone(),
-                token,
-            });
-        let older_peer = context
-            .protocol_version()
-            .is_none_or(|version| version.as_str() < ProtocolVersion::V_2026_07_28.as_str())
-            .then(|| context.peer.clone());
-        let round_trip = RoundTrip {
-            request_state: request.request_state,
-            input_responses: request.input_responses,
-            can_elicit,
-            progress,
-            older_peer,
-            principal: self.principal_for(&context),
-        };
-        let outcome = self
-            .call(&name, arguments, request_id, context.ct.clone(), round_trip)
-            .await
-            .ok_or_else(|| ErrorData::invalid_params(format!("tool not found: {name}"), None))?;
-        let response = match outcome {
-            Ok(Reply::Output(output)) => CallToolResponse::Complete(output.into_call_result()),
-            Ok(Reply::InputRequired(result)) => CallToolResponse::InputRequired(result),
-            Err(failure) => {
-                tracing::info!(
-                    code = failure.error().id().as_str(),
-                    "tool call ended in an error result"
-                );
-                CallToolResponse::Complete(failure.into_call_result())
-            }
-        };
-        Ok(response)
+        async move {
+            let arguments = request.arguments.unwrap_or_default();
+            let can_elicit = context
+                .protocol_version()
+                .is_some_and(|version| version.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
+                && context
+                    .client_capabilities()
+                    .is_some_and(|capabilities| capabilities.elicitation.is_some());
+            let progress = context
+                .meta
+                .get_progress_token()
+                .map(|token| tools::Progress {
+                    peer: context.peer.clone(),
+                    token,
+                });
+            let older_peer = context
+                .protocol_version()
+                .is_none_or(|version| version.as_str() < ProtocolVersion::V_2026_07_28.as_str())
+                .then(|| context.peer.clone());
+            let round_trip = RoundTrip {
+                request_state: request.request_state,
+                input_responses: request.input_responses,
+                can_elicit,
+                progress,
+                older_peer,
+                principal: self.principal_for(&context),
+            };
+            let outcome = self
+                .call(&name, arguments, request_id, context.ct.clone(), round_trip)
+                .await
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(format!("tool not found: {name}"), None)
+                })?;
+            let response = match outcome {
+                Ok(Reply::Output(output)) => CallToolResponse::Complete(
+                    output.into_call_result(self.context.settings().result_text.value),
+                ),
+                Ok(Reply::InputRequired(result)) => CallToolResponse::InputRequired(result),
+                Err(failure) => {
+                    tracing::info!(
+                        code = failure.error().id().as_str(),
+                        "tool call ended in an error result"
+                    );
+                    CallToolResponse::Complete(failure.into_call_result())
+                }
+            };
+            Ok(response)
+        }
+        .instrument(span)
+        .await
     }
 
     async fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListResourcesResult, ErrorData> {
         let started = Instant::now();
@@ -777,7 +987,8 @@ impl ServerHandler for Server {
             &request_id,
             started,
         )?;
-        let result = self.list_resource_items().await;
+        let cursor = request.and_then(|request| request.cursor);
+        let result = self.list_resource_items(cursor.as_deref()).await;
         self.record_protocol_request(
             "resources/list",
             request_id,
@@ -785,7 +996,7 @@ impl ServerHandler for Server {
             &principal,
             Decision::Allowed,
             None,
-            result.as_ref().err().map(|error| error.message.to_string()),
+            result.as_ref().err().map(protocol_outcome),
         );
         result
     }
@@ -806,26 +1017,29 @@ impl ServerHandler for Server {
         let started = Instant::now();
         let request_id = request_id_from(&context);
         let span = tracing::info_span!("resource", uri = ?request.uri, request_id = %request_id);
-        let _guard = span.enter();
-        let principal = self.principal_for(&context);
-        self.require_scope(
-            &principal,
-            tool_specs::SCOPE_READ,
-            "resources/read",
-            &request_id,
-            started,
-        )?;
-        let result = self.read_resource_item(&request.uri, &principal).await;
-        self.record_protocol_request(
-            "resources/read",
-            request_id,
-            started.elapsed(),
-            &principal,
-            Decision::Allowed,
-            None,
-            result.as_ref().err().map(|error| error.message.to_string()),
-        );
-        result.map(ReadResourceResponse::Complete)
+        async move {
+            let principal = self.principal_for(&context);
+            self.require_scope(
+                &principal,
+                tool_specs::SCOPE_READ,
+                "resources/read",
+                &request_id,
+                started,
+            )?;
+            let result = self.read_resource_item(&request.uri, &principal).await;
+            self.record_protocol_request(
+                "resources/read",
+                request_id,
+                started.elapsed(),
+                &principal,
+                Decision::Allowed,
+                None,
+                result.as_ref().err().map(protocol_outcome),
+            );
+            result.map(ReadResourceResponse::Complete)
+        }
+        .instrument(span)
+        .await
     }
 
     async fn list_prompts(
@@ -878,7 +1092,7 @@ impl ServerHandler for Server {
             &principal,
             Decision::Allowed,
             None,
-            result.as_ref().err().map(|error| error.message.to_string()),
+            result.as_ref().err().map(protocol_outcome),
         );
         result
     }
@@ -995,6 +1209,10 @@ impl ServerHandler for Server {
     async fn on_initialized(&self, _context: NotificationContext<RoleServer>) {
         tracing::info!("client initialized");
     }
+}
+
+fn protocol_outcome(error: &ErrorData) -> String {
+    format!("jsonrpc.{}", error.code.0)
 }
 
 fn same_peer(left: &Peer<RoleServer>, right: &Peer<RoleServer>) -> bool {

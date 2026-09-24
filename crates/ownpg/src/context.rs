@@ -53,11 +53,7 @@ pub(crate) fn detect(global: &GlobalArgs) -> Result<Process> {
     } else {
         strategy.state_dir().map(|state| state.join("logs"))
     };
-    let mut paths = AppPaths::from_base(
-        strategy.config_dir(),
-        strategy.data_dir(),
-        strategy.cache_dir(),
-    );
+    let mut paths = AppPaths::from_base(strategy.config_dir(), strategy.data_dir());
     if let Some(log_dir) = log_dir {
         paths = paths.with_log_dir(log_dir);
     }
@@ -100,12 +96,6 @@ pub(crate) fn flag_layer(
     global: &GlobalArgs,
     serve: Option<&ServeArgs>,
 ) -> Result<FlagLayer> {
-    if connection.ssh_transport == Some(SshTransportArg::System) && connection.ssh_trust_new_host {
-        return Err(Error::ArgumentInvalid {
-            argument: "--ssh-trust-new-host".to_owned(),
-            detail: "the system ssh command manages its own known hosts; drop the flag or use --ssh-transport in-process".to_owned(),
-        });
-    }
     let tools = if connection.tools.is_empty() {
         None
     } else {
@@ -185,14 +175,14 @@ mod tests {
     }
 
     #[test]
-    fn the_no_input_flag_is_passed_through_and_system_ssh_refuses_trust_on_first_use() {
+    fn the_no_input_flag_and_the_ssh_transport_flags_are_passed_through() {
         let mut flagged = global();
         flagged.no_input = true;
         let layer = flag_layer(&ConnectionArgs::default(), &flagged, None).unwrap();
         assert_eq!(layer.no_input, Some(true));
         let plain = flag_layer(&ConnectionArgs::default(), &global(), None).unwrap();
         assert_eq!(plain.no_input, None);
-        let refused = flag_layer(
+        let ssh = flag_layer(
             &ConnectionArgs {
                 ssh_transport: Some(SshTransportArg::System),
                 ssh_trust_new_host: true,
@@ -201,8 +191,12 @@ mod tests {
             &global(),
             None,
         )
-        .unwrap_err();
-        assert_eq!(refused.id().as_str(), "argument.invalid");
+        .unwrap();
+        assert_eq!(
+            ssh.ssh_transport,
+            Some(ownpg_core::config::SshTransport::System)
+        );
+        assert_eq!(ssh.ssh_trust_new_host, Some(true));
     }
 
     #[test]
