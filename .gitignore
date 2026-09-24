@@ -8,3 +8,4 @@
 .vscode/
 /mutants.out*
 /THIRD-PARTY.txt
+/secrets/

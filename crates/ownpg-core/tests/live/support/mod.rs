@@ -63,11 +63,7 @@ pub(crate) async fn scratch() -> Option<Scratch> {
         .await
         .expect("the scratch database is created");
     let dir = tempfile::tempdir().expect("a temporary home for the test");
-    let paths = AppPaths::from_base(
-        dir.path().join("config"),
-        dir.path().join("data"),
-        dir.path().join("cache"),
-    );
+    let paths = AppPaths::from_base(dir.path().join("config"), dir.path().join("data"));
     Some(Scratch {
         maintenance_dsn,
         database,

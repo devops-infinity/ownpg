@@ -11,7 +11,7 @@ use crate::error::Error;
 use crate::shape::UNTRUSTED_NOTICE;
 use crate::tool_specs;
 
-const LIST_OBJECTS_DESCRIPTION: &str = "List objects in the scoped schema: tables, views, materialized views, sequences, functions, procedures, types, indexes, extensions, and the schemas of the database. Filter by object type and by a LIKE pattern on the name (% and _ are wildcards). The list is sorted by schema, then name, then OID, so repeated calls return the same order. At most 200 objects return per call; when more remain, truncated is true and cursor carries a token to pass back for the next page.";
+const LIST_OBJECTS_DESCRIPTION: &str = "List objects in the scoped schema: tables, views, materialized views, sequences, functions, procedures, types, and indexes, plus the database's extensions, publications, event triggers, and schemas. Publications and event triggers belong to no schema, so their schema is empty; pg_replication reports what a publication publishes. Filter by object type and by a LIKE pattern on the name (% and _ are wildcards). The list is sorted by schema, then name, then OID, so repeated calls return the same order. At most 200 objects return per call; when more remain, truncated is true and cursor carries a token to pass back for the next page.";
 
 const DESCRIBE_DESCRIPTION: &str = "Describe one object in detail. For a table, view, or materialized view: columns with types, defaults, identity and generated markers, constraints with validity, indexes with validity and size, triggers, row-level security policies, comments, size, and the estimated row count. Also describes sequences, functions and procedures (every overload), types (enum labels, composite attributes, domain constraints), extensions, roles, and the privileges granted on a relation. Names may be schema-qualified; unqualified names resolve in the scoped schema.";
 
@@ -116,8 +116,7 @@ fn decode_cursor(cursor: &str) -> Result<Keyset, Error> {
 const LIST_SQL: &str = "WITH objects AS ( \
 SELECT n.nspname::text AS schema, c.relname::text AS name, c.oid::int8 AS oid, \
 CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized_view' WHEN 'S' THEN 'sequence' WHEN 'i' THEN 'index' WHEN 'I' THEN 'index' ELSE 'table' END AS kind, \
-pg_catalog.pg_get_userbyid(c.relowner)::text AS owner, pg_catalog.obj_description(c.oid, 'pg_class') AS comment, \
-pg_catalog.pg_total_relation_size(c.oid) AS size_bytes, \
+c.relowner AS owner_oid, 'pg_class' AS catalog, \
 CASE WHEN c.relkind IN ('r', 'p', 'f', 'm') AND c.reltuples >= 0 THEN c.reltuples::int8 END AS estimated_rows, \
 CASE c.relkind WHEN 'p' THEN 'partitioned' WHEN 'f' THEN 'foreign' WHEN 'I' THEN 'partitioned index' \
 WHEN 'r' THEN CASE c.relpersistence WHEN 'u' THEN 'unlogged' WHEN 't' THEN 'temporary' ELSE 'permanent' END END AS detail \
@@ -125,32 +124,44 @@ FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamesp
 WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'f', 'v', 'm', 'S', 'i', 'I') \
 UNION ALL \
 SELECT n.nspname::text, p.proname::text, p.oid::int8, CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END, \
-pg_catalog.pg_get_userbyid(p.proowner)::text, pg_catalog.obj_description(p.oid, 'pg_proc'), NULL::int8, NULL::int8, \
-pg_catalog.pg_get_function_identity_arguments(p.oid) \
+p.proowner, 'pg_proc', NULL::int8, pg_catalog.pg_get_function_identity_arguments(p.oid) \
 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1 \
 UNION ALL \
-SELECT n.nspname::text, t.typname::text, t.oid::int8, 'type', pg_catalog.pg_get_userbyid(t.typowner)::text, \
-pg_catalog.obj_description(t.oid, 'pg_type'), NULL::int8, NULL::int8, \
+SELECT n.nspname::text, t.typname::text, t.oid::int8, 'type', t.typowner, 'pg_type', NULL::int8, \
 CASE t.typtype WHEN 'e' THEN 'enum' WHEN 'c' THEN 'composite' WHEN 'd' THEN 'domain' WHEN 'r' THEN 'range' WHEN 'm' THEN 'multirange' ELSE 'base' END \
 FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
 WHERE n.nspname = $1 AND t.typtype IN ('e', 'c', 'd', 'r', 'm') \
 AND (t.typrelid = 0 OR EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c')) \
 UNION ALL \
-SELECT n.nspname::text, e.extname::text, e.oid::int8, 'extension', pg_catalog.pg_get_userbyid(e.extowner)::text, \
-pg_catalog.obj_description(e.oid, 'pg_extension'), NULL::int8, NULL::int8, e.extversion::text \
+SELECT n.nspname::text, e.extname::text, e.oid::int8, 'extension', e.extowner, 'pg_extension', NULL::int8, e.extversion::text \
 FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
 UNION ALL \
-SELECT n.nspname::text, n.nspname::text, n.oid::int8, 'schema', pg_catalog.pg_get_userbyid(n.nspowner)::text, \
-pg_catalog.obj_description(n.oid, 'pg_namespace'), NULL::int8, NULL::int8, CASE WHEN n.nspname = $1 THEN 'scoped' END \
+SELECT ''::text, p.pubname::text, p.oid::int8, 'publication', p.pubowner, 'pg_publication', NULL::int8, \
+pg_catalog.concat_ws('; ', pg_catalog.concat_ws(', ', CASE WHEN p.pubinsert THEN 'insert' END, CASE WHEN p.pubupdate THEN 'update' END, \
+CASE WHEN p.pubdelete THEN 'delete' END, CASE WHEN p.pubtruncate THEN 'truncate' END), CASE WHEN p.puballtables THEN 'all tables' END) \
+FROM pg_catalog.pg_publication p \
+UNION ALL \
+SELECT ''::text, e.evtname::text, e.oid::int8, 'event_trigger', e.evtowner, 'pg_event_trigger', NULL::int8, \
+e.evtevent::text || ' runs ' || e.evtfoid::regprocedure::text || \
+CASE e.evtenabled WHEN 'D' THEN ', disabled' WHEN 'R' THEN ', replica only' WHEN 'A' THEN ', always' ELSE '' END \
+FROM pg_catalog.pg_event_trigger e \
+UNION ALL \
+SELECT n.nspname::text, n.nspname::text, n.oid::int8, 'schema', n.nspowner, 'pg_namespace', NULL::int8, CASE WHEN n.nspname = $1 THEN 'scoped' END \
 FROM pg_catalog.pg_namespace n WHERE n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema' \
 ) \
 , matched AS ( \
 SELECT * FROM objects WHERE kind = ANY($2::text[]) AND name LIKE $3 \
 ) \
-SELECT schema, name, kind, oid, owner, comment, size_bytes, estimated_rows, detail, (SELECT count(*) FROM matched) AS total \
-FROM matched \
+, page AS ( \
+SELECT *, (SELECT count(*) FROM matched) AS total FROM matched \
 WHERE (schema, name, oid) > ($4::text, $5::text, $6::int8) \
-ORDER BY schema, name, oid LIMIT $7::int8";
+ORDER BY schema, name, oid LIMIT $7::int8 \
+) \
+SELECT schema, name, kind, oid, pg_catalog.pg_get_userbyid(owner_oid)::text AS owner, \
+pg_catalog.obj_description(oid::oid, catalog) AS comment, \
+CASE WHEN catalog = 'pg_class' THEN pg_catalog.pg_total_relation_size(oid::oid) END AS size_bytes, \
+estimated_rows, detail, total \
+FROM page ORDER BY schema, name, oid";
 
 pub fn list_objects(call: Call, args: ListObjectsArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {

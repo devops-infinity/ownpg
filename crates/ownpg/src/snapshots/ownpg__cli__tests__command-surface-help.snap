@@ -13,6 +13,7 @@ Usage: ownpg [OPTIONS] [COMMAND]
 Commands:
   serve        Serve the database to an MCP client over stdio (the default command)
   doctor       Check the connection and the settings, and report every attempt
+  health       Ask a running HTTP server whether it is ready; exit 0 when it is and 1 when it is not
   config       Manage connection profiles and local state
   audit        Work with the audit log
   man          Write the manual page to stdout
@@ -276,6 +277,58 @@ EXAMPLES:
   ownpg doctor -d app
   ownpg doctor -p staging --format json
 
+===== ownpg health =====
+Ask a running HTTP server whether it is ready; exit 0 when it is and 1 when it is not
+
+Usage: ownpg health [OPTIONS]
+
+Options:
+      --bind <ADDR>
+          Address the server binds: host:port, a bare address, or :port (default 127.0.0.1:8765)
+          [env: OWNPG_BIND]
+
+  -v, --verbose...
+          More log detail on stderr; repeat for trace. Composes with RUST_LOG
+
+      --live
+          Only check that the process answers, not that PostgreSQL and the audit log are ready
+
+  -q, --quiet
+          Only errors on stderr
+
+      --no-input
+          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
+
+      --timeout <SECONDS>
+          Give up after this many seconds
+          
+          [default: 5]
+
+      --log-format <FORMAT>
+          Shape of the log lines on stderr
+          
+          [default: text]
+          [possible values: text, json]
+
+      --log-file <PATH>
+          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
+          lands under the log directory (see `config path`)
+
+      --config <FILE>
+          Profile file to read instead of the one in the config directory
+          
+          [env: OWNPG_CONFIG]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+EXAMPLES:
+  ownpg health                        ask the server on OWNPG_BIND or 127.0.0.1:8765
+  ownpg health --bind :9000 --live    only check that the process answers
+
 ===== ownpg config =====
 Manage connection profiles and local state
 
@@ -283,14 +336,13 @@ Usage: ownpg config [OPTIONS] <COMMAND>
 
 Commands:
   show                  Print every setting with the layer it came from; secrets show as `set`
-  path                  Print the profile file path and the data, cache, and log directories
+  path                  Print the profile file path and the data and log directories
   init                  Write an example profile file
   set-password          Store a profile's password in the platform keychain, read without echo
   unset-password        Remove a profile's password from the platform keychain
   set-ssh-passphrase    Store a profile's SSH key passphrase in the platform keychain, read without
                         echo
   unset-ssh-passphrase  Remove a profile's SSH key passphrase from the platform keychain
-  cache-clear           Delete the cache directory contents
 
 Options:
   -v, --verbose...
@@ -422,7 +474,7 @@ Options:
           Print version
 
 ===== ownpg config path =====
-Print the profile file path and the data, cache, and log directories
+Print the profile file path and the data and log directories
 
 Usage: ownpg config path [OPTIONS]
 
@@ -646,45 +698,6 @@ Arguments:
 Options:
       --dry-run
           Say what would change without touching the keychain or the file
-
-  -v, --verbose...
-          More log detail on stderr; repeat for trace. Composes with RUST_LOG
-
-  -q, --quiet
-          Only errors on stderr
-
-      --no-input
-          Never prompt; fail instead. Implied by CI=true [env: OWNPG_NO_INPUT]
-
-      --log-format <FORMAT>
-          Shape of the log lines on stderr
-          
-          [default: text]
-          [possible values: text, json]
-
-      --log-file <PATH>
-          Also write logs to this file, rotated daily with the newest eight files kept. A bare name
-          lands under the log directory (see `config path`)
-
-      --config <FILE>
-          Profile file to read instead of the one in the config directory
-          
-          [env: OWNPG_CONFIG]
-
-  -h, --help
-          Print help
-
-  -V, --version
-          Print version
-
-===== ownpg config cache-clear =====
-Delete the cache directory contents
-
-Usage: ownpg config cache-clear [OPTIONS]
-
-Options:
-      --dry-run
-          List what would be removed without removing it
 
   -v, --verbose...
           More log detail on stderr; repeat for trace. Composes with RUST_LOG

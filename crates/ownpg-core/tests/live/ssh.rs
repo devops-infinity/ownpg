@@ -546,3 +546,53 @@ async fn a_pooled_engine_opens_one_tunnel_per_pooled_connection() {
     engine.rollback(&bob.id, "bob").await.unwrap();
     engine.release_everything().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_statement_running_through_a_tunnel_can_be_cancelled() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    if scratch.host.starts_with('/') {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client_key = write_client_key(dir.path());
+    let bastion = start_bastion(client_key.public.clone()).await;
+    let known_hosts = dir.path().join("known_hosts");
+    learn_known_hosts_path("127.0.0.1", bastion.port, &bastion.host_key, &known_hosts).unwrap();
+    let settings = tunnel_settings(
+        &scratch,
+        SshEntry {
+            host: "127.0.0.1".to_owned(),
+            port: Some(bastion.port),
+            user: Some("deploy".to_owned()),
+            key_file: Some(client_key.path.clone()),
+            agent: Some(false),
+            known_hosts: Some(known_hosts),
+            ..SshEntry::default()
+        },
+        None,
+    );
+    let connector = Connector::new(Arc::new(settings)).with_ssh_hints(Hints::default());
+    let session = Arc::new(connector.connect().await.expect("the tunnel connects"));
+    let running = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move { session.client.batch_execute("SELECT pg_sleep(30)").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let started = std::time::Instant::now();
+    session
+        .cancel_running_statement()
+        .await
+        .expect("the cancel request travels through the tunnel");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+        .await
+        .expect("the statement stops soon after the cancel")
+        .unwrap();
+    let error = outcome.expect_err("the sleep was cancelled");
+    assert_eq!(
+        error.code(),
+        Some(&tokio_postgres::error::SqlState::QUERY_CANCELED)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}

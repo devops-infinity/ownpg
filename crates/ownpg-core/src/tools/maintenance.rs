@@ -515,6 +515,10 @@ pub struct VacuumNeed {
     pub modified_since_analyze: i64,
     pub vacuum_threshold: i64,
     pub analyze_threshold: i64,
+    pub inserted_since_vacuum: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert_threshold: Option<i64>,
+    pub transaction_id_age: i64,
     pub needs_vacuum: bool,
     pub needs_analyze: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -531,39 +535,74 @@ pub struct VacuumNeed {
 pub struct VacuumNeeds {
     pub rows: Vec<VacuumNeed>,
     pub row_count: usize,
+    pub truncated: bool,
     pub order: &'static str,
     pub notice: &'static str,
 }
 
-const VACUUM_NEEDS_SQL: &str = "WITH settings AS ( \
+fn reloption(name: &str, fallback: &str) -> String {
+    format!(
+        "COALESCE((SELECT option_value::float8 FROM pg_catalog.pg_options_to_table(c.reloptions) WHERE option_name = '{name}'), {fallback})"
+    )
+}
+
+const VACUUM_NEEDS_CAP: usize = 1_000;
+
+fn vacuum_needs_sql(features: crate::engine::Features) -> String {
+    let unfrozen = if features.server_version_num >= 180_000 {
+        "CASE WHEN c.relpages > 0 THEN GREATEST(1 - c.relallfrozen::float8 / c.relpages, 0) ELSE 1 END"
+    } else {
+        "1"
+    };
+    format!(
+        "WITH settings AS ( \
 SELECT current_setting('autovacuum_vacuum_threshold')::float8 AS vt, current_setting('autovacuum_vacuum_scale_factor')::float8 AS vs, \
-current_setting('autovacuum_analyze_threshold')::float8 AS at, current_setting('autovacuum_analyze_scale_factor')::float8 AS ascale \
+current_setting('autovacuum_analyze_threshold')::float8 AS at, current_setting('autovacuum_analyze_scale_factor')::float8 AS ascale, \
+current_setting('autovacuum_vacuum_max_threshold', true)::float8 AS mt, \
+current_setting('autovacuum_vacuum_insert_threshold', true)::float8 AS it, current_setting('autovacuum_vacuum_insert_scale_factor', true)::float8 AS iscale, \
+current_setting('autovacuum_freeze_max_age')::float8 AS fma \
 ), tables AS ( \
-SELECT c.oid, c.relname::text AS name, c.reltuples::float8 AS reltuples, \
-COALESCE((SELECT option_value::float8 FROM pg_catalog.pg_options_to_table(c.reloptions) WHERE option_name = 'autovacuum_vacuum_threshold'), s.vt) AS vt, \
-COALESCE((SELECT option_value::float8 FROM pg_catalog.pg_options_to_table(c.reloptions) WHERE option_name = 'autovacuum_vacuum_scale_factor'), s.vs) AS vs, \
-COALESCE((SELECT option_value::float8 FROM pg_catalog.pg_options_to_table(c.reloptions) WHERE option_name = 'autovacuum_analyze_threshold'), s.at) AS at, \
-COALESCE((SELECT option_value::float8 FROM pg_catalog.pg_options_to_table(c.reloptions) WHERE option_name = 'autovacuum_analyze_scale_factor'), s.ascale) AS ascale \
+SELECT c.oid, c.relname::text AS name, c.reltuples::float8 AS reltuples, {unfrozen} AS unfrozen, pg_catalog.age(c.relfrozenxid)::int8 AS xid_age, \
+{vt} AS vt, {vs} AS vs, {at} AS at, {ascale} AS ascale, {mt} AS mt, {it} AS it, {iscale} AS iscale, {fma} AS fma \
 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace CROSS JOIN settings s \
 WHERE n.nspname = $1 AND c.relkind IN ('r', 'm') \
+), limits AS ( \
+SELECT t.*, \
+CASE WHEN t.mt IS NULL OR t.mt < 0 THEN t.vt + t.vs * GREATEST(t.reltuples, 0) ELSE LEAST(t.mt, t.vt + t.vs * GREATEST(t.reltuples, 0)) END AS vacuum_limit, \
+t.at + t.ascale * GREATEST(t.reltuples, 0) AS analyze_limit, \
+CASE WHEN t.it IS NULL OR t.it < 0 THEN NULL ELSE t.it + COALESCE(t.iscale, 0) * GREATEST(t.reltuples, 0) * t.unfrozen END AS insert_limit \
+FROM tables t \
 ) \
-SELECT t.name, COALESCE(st.n_live_tup, 0)::int8, COALESCE(st.n_dead_tup, 0)::int8, COALESCE(st.n_mod_since_analyze, 0)::int8, \
-(t.vt + t.vs * GREATEST(t.reltuples, 0))::int8, (t.at + t.ascale * GREATEST(t.reltuples, 0))::int8, \
-COALESCE(st.n_dead_tup, 0) > (t.vt + t.vs * GREATEST(t.reltuples, 0)), \
-COALESCE(st.n_mod_since_analyze, 0) > (t.at + t.ascale * GREATEST(t.reltuples, 0)), \
-st.last_vacuum::text, st.last_autovacuum::text, st.last_analyze::text, st.last_autoanalyze::text \
-FROM tables t LEFT JOIN pg_catalog.pg_stat_user_tables st ON st.relid = t.oid \
-ORDER BY COALESCE(st.n_dead_tup, 0) DESC, t.name";
+SELECT l.name, COALESCE(st.n_live_tup, 0)::int8, COALESCE(st.n_dead_tup, 0)::int8, COALESCE(st.n_mod_since_analyze, 0)::int8, \
+l.vacuum_limit::int8, l.analyze_limit::int8, \
+COALESCE(st.n_dead_tup, 0) > l.vacuum_limit OR COALESCE(st.n_ins_since_vacuum, 0) > l.insert_limit IS TRUE OR l.xid_age > l.fma, \
+COALESCE(st.n_mod_since_analyze, 0) > l.analyze_limit, \
+st.last_vacuum::text, st.last_autovacuum::text, st.last_analyze::text, st.last_autoanalyze::text, \
+COALESCE(st.n_ins_since_vacuum, 0)::int8, l.insert_limit::int8, l.xid_age \
+FROM limits l LEFT JOIN pg_catalog.pg_stat_user_tables st ON st.relid = l.oid \
+ORDER BY COALESCE(st.n_dead_tup, 0) DESC, l.name LIMIT {limit}",
+        limit = VACUUM_NEEDS_CAP + 1,
+        vt = reloption("autovacuum_vacuum_threshold", "s.vt"),
+        vs = reloption("autovacuum_vacuum_scale_factor", "s.vs"),
+        at = reloption("autovacuum_analyze_threshold", "s.at"),
+        ascale = reloption("autovacuum_analyze_scale_factor", "s.ascale"),
+        mt = reloption("autovacuum_vacuum_max_threshold", "s.mt"),
+        it = reloption("autovacuum_vacuum_insert_threshold", "s.it"),
+        iscale = reloption("autovacuum_vacuum_insert_scale_factor", "s.iscale"),
+        fma = reloption("autovacuum_freeze_max_age", "s.fma"),
+    )
+}
 
 pub fn vacuum_needs(call: Call, _args: super::health::NoArgs) -> BoxFuture<'static, Outcome> {
     Box::pin(async move {
         let scoped = call.settings().schema.value.clone();
         let rows = call
             .engine()
-            .catalog_rows(VACUUM_NEEDS_SQL, &[&scoped])
+            .catalog_rows(&vacuum_needs_sql(call.engine().features()), &[&scoped])
             .await?;
+        let truncated = rows.len() > VACUUM_NEEDS_CAP;
         let mut needs = Vec::new();
-        for row in &rows {
+        for row in rows.iter().take(VACUUM_NEEDS_CAP) {
             needs.push(VacuumNeed {
                 table: catalog::read_column(row, 0)?,
                 live_rows: catalog::read_column(row, 1)?,
@@ -577,6 +616,9 @@ pub fn vacuum_needs(call: Call, _args: super::health::NoArgs) -> BoxFuture<'stat
                 last_autovacuum: catalog::read_column(row, 9)?,
                 last_analyze: catalog::read_column(row, 10)?,
                 last_autoanalyze: catalog::read_column(row, 11)?,
+                inserted_since_vacuum: catalog::read_column(row, 12)?,
+                insert_threshold: catalog::read_column(row, 13)?,
+                transaction_id_age: catalog::read_column(row, 14)?,
             });
         }
         let text = text_rows(
@@ -608,6 +650,7 @@ pub fn vacuum_needs(call: Call, _args: super::health::NoArgs) -> BoxFuture<'stat
         );
         let result = VacuumNeeds {
             row_count: needs.len(),
+            truncated,
             rows: needs,
             order: "dead_rows desc, table",
             notice: UNTRUSTED_NOTICE,
@@ -694,15 +737,35 @@ pub fn backend(call: Call, args: BackendArgs) -> BoxFuture<'static, Outcome> {
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<VacuumArgs, ResultSet, _>(&tool_specs::PG_VACUUM, VACUUM_DESCRIPTION, vacuum)?,
-        route::<AnalyzeArgs, ResultSet, _>(&tool_specs::PG_ANALYZE, ANALYZE_DESCRIPTION, analyze)?,
-        route::<ReindexArgs, ResultSet, _>(&tool_specs::PG_REINDEX, REINDEX_DESCRIPTION, reindex)?,
-        route::<RefreshArgs, ResultSet, _>(&tool_specs::PG_REFRESH, REFRESH_DESCRIPTION, refresh)?,
+        route::<VacuumArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_VACUUM,
+            VACUUM_DESCRIPTION,
+            vacuum,
+        )?,
+        route::<AnalyzeArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_ANALYZE,
+            ANALYZE_DESCRIPTION,
+            analyze,
+        )?,
+        route::<ReindexArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_REINDEX,
+            REINDEX_DESCRIPTION,
+            reindex,
+        )?,
+        route::<RefreshArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_REFRESH,
+            REFRESH_DESCRIPTION,
+            refresh,
+        )?,
         route::<super::health::NoArgs, VacuumNeeds, _>(
             &tool_specs::PG_VACUUM_NEEDS,
             VACUUM_NEEDS_DESCRIPTION,
             vacuum_needs,
         )?,
-        route::<BackendArgs, ResultSet, _>(&tool_specs::PG_BACKEND, BACKEND_DESCRIPTION, backend)?,
+        route::<BackendArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_BACKEND,
+            BACKEND_DESCRIPTION,
+            backend,
+        )?,
     ])
 }

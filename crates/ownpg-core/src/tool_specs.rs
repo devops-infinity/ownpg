@@ -96,9 +96,9 @@ impl ToolSpec {
             Some(group) => settings.loaded_groups().contains(&group),
         };
         group_loaded
-            && self
-                .program
-                .is_none_or(|program| crate::tools::host::find_program(settings, program).is_some())
+            && self.program.is_none_or(|program| {
+                crate::config::programs::find_program(settings, program).is_some()
+            })
     }
 }
 
@@ -601,11 +601,7 @@ mod snapshots {
             vars.insert("OWNPG_TOOLS".to_owned(), tools.to_owned());
         }
         let env = Environment::new(vars, Some(dir.path().to_path_buf()), None);
-        let paths = AppPaths::from_base(
-            dir.path().join("c"),
-            dir.path().join("d"),
-            dir.path().join("k"),
-        );
+        let paths = AppPaths::from_base(dir.path().join("c"), dir.path().join("d"));
         resolve(
             FlagLayer {
                 mode: Some(mode),
@@ -639,6 +635,44 @@ mod snapshots {
         ] {
             let tools = listed(&settings_for(mode, ""));
             insta::assert_json_snapshot!(format!("tools-list-{label}"), tools);
+        }
+    }
+
+    #[test]
+    fn every_route_publishes_a_pinned_input_and_output_schema() {
+        let routes = all_routes().unwrap();
+        let schemas: Vec<serde_json::Value> = routes
+            .iter()
+            .map(|route| {
+                serde_json::json!({
+                    "name": route.spec.name,
+                    "input": route.tool.input_schema,
+                    "output": route.tool.output_schema,
+                })
+            })
+            .collect();
+        assert_eq!(schemas.len(), routes.len());
+        insta::assert_json_snapshot!("tools-schemas-all-routes", schemas);
+    }
+
+    #[test]
+    fn a_route_that_accepts_dry_run_declares_the_dry_run_shape() {
+        for route in all_routes().unwrap() {
+            let accepts_dry_run = route
+                .tool
+                .input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|properties| properties.contains_key("dry_run"));
+            if !accepts_dry_run {
+                continue;
+            }
+            let output = serde_json::to_string(&route.tool.output_schema).unwrap();
+            assert!(
+                output.contains("\"dry_run\""),
+                "{} accepts dry_run but its output schema has no dry-run shape",
+                route.spec.name
+            );
         }
     }
 

@@ -1,9 +1,11 @@
 pub mod describe;
 pub mod environment;
 pub mod http;
+pub mod keychain;
 pub mod libpq;
 pub mod presets;
 pub mod profile;
+pub mod programs;
 mod resolve;
 
 use std::fmt;
@@ -18,8 +20,8 @@ pub use http::{
     AuthMode, AuthSettings, HttpEntry, HttpFlags, HttpSettings, MCP_PATH, OauthSettings,
 };
 pub use resolve::{
-    FlagLayer, KeychainLookup, Sources, SshTarget, Warning, ci_no_input, parse_ssh_target,
-    parse_tool_groups, resolve,
+    FlagLayer, KeychainLookup, Sources, SshTarget, Warning, ci_no_input, no_input_from_env,
+    parse_ssh_target, parse_tool_groups, resolve, resolve_bind,
 };
 
 pub const FILE_CAP_BYTES: u64 = 1_048_576;
@@ -36,22 +38,23 @@ pub const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_HANDLE_EXPIRY: Duration = Duration::from_secs(60);
 pub const DEFAULT_CURSOR_EXPIRY: Duration = Duration::from_secs(30);
 
-#[must_use]
-pub fn keychain_account(profile: &str) -> String {
-    format!("profile:{profile}")
-}
+pub const DEFAULT_AUDIT_MAX_BYTES: u64 = 52_428_800;
+pub const DEFAULT_AUDIT_KEEP_DAYS: u32 = 366;
+pub const EXPIRY_HEADROOM: Duration = Duration::from_secs(5);
 
 #[must_use]
-pub fn ssh_keychain_account(profile: &str) -> String {
-    format!("ssh:{profile}")
+pub fn expiry_headroom(handle_expiry: Duration) -> Duration {
+    handle_expiry + EXPIRY_HEADROOM
 }
-pub const DEFAULT_AUDIT_MAX_BYTES: u64 = 52_428_800;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
+    #[serde(alias = "readonly", alias = "ro")]
     ReadOnly,
+    #[serde(alias = "writeonly", alias = "wo")]
     WriteOnly,
+    #[serde(alias = "readwrite", alias = "rw")]
     ReadWrite,
 }
 
@@ -76,7 +79,7 @@ impl Mode {
     }
 
     pub fn parse(text: &str) -> Option<Self> {
-        match text.trim() {
+        match text.trim().to_ascii_lowercase().as_str() {
             "read-only" | "readonly" | "ro" => Some(Self::ReadOnly),
             "write-only" | "writeonly" | "wo" => Some(Self::WriteOnly),
             "read-write" | "readwrite" | "rw" => Some(Self::ReadWrite),
@@ -163,6 +166,142 @@ impl ChannelBinding {
 }
 
 impl fmt::Display for ChannelBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeychainScope {
+    File,
+    Target,
+}
+
+impl KeychainScope {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Target => "target",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "file" => Some(Self::File),
+            "target" => Some(Self::Target),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for KeychainScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuditFailure {
+    Continue,
+    RefuseWrites,
+    RefuseAll,
+}
+
+impl AuditFailure {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::RefuseWrites => "refuse-writes",
+            Self::RefuseAll => "refuse-all",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "continue" => Some(Self::Continue),
+            "refuse-writes" => Some(Self::RefuseWrites),
+            "refuse-all" => Some(Self::RefuseAll),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn refuses(self, read_only: bool) -> bool {
+        match self {
+            Self::Continue => false,
+            Self::RefuseWrites => !read_only,
+            Self::RefuseAll => true,
+        }
+    }
+}
+
+impl fmt::Display for AuditFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResultText {
+    Full,
+    Summary,
+}
+
+impl ResultText {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Summary => "summary",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "full" => Some(Self::Full),
+            "summary" => Some(Self::Summary),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ResultText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SslNegotiation {
+    Postgres,
+    Direct,
+}
+
+impl SslNegotiation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Direct => "direct",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "postgres" => Some(Self::Postgres),
+            "direct" => Some(Self::Direct),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for SslNegotiation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -366,11 +505,13 @@ pub struct ConnectionSettings {
     pub port: Resolved<u16>,
     pub user: Resolved<String>,
     pub password: Option<Resolved<Secret>>,
+    pub fallback_password: Option<Resolved<Secret>>,
     pub sslmode: Resolved<SslMode>,
     pub sslrootcert: Option<Resolved<PathBuf>>,
     pub sslcert: Option<Resolved<PathBuf>>,
     pub sslkey: Option<Resolved<PathBuf>>,
     pub channel_binding: Resolved<ChannelBinding>,
+    pub ssl_negotiation: Resolved<SslNegotiation>,
     pub connect_timeout: Resolved<Duration>,
     pub application_name: Resolved<String>,
     pub options: Option<Resolved<String>>,
@@ -410,26 +551,26 @@ pub struct AuditSettings {
     pub path: Option<Resolved<PathBuf>>,
     pub max_bytes: Resolved<u64>,
     pub keep_files: Resolved<u32>,
+    pub keep_days: Resolved<u32>,
+    pub on_failure: Resolved<AuditFailure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
-    pub cache_dir: PathBuf,
     pub log_dir: PathBuf,
     pub config_file: PathBuf,
 }
 
 impl AppPaths {
     #[must_use]
-    pub fn from_base(config_dir: PathBuf, data_dir: PathBuf, cache_dir: PathBuf) -> Self {
+    pub fn from_base(config_dir: PathBuf, data_dir: PathBuf) -> Self {
         let config_file = config_dir.join("profiles.toml");
         let log_dir = data_dir.join("logs");
         Self {
             config_dir,
             data_dir,
-            cache_dir,
             log_dir,
             config_file,
         }
@@ -458,7 +599,9 @@ pub struct Settings {
     pub limits: LimitSettings,
     pub strict_role: Resolved<bool>,
     pub tools: Resolved<Vec<ToolGroup>>,
+    pub result_text: Resolved<ResultText>,
     pub ssh: Option<SshSettings>,
+    pub keychain_scope: Resolved<KeychainScope>,
     pub audit: AuditSettings,
     pub pg_bindir: Option<Resolved<PathBuf>>,
     pub output_dir: Option<Resolved<PathBuf>>,
@@ -490,11 +633,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_server_side_idle_timeout_sits_five_seconds_past_the_handle_expiry() {
+        assert_eq!(
+            expiry_headroom(Duration::from_secs(60)),
+            Duration::from_secs(65)
+        );
+    }
+
+    #[test]
     fn a_mode_parses_its_documented_spellings() {
         assert_eq!(Mode::parse("read-only"), Some(Mode::ReadOnly));
         assert_eq!(Mode::parse("rw"), Some(Mode::ReadWrite));
         assert_eq!(Mode::parse("write-only"), Some(Mode::WriteOnly));
         assert_eq!(Mode::parse("all"), None);
+        assert_eq!(Mode::parse(" Read-Only "), Some(Mode::ReadOnly));
+        for (spelling, mode) in [
+            ("\"readonly\"", Mode::ReadOnly),
+            ("\"ro\"", Mode::ReadOnly),
+            ("\"writeonly\"", Mode::WriteOnly),
+            ("\"rw\"", Mode::ReadWrite),
+            ("\"read-write\"", Mode::ReadWrite),
+        ] {
+            assert_eq!(serde_json::from_str::<Mode>(spelling).unwrap(), mode);
+            assert_eq!(Mode::parse(spelling.trim_matches('"')), Some(mode));
+        }
+        assert_eq!(
+            serde_json::to_string(&Mode::ReadOnly).unwrap(),
+            "\"read-only\""
+        );
         assert!(Mode::ReadOnly.allows_reads());
         assert!(!Mode::ReadOnly.allows_writes());
         assert!(!Mode::WriteOnly.allows_reads());
@@ -524,7 +690,7 @@ mod tests {
 
     #[test]
     fn the_config_file_sits_in_the_config_dir_unless_overridden() {
-        let paths = AppPaths::from_base("/c".into(), "/d".into(), "/k".into());
+        let paths = AppPaths::from_base("/c".into(), "/d".into());
         assert_eq!(paths.config_file, PathBuf::from("/c/profiles.toml"));
         let moved = paths.with_config_file("/elsewhere/p.toml".into());
         assert_eq!(moved.config_file, PathBuf::from("/elsewhere/p.toml"));

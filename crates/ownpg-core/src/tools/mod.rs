@@ -1,3 +1,4 @@
+pub mod cascade;
 pub mod catalog;
 pub mod confirm;
 pub mod ddl;
@@ -24,7 +25,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::audit::{Decision, Sink, Transport};
-use crate::config::{MAX_ROW_CAP, Settings};
+use crate::config::{MAX_ROW_CAP, ResultText, Settings};
 use crate::engine::Engine;
 use crate::error::Error;
 use crate::shape::{Caps, ResultSet};
@@ -186,10 +187,51 @@ impl ToolOutput {
     }
 
     #[must_use]
-    pub fn into_call_result(self) -> CallToolResult {
+    pub fn into_call_result(self, shape: ResultText) -> CallToolResult {
+        let text = match shape {
+            ResultText::Full => self.text,
+            ResultText::Summary => summary_text(&self.structured, self.text),
+        };
         let mut result = CallToolResult::structured(self.structured);
-        result.content = vec![ContentBlock::text(self.text)];
+        result.content = vec![ContentBlock::text(text)];
         result
+    }
+}
+
+const SUMMARY_KEEPS_TEXT_UP_TO: usize = 400;
+
+fn summary_text(structured: &serde_json::Value, text: String) -> String {
+    if text.len() <= SUMMARY_KEEPS_TEXT_UP_TO {
+        return text;
+    }
+    let mut parts = Vec::new();
+    if let Some(rows) = structured
+        .get("row_count")
+        .and_then(serde_json::Value::as_u64)
+    {
+        parts.push(if rows == 1 {
+            "1 row".to_owned()
+        } else {
+            format!("{rows} rows")
+        });
+    }
+    if structured
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        parts.push("more remain".to_owned());
+    }
+    if let Some(cursor) = structured.get("cursor").and_then(serde_json::Value::as_str) {
+        parts.push(format!("next page cursor {cursor}"));
+    }
+    if parts.is_empty() {
+        "The full result is in structuredContent.".to_owned()
+    } else {
+        format!(
+            "{}. The full result is in structuredContent.",
+            parts.join(", ")
+        )
     }
 }
 
@@ -227,7 +269,8 @@ impl ToolFailure {
             | Error::StatementUnparsable { .. }
             | Error::RoleRefused { .. }
             | Error::ConfirmationRequired { .. }
-            | Error::ScopeInsufficient { .. } => Decision::Refused,
+            | Error::ScopeInsufficient { .. }
+            | Error::AuditDegraded { .. } => Decision::Refused,
             _ => Decision::Allowed,
         }
     }
@@ -246,6 +289,9 @@ impl ToolFailure {
             }
             Error::ArgumentInvalid { argument, .. } => Some(format!("argument `{argument}`")),
             Error::ScopeInsufficient { scope } => Some(format!("token lacks scope {scope}")),
+            Error::AuditDegraded { policy, .. } => Some(format!(
+                "the audit log cannot be written (audit_on_failure = {policy})"
+            )),
             _ => None,
         }
     }
@@ -267,8 +313,8 @@ impl ToolFailure {
     #[must_use]
     pub fn into_call_result(self) -> CallToolResult {
         let code = self.0.error.id().as_str();
-        let message = self.0.error.to_string();
-        let remedy = self.0.error.remedy();
+        let message = crate::shape::sanitize(&self.0.error.to_string());
+        let remedy = crate::shape::sanitize(&self.0.error.remedy());
         let mut structured = serde_json::Map::new();
         structured.insert(
             "code".to_owned(),
@@ -279,7 +325,10 @@ impl ToolFailure {
             serde_json::Value::String(message.clone()),
         );
         if let Some(rule) = self.rule() {
-            structured.insert("rule".to_owned(), serde_json::Value::String(rule));
+            structured.insert(
+                "rule".to_owned(),
+                serde_json::Value::String(crate::shape::sanitize(&rule)),
+            );
         }
         if let Some(sqlstate) = self.sqlstate() {
             structured.insert("sqlstate".to_owned(), serde_json::Value::String(sqlstate));
@@ -420,6 +469,54 @@ pub fn text_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn output(rows: usize, cursor: Option<&str>) -> ToolOutput {
+        let text = "id\tname\n".to_owned() + &"1\tsome name\n".repeat(rows);
+        ToolOutput {
+            text,
+            structured: serde_json::json!({
+                "rows": [], "row_count": rows, "truncated": cursor.is_some(), "cursor": cursor
+            }),
+            facts: AuditFacts::default(),
+        }
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|block| block.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn full_text_repeats_the_rows_and_summary_text_points_at_the_structured_result() {
+        let full = output(100, Some("c1")).into_call_result(ResultText::Full);
+        assert!(text_of(&full).starts_with("id\tname\n1\tsome name"));
+        let summary = output(100, Some("c1")).into_call_result(ResultText::Summary);
+        assert_eq!(
+            text_of(&summary),
+            "100 rows, more remain, next page cursor c1. The full result is in structuredContent."
+        );
+        assert_eq!(summary.structured_content.unwrap()["row_count"], 100);
+        let one = output(60, None);
+        let one = ToolOutput {
+            structured: serde_json::json!({"row_count": 1, "truncated": false}),
+            ..one
+        }
+        .into_call_result(ResultText::Summary);
+        assert_eq!(
+            text_of(&one),
+            "1 row. The full result is in structuredContent."
+        );
+    }
+
+    #[test]
+    fn summary_text_keeps_a_short_text_as_it_is() {
+        let short = output(2, None).into_call_result(ResultText::Summary);
+        assert_eq!(text_of(&short), "id\tname\n1\tsome name\n1\tsome name\n");
+    }
 
     #[test]
     fn a_failure_maps_onto_a_structured_error_with_the_stable_code() {

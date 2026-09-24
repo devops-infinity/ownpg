@@ -6,7 +6,7 @@ expression: tools
   {
     "name": "pg_list_objects",
     "title": "List objects in the scoped schema",
-    "description": "List objects in the scoped schema: tables, views, materialized views, sequences, functions, procedures, types, indexes, extensions, and the schemas of the database. Filter by object type and by a LIKE pattern on the name (% and _ are wildcards). The list is sorted by schema, then name, then OID, so repeated calls return the same order. At most 200 objects return per call; when more remain, truncated is true and cursor carries a token to pass back for the next page.",
+    "description": "List objects in the scoped schema: tables, views, materialized views, sequences, functions, procedures, types, and indexes, plus the database's extensions, publications, event triggers, and schemas. Publications and event triggers belong to no schema, so their schema is empty; pg_replication reports what a publication publishes. Filter by object type and by a LIKE pattern on the name (% and _ are wildcards). The list is sorted by schema, then name, then OID, so repeated calls return the same order. At most 200 objects return per call; when more remain, truncated is true and cursor carries a token to pass back for the next page.",
     "inputSchema": {
       "$defs": {
         "DetailLevel": {
@@ -27,7 +27,9 @@ expression: tools
             "procedure",
             "type",
             "index",
-            "extension"
+            "extension",
+            "publication",
+            "event_trigger"
           ],
           "type": "string"
         }
@@ -130,7 +132,9 @@ expression: tools
             "procedure",
             "type",
             "index",
-            "extension"
+            "extension",
+            "publication",
+            "event_trigger"
           ],
           "type": "string"
         }
@@ -367,7 +371,9 @@ expression: tools
             "procedure",
             "type",
             "index",
-            "extension"
+            "extension",
+            "publication",
+            "event_trigger"
           ],
           "type": "string"
         },
@@ -1085,6 +1091,12 @@ expression: tools
             },
             {
               "type": "boolean"
+            },
+            {
+              "type": "object"
+            },
+            {
+              "type": "array"
             }
           ]
         },
@@ -1469,6 +1481,12 @@ expression: tools
         "server_version": {
           "type": "string"
         },
+        "server_warning": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "status": {
           "$ref": "#/$defs/Status"
         }
@@ -1638,6 +1656,12 @@ expression: tools
         },
         "server_version": {
           "type": "string"
+        },
+        "server_warning": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "settings": {
           "items": {

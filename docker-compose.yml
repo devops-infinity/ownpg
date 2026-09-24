@@ -1,6 +1,10 @@
 services:
   ownpg:
-    build: .
+    build:
+      context: .
+      args:
+        OWNPG_VERSION: ${OWNPG_VERSION:-0.0.0-local}
+        OWNPG_BUILD_COMMIT: ${OWNPG_BUILD_COMMIT:-unknown}
     restart: unless-stopped
     read_only: true
     environment:
@@ -22,19 +26,33 @@ services:
     volumes:
       - ownpg-state:/var/lib/ownpg
     tmpfs:
-      - /tmp
+      - /tmp:mode=0700,uid=65532,gid=65532
     ports:
       - "127.0.0.1:8765:8765"
+    networks:
+      - db
+      - default
     depends_on:
       postgres:
         condition: service_healthy
+    stop_grace_period: 30s
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256m
 
   postgres:
-    image: postgres:18
+    image: postgres:18.6@sha256:86c951e05bf56c93d95d397747fb8820ac76cc3bedb78f43abd83eedbe3666ae
     restart: unless-stopped
     environment:
       POSTGRES_USER: app_admin
@@ -43,12 +61,32 @@ services:
     secrets:
       - postgres_password
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql
+    networks:
+      - db
+    shm_size: 256mb
+    stop_grace_period: 90s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U app_admin -d app"]
       interval: 10s
       timeout: 5s
       retries: 12
+
+networks:
+  db:
+    internal: true
 
 secrets:
   ownpg_tokens:
@@ -60,4 +98,7 @@ secrets:
 
 volumes:
   ownpg-state:
+    name: ownpg-state
   postgres-data:
+    name: ownpg-postgres-data
+    external: true

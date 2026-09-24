@@ -91,6 +91,7 @@ pub fn describe(settings: &Settings) -> Vec<SettingLine> {
         SettingLine::path("sslcert", connection.sslcert.as_ref()),
         SettingLine::path("sslkey", connection.sslkey.as_ref()),
         SettingLine::resolved("channel_binding", &connection.channel_binding),
+        SettingLine::resolved("sslnegotiation", &connection.ssl_negotiation),
         SettingLine::duration("connect_timeout", &connection.connect_timeout),
         SettingLine::resolved("application_name", &connection.application_name),
         SettingLine::optional("options", connection.options.as_ref()),
@@ -118,6 +119,7 @@ pub fn describe(settings: &Settings) -> Vec<SettingLine> {
         SettingLine::resolved("row_cap", &limits.row_cap),
         SettingLine::resolved("byte_cap", &limits.byte_cap),
         SettingLine::resolved("strict_role", &settings.strict_role),
+        SettingLine::resolved("result_text", &settings.result_text),
         SettingLine::new(
             "tools",
             if settings.tools.value.is_empty() {
@@ -183,6 +185,14 @@ pub fn describe(settings: &Settings) -> Vec<SettingLine> {
     lines.push(SettingLine::resolved(
         "audit_keep_files",
         &settings.audit.keep_files,
+    ));
+    lines.push(SettingLine::resolved(
+        "audit_keep_days",
+        &settings.audit.keep_days,
+    ));
+    lines.push(SettingLine::resolved(
+        "audit_on_failure",
+        &settings.audit.on_failure,
     ));
     lines.push(SettingLine::path("pg_bindir", settings.pg_bindir.as_ref()));
     lines.push(SettingLine::path(
@@ -276,11 +286,6 @@ pub fn describe(settings: &Settings) -> Vec<SettingLine> {
         display(&settings.paths.data_dir),
         Origin::Preset,
     ));
-    lines.push(SettingLine::new(
-        "cache_dir",
-        display(&settings.paths.cache_dir),
-        Origin::Preset,
-    ));
     lines
 }
 
@@ -306,11 +311,7 @@ mod tests {
             Some(dir.path().to_path_buf()),
             Some("tester".to_owned()),
         );
-        let paths = AppPaths::from_base(
-            dir.path().join("c"),
-            dir.path().join("d"),
-            dir.path().join("k"),
-        );
+        let paths = AppPaths::from_base(dir.path().join("c"), dir.path().join("d"));
         let (settings, _) = resolve(
             FlagLayer::default(),
             Sources {

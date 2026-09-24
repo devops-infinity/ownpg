@@ -5,6 +5,8 @@ REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 source "$REPO/tools/lib.sh"
+require_bash 4.4 "$REPO/.githooks/pre-commit" "$@"
+shopt -s inherit_errexit
 
 command -v gitleaks >/dev/null 2>&1 ||
 	die "gitleaks is not installed; install it with: brew install gitleaks"

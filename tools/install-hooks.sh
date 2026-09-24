@@ -5,6 +5,8 @@ REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 source "$REPO/tools/lib.sh"
+require_bash 4.4 "$REPO/tools/install-hooks.sh" "$@"
+shopt -s inherit_errexit
 
 command -v git >/dev/null 2>&1 || die "git is not on PATH"
 

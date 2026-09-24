@@ -13,8 +13,6 @@ use crate::cli::{DoctorArgs, GlobalArgs, OutputFormatArg};
 use crate::context::{self, Process};
 use crate::output::{emit, stdout_error};
 
-pub(crate) const SUPPORTED_MAJORS: std::ops::RangeInclusive<i32> = 14..=18;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CheckStatus {
@@ -280,26 +278,15 @@ async fn run_connected_checks(
             },
         ),
     });
-    let major = info.server_version_num.div_euclid(10_000);
-    checks.push(if SUPPORTED_MAJORS.contains(&major) {
-        check(
+    let features = ownpg_core::engine::Features::from_version(info.server_version_num);
+    checks.push(match features.version_warning(&info.server_version) {
+        None => check(
             "server_version",
             CheckStatus::Ok,
             false,
             format!("PostgreSQL {}", info.server_version),
-        )
-    } else {
-        check(
-            "server_version",
-            CheckStatus::Warning,
-            false,
-            format!(
-                "PostgreSQL {} is outside the tested range {} to {}",
-                info.server_version,
-                SUPPORTED_MAJORS.start(),
-                SUPPORTED_MAJORS.end()
-            ),
-        )
+        ),
+        Some(warning) => check("server_version", CheckStatus::Warning, false, warning),
     });
     match engine.role().await {
         Ok(role) => checks.push(match role.warning() {

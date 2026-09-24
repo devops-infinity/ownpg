@@ -107,6 +107,10 @@ pub(crate) const SERVE_EXAMPLES: &str = "EXAMPLES:\n  \
     ownpg serve --http --auth none --bind 127.0.0.1:8765 -d app\n  \
     ownpg serve --http --auth bearer --bind 0.0.0.0:8765 -d app --strict-role";
 
+pub(crate) const HEALTH_EXAMPLES: &str = "EXAMPLES:\n  \
+    ownpg health                        ask the server on OWNPG_BIND or 127.0.0.1:8765\n  \
+    ownpg health --bind :9000 --live    only check that the process answers";
+
 pub(crate) const DOCTOR_EXAMPLES: &str = "EXAMPLES:\n  \
     ownpg doctor -d app\n  \
     ownpg doctor -p staging --format json";
@@ -130,6 +134,12 @@ pub(crate) enum Command {
         after_long_help = DOCTOR_EXAMPLES
     )]
     Doctor(DoctorArgs),
+
+    #[command(
+        about = "Ask a running HTTP server whether it is ready; exit 0 when it is and 1 when it is not",
+        after_long_help = HEALTH_EXAMPLES
+    )]
+    Health(HealthArgs),
 
     #[command(
         subcommand,
@@ -325,6 +335,31 @@ pub(crate) struct ServeArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub(crate) struct HealthArgs {
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "Address the server binds: host:port, a bare address, or :port (default 127.0.0.1:8765) [env: OWNPG_BIND]"
+    )]
+    pub bind: Option<String>,
+
+    #[arg(
+        long,
+        help = "Only check that the process answers, not that PostgreSQL and the audit log are ready"
+    )]
+    pub live: bool,
+
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..=60),
+        help = "Give up after this many seconds"
+    )]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Clone, Args)]
 pub(crate) struct DoctorArgs {
     #[command(flatten)]
     pub connection: ConnectionArgs,
@@ -356,7 +391,7 @@ pub(crate) enum ConfigCommand {
         format: OutputFormatArg,
     },
 
-    #[command(about = "Print the profile file path and the data, cache, and log directories")]
+    #[command(about = "Print the profile file path and the data and log directories")]
     Path {
         #[arg(
             long,
@@ -435,12 +470,6 @@ pub(crate) enum ConfigCommand {
         )]
         dry_run: bool,
     },
-
-    #[command(name = "cache-clear", about = "Delete the cache directory contents")]
-    CacheClear {
-        #[arg(long, help = "List what would be removed without removing it")]
-        dry_run: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -454,11 +483,11 @@ pub(crate) enum AuditCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum ModeArg {
-    #[value(name = "read-only", alias = "ro")]
+    #[value(name = "read-only", aliases = ["ro", "readonly"])]
     ReadOnly,
-    #[value(name = "write-only", alias = "wo")]
+    #[value(name = "write-only", aliases = ["wo", "writeonly"])]
     WriteOnly,
-    #[value(name = "read-write", alias = "rw")]
+    #[value(name = "read-write", aliases = ["rw", "readwrite"])]
     ReadWrite,
 }
 
@@ -643,7 +672,8 @@ mod tests {
             "init",
             "set-password",
             "unset-password",
-            "cache-clear",
+            "set-ssh-passphrase",
+            "unset-ssh-passphrase",
         ] {
             let found = Cli::command()
                 .find_subcommand("config")
@@ -656,11 +686,7 @@ mod tests {
             parsed.command,
             Some(Command::Config(ConfigCommand::SetPassword { profile, dry_run: false })) if profile == "prod"
         ));
-        let cache_clear_dry_run = parse(&["config", "cache-clear", "--dry-run"]).unwrap();
-        assert!(matches!(
-            cache_clear_dry_run.command,
-            Some(Command::Config(ConfigCommand::CacheClear { dry_run: true }))
-        ));
+        assert!(parse(&["config", "cache-clear"]).is_err());
         let verify = parse(&["audit", "verify", "/tmp/audit.jsonl"]).unwrap();
         assert!(matches!(
             verify.command,

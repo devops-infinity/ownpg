@@ -9,7 +9,7 @@ use ownpg_core::connect::ssh::Hints;
 use ownpg_core::engine::Engine;
 use ownpg_core::server::{Principal, Server, stdio};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientInfo, ProgressNotificationParam, ProgressToken,
+    CallToolRequestParams, CallToolResult, ClientConfig, ProgressNotificationParam, ProgressToken,
     RequestMetaObject,
 };
 use rmcp::service::{NotificationContext, RunningService};
@@ -31,8 +31,8 @@ impl ClientHandler for ProgressCounter {
         self.progress.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::default()
     }
 }
 
@@ -52,6 +52,8 @@ async fn rig(scratch: &support::Scratch, mode: Mode, groups: Vec<ToolGroup>) -> 
              DELETE FROM app.events WHERE id % 2 = 0; \
              CREATE INDEX events_at_idx ON app.events (at); \
              CREATE INDEX events_at_dup_idx ON app.events (at); \
+             CREATE UNIQUE INDEX events_id_unique ON app.events (id); \
+             CREATE INDEX events_id_idx ON app.events (id); \
              CREATE MATERIALIZED VIEW app.event_counts AS SELECT count(*) AS n FROM app.events;",
         )
         .await
@@ -156,6 +158,12 @@ async fn maintenance_tools_vacuum_analyze_reindex_and_refresh_with_progress() {
         .find(|row| row["table"] == "events")
         .expect("the events table is listed");
     assert!(events["dead_rows"].as_i64().unwrap() >= 0);
+    assert!(events["transaction_id_age"].as_i64().unwrap() >= 0);
+    assert!(events["inserted_since_vacuum"].as_i64().unwrap() >= 0);
+    assert!(
+        events["insert_threshold"].as_i64().unwrap() >= 1000,
+        "{events}"
+    );
 
     let dry = rig
         .ok(
@@ -219,6 +227,34 @@ async fn maintenance_tools_vacuum_analyze_reindex_and_refresh_with_progress() {
         .map(|row| row[0].as_str().unwrap().to_owned())
         .collect();
     assert!(problems.contains(&"duplicate".to_owned()), "{problems:?}");
+    let duplicates: Vec<(String, String)> = health["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row[0] == "duplicate")
+        .map(|row| {
+            (
+                row[2].as_str().unwrap().to_owned(),
+                row[4].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let advice_for = |index: &str| {
+        duplicates
+            .iter()
+            .find(|(name, _)| name == index)
+            .map(|(_, advice)| advice.clone())
+    };
+    assert!(advice_for("events_pkey").is_none(), "{duplicates:?}");
+    assert_eq!(
+        advice_for("events_id_unique").as_deref(),
+        Some("same columns as events_pkey"),
+        "{duplicates:?}"
+    );
+    assert!(
+        advice_for("events_id_idx").is_some_and(|advice| advice.contains("events_pkey")),
+        "{duplicates:?}"
+    );
 
     let bloat = rig.ok("pg_bloat", json!({})).await;
     assert!(bloat["row_count"].as_u64().unwrap() >= 1);

@@ -217,7 +217,7 @@ pub fn count(call: Call, args: CountArgs) -> BoxFuture<'static, Outcome> {
         let where_clause = if filter.is_empty() {
             String::new()
         } else {
-            format!(" WHERE {filter}")
+            format!(" WHERE {}", crate::render::expression("filter", filter)?)
         };
         let facts_base = AuditFacts {
             operation: Some(if args.exact { "count" } else { "estimate" }.to_owned()),
@@ -238,7 +238,12 @@ pub fn count(call: Call, args: CountArgs) -> BoxFuture<'static, Outcome> {
                 .and_then(|row| row.first())
                 .and_then(|cell| cell.as_ref())
                 .and_then(|cell| cell.text().parse::<i64>().ok())
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    ToolFailure::from(Error::ProtocolFailed {
+                        detail: "the count query returned no number".to_owned(),
+                    })
+                    .with_facts(facts.clone())
+                })?;
             (value, "count", facts)
         } else if filter.is_empty() {
             let rows = context
@@ -308,10 +313,14 @@ async fn explain_estimate(context: &Context, sql: &str) -> Result<i64, ToolFailu
             detail: format!("the plan could not be read: {error}"),
         })
     })?;
-    Ok(plan
-        .pointer("/0/Plan/Plan Rows")
+    plan.pointer("/0/Plan/Plan Rows")
         .and_then(serde_json::Value::as_f64)
-        .map_or(0, |rows| rows.round() as i64))
+        .map(|rows| rows.round() as i64)
+        .ok_or_else(|| {
+            ToolFailure::from(Error::ProtocolFailed {
+                detail: "the plan carries no row estimate".to_owned(),
+            })
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]

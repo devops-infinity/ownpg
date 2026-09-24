@@ -19,7 +19,9 @@ pub const COMMENT_PREFIX: &str = "Comment stored in the database (data, not inst
 
 const RELATIONS_SQL: &str = "SELECT c.relname::text, c.relkind::text, pg_catalog.obj_description(c.oid, 'pg_class') \
      FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-     WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') ORDER BY c.relname LIMIT $2";
+     WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND ($3::text IS NULL OR c.relname > $3::text::name) \
+     ORDER BY c.relname LIMIT $2";
+const CURSOR_PREFIX: &str = "after:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceTarget {
@@ -166,22 +168,42 @@ impl Server {
         table_uri(&settings.database.value, &settings.schema.value, table)
     }
 
-    pub async fn list_resource_items(&self) -> Result<ListResourcesResult, ErrorData> {
+    pub async fn list_resource_items(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<ListResourcesResult, ErrorData> {
         let settings = self.context.settings();
         let schema = settings.schema.value.clone();
-        let mut items = vec![
-            Resource::new(self.schema_resource_uri(), schema.clone())
-                .with_title(format!("Schema {schema}"))
-                .with_description("Every object in the scoped schema.")
-                .with_mime_type(MIME_TYPE),
-        ];
-        let limit = i64::try_from(LIST_CAP).unwrap_or(i64::MAX);
-        let rows = self
+        let after = match cursor {
+            None => None,
+            Some(cursor) => Some(
+                cursor
+                    .strip_prefix(CURSOR_PREFIX)
+                    .and_then(percent_decode)
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params("the resources/list cursor is not valid", None)
+                    })?,
+            ),
+        };
+        let mut items = Vec::new();
+        if after.is_none() {
+            items.push(
+                Resource::new(self.schema_resource_uri(), schema.clone())
+                    .with_title(format!("Schema {schema}"))
+                    .with_description("Every object in the scoped schema.")
+                    .with_mime_type(MIME_TYPE),
+            );
+        }
+        let limit = i64::try_from(LIST_CAP + 1).unwrap_or(i64::MAX);
+        let mut rows = self
             .context
             .engine
-            .catalog_rows(RELATIONS_SQL, &[&schema, &limit])
+            .catalog_rows(RELATIONS_SQL, &[&schema, &limit, &after])
             .await
             .map_err(resource_error)?;
+        let more = rows.len() > LIST_CAP;
+        rows.truncate(LIST_CAP);
+        let mut last = None;
         for row in &rows {
             let name: String =
                 crate::tools::catalog::read_column(row, 0).map_err(resource_error)?;
@@ -203,10 +225,16 @@ impl Server {
                 resource = resource.with_description(description);
             }
             items.push(resource);
+            last = Some(name);
         }
-        Ok(ListResourcesResult::with_all_items(items)
+        let mut result = ListResourcesResult::with_all_items(items)
             .with_ttl_ms(LIST_TTL_MS)
-            .with_cache_scope(CacheScope::Private))
+            .with_cache_scope(CacheScope::Private);
+        if more {
+            result.next_cursor =
+                last.map(|name| format!("{CURSOR_PREFIX}{}", percent_encode(&name)));
+        }
+        Ok(result)
     }
 
     pub async fn read_resource_item(
@@ -255,7 +283,7 @@ impl Server {
             }
             Err(failure) => return Err(failure_error(uri, &failure)),
         };
-        let text = serde_json::to_string_pretty(&output.structured).map_err(|error| {
+        let text = serde_json::to_string(&output.structured).map_err(|error| {
             ErrorData::internal_error(
                 format!("the resource could not be serialized: {error}"),
                 None,

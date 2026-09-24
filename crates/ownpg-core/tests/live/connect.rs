@@ -123,3 +123,69 @@ async fn an_unreachable_server_lists_what_was_tried() {
     assert_eq!(error.id(), ownpg_core::ErrorId::ConnectFailed);
     assert!(error.remedy().contains("127.0.0.1:1"), "{}", error.remedy());
 }
+
+#[tokio::test]
+async fn a_session_left_inside_a_transaction_is_rolled_back_before_reuse() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    scratch
+        .client()
+        .await
+        .batch_execute("CREATE SCHEMA app; CREATE TABLE app.t (id int)")
+        .await
+        .unwrap();
+    let settings = scratch.settings(FlagLayer {
+        schema: Some("app".to_owned()),
+        ..FlagLayer::default()
+    });
+    let session = Connector::new(support::shared(settings))
+        .connect()
+        .await
+        .expect("the scratch database connects");
+    assert!(session.ready_for_reuse().await);
+    session
+        .client
+        .batch_execute("BEGIN; INSERT INTO app.t VALUES (1)")
+        .await
+        .unwrap();
+    assert!(session.ready_for_reuse().await);
+    let rows: i64 = session
+        .client
+        .query_one("SELECT count(*) FROM app.t", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 0);
+    session
+        .client
+        .batch_execute("BEGIN; SELECT 1 / 0")
+        .await
+        .unwrap_err();
+    assert!(session.ready_for_reuse().await);
+    let probe = session
+        .client
+        .simple_query("SELECT now() = statement_timestamp()")
+        .await
+        .unwrap();
+    let outside = probe.iter().any(|message| {
+        matches!(message, tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some("t"))
+    });
+    assert!(outside);
+    session
+        .client
+        .batch_execute("CREATE TEMPORARY TABLE left_behind (id int)")
+        .await
+        .unwrap();
+    assert!(session.ready_for_reuse().await);
+    let temporary: i64 = session
+        .client
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace = pg_catalog.pg_my_temp_schema()",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(temporary, 0);
+}

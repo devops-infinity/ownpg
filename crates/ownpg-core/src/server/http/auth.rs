@@ -25,6 +25,7 @@ pub const ALL_SCOPES: [&str; 6] = [
 ];
 pub const LEEWAY_SECONDS: u64 = 30;
 pub const MAX_TOKEN_BYTES: usize = 8 * 1024;
+const DEFAULT_NAME_HEX_CHARS: usize = 8;
 
 #[must_use]
 pub fn scopes_for_mode(mode: Mode) -> Vec<String> {
@@ -45,27 +46,40 @@ pub fn scopes_for_mode(mode: Mode) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejection {
     pub status: u16,
-    pub error: &'static str,
+    pub error: Option<&'static str>,
     pub description: String,
     pub scope: Option<String>,
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl Rejection {
     fn unauthorized(description: impl Into<String>) -> Self {
         Self {
             status: 401,
-            error: "invalid_token",
+            error: Some("invalid_token"),
             description: description.into(),
             scope: None,
+            retry_after_seconds: None,
         }
     }
 
     fn missing() -> Self {
         Self {
             status: 401,
-            error: "invalid_request",
+            error: None,
             description: "a bearer token is required".to_owned(),
             scope: None,
+            retry_after_seconds: None,
+        }
+    }
+
+    fn unavailable(description: impl Into<String>) -> Self {
+        Self {
+            status: 503,
+            error: None,
+            description: description.into(),
+            scope: None,
+            retry_after_seconds: Some(super::jwks::REFRESH_INTERVAL.as_secs()),
         }
     }
 
@@ -73,9 +87,10 @@ impl Rejection {
     pub fn insufficient(scope: &str) -> Self {
         Self {
             status: 403,
-            error: "insufficient_scope",
+            error: Some("insufficient_scope"),
             description: format!("the token does not carry the {scope} scope"),
             scope: Some(scope.to_owned()),
+            retry_after_seconds: None,
         }
     }
 }
@@ -84,7 +99,6 @@ pub struct BearerToken {
     digest: [u8; 32],
     name: String,
     scopes: Vec<String>,
-    fingerprint: String,
 }
 
 fn digest_of(secret: &[u8]) -> [u8; 32] {
@@ -140,9 +154,25 @@ impl BearerTokens {
             let mut parts = line.split_whitespace();
             let secret = parts.next().unwrap_or_default();
             let grant = parts.next().unwrap_or("read-only");
-            let name = parts
-                .next()
-                .map_or_else(|| format!("{label}-{}", index + 1), str::to_owned);
+            let name = parts.next().map_or_else(
+                || {
+                    let fingerprint: String = sha256_hex(secret.as_bytes())
+                        .chars()
+                        .take(DEFAULT_NAME_HEX_CHARS)
+                        .collect();
+                    format!("{label}-{fingerprint}")
+                },
+                str::to_owned,
+            );
+            if parts.next().is_some() {
+                return Err(Error::ConfigInvalid {
+                    setting: source.to_owned(),
+                    value: format!("line {}", index + 1),
+                    detail:
+                        "a bearer token line has at most three columns: `<token> <mode> [name]`"
+                            .to_owned(),
+                });
+            }
             if tokens.iter().any(|known| known.name == name) {
                 return Err(Error::ConfigInvalid {
                     setting: source.to_owned(),
@@ -173,7 +203,6 @@ impl BearerTokens {
                 });
             };
             tokens.push(BearerToken {
-                fingerprint: sha256_hex(secret.as_bytes()).chars().take(16).collect(),
                 digest,
                 name,
                 scopes,
@@ -191,14 +220,8 @@ impl BearerTokens {
     }
 
     pub fn from_file(path: &Path) -> Result<Self> {
-        let mut file = crate::config::profile::open_private(path)?;
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut file, &mut text).map_err(|source| {
-            Error::ConfigUnreadable {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
+        let file = crate::config::profile::open_private(path)?;
+        let text = crate::config::profile::read_capped_handle(file, path)?;
         Self::parse_labeled(&text, &path.display().to_string(), "file")
     }
 
@@ -432,14 +455,16 @@ impl Oauth {
                 ));
             }
             Err(JwksError::Unreachable(detail)) => {
-                tracing::warn!(%detail, "the key endpoint is unreachable; the token is refused");
-                return Err(Rejection::unauthorized(
-                    "the key endpoint could not be reached",
+                tracing::warn!(%detail, "the key endpoint is unreachable; the token cannot be checked");
+                return Err(Rejection::unavailable(
+                    "the key endpoint could not be reached, so the token cannot be checked yet",
                 ));
             }
             Err(JwksError::Unusable(detail)) => {
-                tracing::warn!(%detail, "the key endpoint document is unusable; the token is refused");
-                return Err(Rejection::unauthorized("the key endpoint is unusable"));
+                tracing::warn!(%detail, "the key endpoint document is unusable; the token cannot be checked");
+                return Err(Rejection::unavailable(
+                    "the key endpoint returned an unusable key set, so the token cannot be checked yet",
+                ));
             }
         };
         if !key.accepts(algorithm) {
@@ -535,7 +560,7 @@ impl Authenticator {
         &self,
         authorization: Option<&str>,
         anonymous: &Principal,
-    ) -> std::result::Result<(Principal, String), Rejection> {
+    ) -> std::result::Result<Principal, Rejection> {
         let presented = authorization.and_then(|value| {
             let (scheme, rest) = value.trim().split_once(' ')?;
             scheme
@@ -543,7 +568,7 @@ impl Authenticator {
                 .then(|| rest.trim().to_owned())
         });
         match self {
-            Self::None => Ok((anonymous.clone(), String::new())),
+            Self::None => Ok(anonymous.clone()),
             Self::Bearer(tokens) => {
                 let Some(token) = presented else {
                     return Err(Rejection::missing());
@@ -554,13 +579,10 @@ impl Authenticator {
                 let Some(found) = tokens.lookup(token.as_bytes()) else {
                     return Err(Rejection::unauthorized("the token is not known"));
                 };
-                Ok((
-                    Principal::from_token(
-                        found.name.clone(),
-                        PrincipalKind::Bearer,
-                        found.scopes.clone(),
-                    ),
-                    found.fingerprint.clone(),
+                Ok(Principal::from_token(
+                    found.name.clone(),
+                    PrincipalKind::Bearer,
+                    found.scopes.clone(),
                 ))
             }
             Self::Oauth(oauth) => {
@@ -570,9 +592,7 @@ impl Authenticator {
                 if token.len() > MAX_TOKEN_BYTES {
                     return Err(Rejection::unauthorized("the token is too long"));
                 }
-                let principal = oauth.validate(&token).await?;
-                let fingerprint: String = sha256_hex(token.as_bytes()).chars().take(16).collect();
-                Ok((principal, fingerprint))
+                oauth.validate(&token).await
             }
         }
     }
@@ -589,6 +609,20 @@ impl Authenticator {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn an_oversized_token_file_is_refused_before_it_is_read_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens");
+        let line = "abcdefghijklmnop0123 read-only\n";
+        let text = line.repeat((crate::config::FILE_CAP_BYTES as usize).div_euclid(line.len()) + 2);
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let refused = BearerTokens::from_file(&path).unwrap_err();
+        assert_eq!(refused.id().as_str(), "config.too_large");
+    }
+
     #[test]
     fn bearer_lines_carry_a_mode_or_explicit_scopes() {
         let tokens = BearerTokens::parse(
@@ -601,7 +635,17 @@ mod tests {
         assert_eq!(reader.name, "reader");
         assert_eq!(reader.scopes, vec![SCOPE_READ.to_owned()]);
         let writer = tokens.lookup(b"zyxwvutsrqponmlk9876").unwrap();
-        assert_eq!(writer.name, "token-3");
+        let writer_fingerprint: String = sha256_hex(b"zyxwvutsrqponmlk9876")
+            .chars()
+            .take(8)
+            .collect();
+        assert_eq!(writer.name, format!("token-{writer_fingerprint}"));
+        let moved =
+            BearerTokens::parse("\n\n\n\nzyxwvutsrqponmlk9876 read-write\n", "test").unwrap();
+        assert_eq!(moved.tokens[0].name, writer.name);
+        let extra = BearerTokens::parse("abcdefghijklmnop0123 read-only reader extra\n", "test")
+            .unwrap_err();
+        assert!(extra.to_string().contains("line 1"), "{extra}");
         assert!(
             BearerTokens::parse(
                 "abcdefghijklmnop0123 read-only a\nabcdefghijklmnop0123 read-write b\n",
@@ -618,10 +662,14 @@ mod tests {
         );
         let mut merged =
             BearerTokens::parse_labeled("abcdefghijklmnop0123 read-only\n", "f", "file").unwrap();
-        assert_eq!(merged.tokens[0].name, "file-1");
+        let file_fingerprint: String = sha256_hex(b"abcdefghijklmnop0123")
+            .chars()
+            .take(8)
+            .collect();
+        assert_eq!(merged.tokens[0].name, format!("file-{file_fingerprint}"));
         let env =
             BearerTokens::parse_labeled("zyxwvutsrqponmlk9876 read-only\n", "e", "env").unwrap();
-        assert_eq!(env.tokens[0].name, "env-1");
+        assert_eq!(env.tokens[0].name, format!("env-{writer_fingerprint}"));
         merged.merge(env, "e").unwrap();
         assert_eq!(merged.len(), 2);
         let clash =

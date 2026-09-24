@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use super::{Toggle, if_exists_clause, run_ddl, scoped_name};
 use crate::error::{Error, Result};
 use crate::render::{quote_ident, quote_literal, validate_ident};
-use crate::shape::ResultSet;
 use crate::tool_specs;
 use crate::tools::{Call, Outcome, Route, route};
 
@@ -213,7 +212,11 @@ pub fn publication(call: Call, args: PublicationArgs) -> BoxFuture<'static, Outc
 }
 
 pub fn routes() -> Result<Vec<Route>> {
-    Ok(vec![route::<PublicationArgs, ResultSet, _>(
+    Ok(vec![route::<
+        PublicationArgs,
+        crate::tools::write::StatementOutput,
+        _,
+    >(
         &tool_specs::PG_PUBLICATION,
         PUBLICATION_DESCRIPTION,
         publication,

@@ -8,7 +8,7 @@ use ownpg_core::connect::ssh::Hints;
 use ownpg_core::engine::Engine;
 use ownpg_core::server::{Principal, Server, stdio};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, ElicitRequestParams,
+    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, ElicitRequestParams,
     ElicitResult, ElicitationAction, Implementation, ProtocolVersion,
 };
 use rmcp::service::{RequestContext, RunningService};
@@ -34,8 +34,8 @@ impl ClientHandler for ConfirmingClient {
             .with_content(json!({"proceed": self.proceed})))
     }
 
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::new(
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::new(
             ClientCapabilities::builder().enable_elicitation().build(),
             Implementation::new("write-test", "0"),
         )
@@ -212,6 +212,33 @@ async fn the_typed_write_tools_insert_update_delete_merge_and_copy() {
         .await;
     assert_ne!(merged.is_error, Some(true), "{merged:?}");
     assert_eq!(structured(&merged)["rows_affected"], 2);
+
+    let partial = rig
+        .call(
+            "pg_merge",
+            json!({"table": "items", "rows": [{"id": 3, "qty": 34}, {"id": 6, "name": "six renamed"}], "match_on": ["id"]}),
+        )
+        .await;
+    assert_ne!(partial.is_error, Some(true), "{partial:?}");
+    let kept = rig
+        .call(
+            "pg_run_query",
+            json!({"sql": "SELECT name, qty FROM items WHERE id IN (3, 6) ORDER BY id"}),
+        )
+        .await;
+    let kept = structured(&kept);
+    assert_eq!(kept["rows"][0][0], "three merged");
+    assert_eq!(kept["rows"][0][1], 34);
+    assert_eq!(kept["rows"][1][0], "six renamed");
+    assert_eq!(kept["rows"][1][1], 6);
+
+    let uneven_upsert = rig
+        .call(
+            "pg_insert",
+            json!({"table": "items", "rows": [{"id": 3, "name": "x", "qty": 1}, {"id": 6, "qty": 2}], "on_conflict": "update", "conflict_columns": ["id"]}),
+        )
+        .await;
+    assert_eq!(structured(&uneven_upsert)["code"], "argument.invalid");
 
     let raw = rig
         .call(
@@ -700,5 +727,97 @@ async fn a_procedural_body_always_needs_confirmation() {
         .await;
     assert_eq!(unconfirmed.is_error, Some(true), "{unconfirmed:?}");
     assert_eq!(structured(&unconfirmed)["code"], "confirmation.required");
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_cancelled_while_it_waits_for_the_connection_never_runs() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    seed_schema(&scratch).await;
+    let (engine, audit) = engine_and_audit(&scratch, Mode::ReadWrite).await;
+    let rig = rig(engine, audit, "writer", (), ClientLifecycleMode::Initialize).await;
+    let peer = rig.client.peer().clone();
+    let slow = tokio::spawn({
+        let peer = peer.clone();
+        async move {
+            peer.call_tool(
+                CallToolRequestParams::new("pg_run_query").with_arguments(
+                    json!({"sql": "SELECT count(*) FROM generate_series(1, 30000000)"})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                ),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let queued = peer
+        .send_cancellable_request(
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                CallToolRequestParams::new("pg_insert").with_arguments(
+                    json!({"table": "items", "rows": [{"id": 9001, "name": "never"}]})
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                ),
+            )),
+            rmcp::service::PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    queued
+        .cancel(Some("the user gave up".to_owned()))
+        .await
+        .unwrap();
+    let finished = slow.await.unwrap();
+    assert!(finished.is_ok(), "{finished:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let landed: i64 = scratch
+        .client()
+        .await
+        .query_one("SELECT count(*) FROM app.items WHERE id = 9001", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(landed, 0, "the cancelled insert still ran");
+    let next = rig
+        .call(
+            "pg_insert",
+            json!({"table": "items", "rows": [{"id": 9002, "name": "after"}]}),
+        )
+        .await;
+    assert_ne!(next.is_error, Some(true), "{next:?}");
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_cells_arrive_as_json_values_and_lossy_ones_stay_text() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    seed_schema(&scratch).await;
+    let (engine, audit) = engine_and_audit(&scratch, Mode::ReadWrite).await;
+    let rig = rig(engine, audit, "reader", (), ClientLifecycleMode::Initialize).await;
+    let result = rig
+        .call(
+            "pg_run_query",
+            json!({"sql": "SELECT '{\"a\": [1, 2], \"b\": {\"c\": \"x\\\"y\"}}'::jsonb AS doc, json_build_object('k', 'v') AS built, '{\"price\": 12345678901234567.89}'::jsonb AS exact"}),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let body = result.structured_content.unwrap();
+    assert_eq!(body["columns"][0]["type"], "jsonb");
+    assert_eq!(body["rows"][0][0], json!({"a": [1, 2], "b": {"c": "x\"y"}}));
+    assert_eq!(body["rows"][0][1], json!({"k": "v"}));
+    assert_eq!(
+        body["rows"][0][2],
+        json!("{\"price\": 12345678901234567.89}")
+    );
+    let serialized = serde_json::to_string(&body["rows"][0][0]).unwrap();
+    assert!(!serialized.contains("\\\"a\\\""), "{serialized}");
     rig.finish().await;
 }

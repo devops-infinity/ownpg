@@ -8,7 +8,6 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::render::{expression, ident_list, quote_ident, type_name, validate_ident};
-use crate::shape::ResultSet;
 use crate::tool_specs;
 use crate::tools::read::classify_checked;
 use crate::tools::{Call, Outcome, Route, route};
@@ -145,6 +144,13 @@ pub fn index(call: Call, args: IndexArgs) -> BoxFuture<'static, Outcome> {
                 let elements: Result<Vec<String>> =
                     args.columns.iter().map(|c| index_element(c)).collect();
                 let name = if args.name.trim().is_empty() {
+                    if args.if_not_exists {
+                        return Err(Error::ArgumentInvalid {
+                            argument: "if_not_exists".to_owned(),
+                            detail: "if_not_exists needs the index name, because PostgreSQL can only skip an index it can find by name".to_owned(),
+                        }
+                        .into());
+                    }
                     String::new()
                 } else {
                     validate_ident("name", args.name.trim())?;
@@ -354,15 +360,15 @@ pub fn view(call: Call, args: ViewArgs) -> BoxFuture<'static, Outcome> {
                 };
                 let mut sql = if args.materialized {
                     format!(
-                        "CREATE MATERIALIZED VIEW{} {}{} AS {}{}",
+                        "CREATE MATERIALIZED VIEW{} {}{} AS {}\n{}",
                         if_not_exists_clause(args.if_not_exists),
                         name.sql(),
                         columns,
                         args.query.trim(),
                         if args.with_data {
-                            " WITH DATA"
+                            "WITH DATA"
                         } else {
-                            " WITH NO DATA"
+                            "WITH NO DATA"
                         }
                     )
                 } else {
@@ -396,8 +402,8 @@ pub fn view(call: Call, args: ViewArgs) -> BoxFuture<'static, Outcome> {
                         .into());
                     }
                     sql.push_str(match args.check_option {
-                        CheckOption::None | CheckOption::Local => " WITH LOCAL CHECK OPTION",
-                        CheckOption::Cascaded => " WITH CASCADED CHECK OPTION",
+                        CheckOption::None | CheckOption::Local => "\nWITH LOCAL CHECK OPTION",
+                        CheckOption::Cascaded => "\nWITH CASCADED CHECK OPTION",
                     });
                 }
                 (sql, &["ViewStmt", "CreateTableAsStmt"])
@@ -632,9 +638,17 @@ pub fn sequence(call: Call, args: SequenceArgs) -> BoxFuture<'static, Outcome> {
 
 pub fn routes() -> Result<Vec<Route>> {
     Ok(vec![
-        route::<IndexArgs, ResultSet, _>(&tool_specs::PG_INDEX, INDEX_DESCRIPTION, index)?,
-        route::<ViewArgs, ResultSet, _>(&tool_specs::PG_VIEW, VIEW_DESCRIPTION, view)?,
-        route::<SequenceArgs, ResultSet, _>(
+        route::<IndexArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_INDEX,
+            INDEX_DESCRIPTION,
+            index,
+        )?,
+        route::<ViewArgs, crate::tools::write::StatementOutput, _>(
+            &tool_specs::PG_VIEW,
+            VIEW_DESCRIPTION,
+            view,
+        )?,
+        route::<SequenceArgs, crate::tools::write::StatementOutput, _>(
             &tool_specs::PG_SEQUENCE,
             SEQUENCE_DESCRIPTION,
             sequence,

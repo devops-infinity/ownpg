@@ -9,13 +9,15 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::confirm::Verdict;
-use super::ddl::{number, scoped_name};
+use super::ddl::{Toggle, number, scoped_name};
 use super::{AuditFacts, Call, Outcome, Route, ToolFailure, ToolOutput, route};
 use crate::audit::{Decision, sha256_hex};
 use crate::classify::{Classification, StatementClass};
 use crate::config::Settings;
+use crate::config::programs::find_program;
 use crate::connect::{Endpoint, Via};
 use crate::error::{Error, Result};
+use crate::render::quote_ident;
 use crate::shape::UNTRUSTED_NOTICE;
 use crate::tool_specs;
 
@@ -31,10 +33,10 @@ pub const PROGRESS_LINES: usize = 1_000;
 pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DUMP_DESCRIPTION: &str = "Run pg_dump on the host against the connected database, pinned to the scoped schema, and write the archive into the configured output_dir with mode 0600. Choose the plain, custom, directory, or tar format, restrict it to named tables, and dump only the data or only the definitions. Progress comes from the program's own verbose output when the client sends a progress token. The password never reaches the command line.";
-const DUMPALL_DESCRIPTION: &str = "Run pg_dumpall --globals-only on the host to dump roles and tablespaces (no database contents) into the configured output_dir with mode 0600. The maintenance connection uses the connected database.";
-const RESTORE_DESCRIPTION: &str = "Run pg_restore on the host to load a custom, directory, or tar archive from the configured output_dir into the connected database, pinned to the scoped schema. clean drops the objects first and needs confirm or a confirmation prompt. Runs only in a write mode.";
+const DUMPALL_DESCRIPTION: &str = "Run pg_dumpall --globals-only on the host to dump roles and tablespaces (no database contents) into the configured output_dir with mode 0600. Role password hashes are left out unless no_role_passwords is false. The maintenance connection uses the connected database.";
+const RESTORE_DESCRIPTION: &str = "Run pg_restore on the host to load a custom, directory, or tar archive from the configured output_dir into the connected database, pinned to the scoped schema. It runs as one transaction by default, so a failed restore leaves the database untouched; parallel jobs or transaction_size switch that off and stop at the first error instead. clean drops the objects first (skipping ones that do not exist yet) and needs confirm or a confirmation prompt. Runs only in a write mode.";
 const BASEBACKUP_DESCRIPTION: &str = "Run pg_basebackup on the host to take a physical copy of the whole cluster into a new directory under the configured output_dir (mode 0700). The connected role needs the REPLICATION attribute. Progress comes from the program's own progress output when the client sends a progress token.";
-const UPGRADE_CHECK_DESCRIPTION: &str = "Run pg_upgrade --check on the host to test whether the old cluster can be upgraded to the new binaries without changing anything. Both data directories and the old binary directory must be absolute paths on this host; the new binary directory defaults to the one that holds pg_upgrade. Logs land in the configured output_dir.";
+const UPGRADE_CHECK_DESCRIPTION: &str = "Run pg_upgrade --check on the host to test whether the old cluster can be upgraded to the new binaries without changing anything. Both data directories and the old binary directory must be absolute paths on this host; the new binary directory defaults to the one that holds pg_upgrade. pg_upgrade 15 and later write their logs to pg_upgrade_output.d inside the new data directory and remove them when the check passes; earlier versions write them to the configured output_dir, where the check runs.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct HostProgram {
@@ -43,38 +45,6 @@ pub struct HostProgram {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-#[must_use]
-pub fn find_program(settings: &Settings, name: &str) -> Option<PathBuf> {
-    let file_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-    if let Some(bindir) = &settings.pg_bindir {
-        let candidate = bindir.value.join(&file_name);
-        return is_executable(&candidate).then_some(candidate);
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .filter(|entry| entry.is_absolute())
-        .map(|entry| entry.join(&file_name))
-        .find(|candidate| is_executable(candidate))
 }
 
 const FORWARDED_ENVIRONMENT: &[&str] = &[
@@ -185,6 +155,12 @@ async fn connection_env(call: &Call) -> Result<ConnectionEnv> {
                 "PGCHANNELBINDING".to_owned(),
                 connection.channel_binding.value.as_str().to_owned(),
             ));
+            if connection.ssl_negotiation.value == crate::config::SslNegotiation::Direct {
+                vars.push((
+                    "PGSSLNEGOTIATION".to_owned(),
+                    connection.ssl_negotiation.value.as_str().to_owned(),
+                ));
+            }
             for (key, path) in [
                 ("PGSSLROOTCERT", &connection.sslrootcert),
                 ("PGSSLCERT", &connection.sslcert),
@@ -341,6 +317,7 @@ fn output_dir(call: &Call) -> Result<PathBuf> {
             ),
         });
     }
+    sweep_stale_partials(path);
     Ok(path.clone())
 }
 
@@ -460,6 +437,48 @@ fn existing_input(dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+struct StagingGuard {
+    path: Option<PathBuf>,
+    is_directory: bool,
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            discard_staging(path, self.is_directory);
+        }
+    }
+}
+
+const STALE_PARTIAL_AGE: Duration = Duration::from_secs(90_000);
+
+fn sweep_stale_partials(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(PARTIAL_SUFFIX)
+        {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_PARTIAL_AGE);
+        if stale && !metadata.file_type().is_symlink() {
+            tracing::info!(path = %entry.path().display(), "removing a partial output left by an earlier run");
+            discard_staging(&entry.path(), metadata.is_dir());
+        }
+    }
+}
+
 fn discard_staging(staging: &Path, is_directory: bool) {
     let outcome = if is_directory {
         std::fs::remove_dir_all(staging)
@@ -547,6 +566,8 @@ pub struct HostRun {
     pub output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_sha256: Option<String>,
     pub dry_run: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -576,8 +597,11 @@ impl HostRun {
         ));
         if let Some(output) = &self.output {
             text.push_str(&format!(
-                "output: {output} ({} bytes)\n",
-                self.output_bytes.unwrap_or(0)
+                "output: {output} ({} bytes{})\n",
+                self.output_bytes.unwrap_or(0),
+                self.output_sha256
+                    .as_ref()
+                    .map_or(String::new(), |digest| format!(", sha256 {digest}"))
             ));
         }
         for line in &self.stderr_tail {
@@ -621,6 +645,8 @@ fn synthetic_classification(
         runs_outside_transaction: true,
         explain_analyze: false,
         returning: false,
+        returns_rows: false,
+        cascade_targets: Vec::new(),
     }
 }
 
@@ -636,6 +662,10 @@ fn push_tail(lines: &mut VecDeque<String>, line: String) {
 }
 
 async fn run_program(call: &Call, job: Job) -> Outcome {
+    let _staging = StagingGuard {
+        path: job.staging.clone(),
+        is_directory: job.output_is_directory,
+    };
     let settings = call.settings();
     let Some(path) = find_program(settings, job.program) else {
         return Err(Error::HostBinaryMissing {
@@ -665,6 +695,7 @@ async fn run_program(call: &Call, job: Job) -> Outcome {
             arguments: job.arguments,
             output: output_text,
             output_bytes: None,
+            output_sha256: None,
             dry_run: true,
             exit_code: None,
             duration_ms: 0,
@@ -814,12 +845,20 @@ async fn run_program(call: &Call, job: Job) -> Outcome {
             std::fs::metadata(path).ok().map(|meta| meta.len())
         }
     });
+    let output_sha256 = match job.output.clone().filter(|_| !job.output_is_directory) {
+        Some(file) => tokio::task::spawn_blocking(move || file_sha256(&file))
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
     let run = HostRun {
         program: job.program.to_owned(),
         path: path.display().to_string(),
         arguments: job.arguments,
         output: output_text,
         output_bytes,
+        output_sha256,
         dry_run: false,
         exit_code: status.code(),
         duration_ms,
@@ -829,6 +868,28 @@ async fn run_program(call: &Call, job: Job) -> Outcome {
     };
     let text = run.render();
     Ok(ToolOutput::structured(&run, text)?.with_facts(facts).into())
+}
+
+fn file_sha256(path: &Path) -> Option<String> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(buffer.get(..read)?);
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 fn directory_size(path: &Path) -> Option<u64> {
@@ -847,6 +908,10 @@ fn directory_size(path: &Path) -> Option<u64> {
         }
     }
     Some(total)
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 const fn default_program_timeout() -> u64 {
@@ -928,7 +993,7 @@ pub fn dump(call: Call, args: DumpArgs) -> BoxFuture<'static, Outcome> {
         let settings = call.settings();
         let mut arguments = vec![
             format!("--dbname={}", settings.database.value),
-            format!("--schema={}", settings.schema.value),
+            format!("--schema={}", quote_ident(&settings.schema.value)),
             format!("--format={}", args.format.flag()),
             "--no-password".to_owned(),
         ];
@@ -1004,8 +1069,10 @@ pub fn dump(call: Call, args: DumpArgs) -> BoxFuture<'static, Outcome> {
 pub struct DumpallArgs {
     #[schemars(description = "File name inside output_dir.")]
     pub file: String,
-    #[serde(default)]
-    #[schemars(description = "Leave password hashes out of the role definitions.")]
+    #[serde(default = "default_true")]
+    #[schemars(
+        description = "Leave password hashes out of the role definitions (default true). A stored hash works as a login credential for MD5 roles and is needed for nothing but a full cluster copy; false writes the hashes into an owner-only file, and needs a role allowed to read them."
+    )]
     pub no_role_passwords: bool,
     #[serde(default = "default_program_timeout")]
     #[schemars(description = "Seconds before the program is killed (default 3600).")]
@@ -1076,18 +1143,32 @@ pub struct RestoreArgs {
     #[schemars(description = "Drop the objects before recreating them; destructive.")]
     pub clean: bool,
     #[serde(default)]
-    pub if_exists: bool,
+    #[schemars(
+        description = "With clean, skip objects that do not exist yet instead of failing; defaults to on whenever clean is on."
+    )]
+    pub if_exists: Toggle,
     #[serde(default)]
     pub no_owner: bool,
     #[serde(default)]
     pub no_privileges: bool,
     #[serde(default)]
-    pub single_transaction: bool,
+    #[schemars(
+        description = "Restore inside one transaction, so a failure leaves the database untouched. Defaults to on when jobs and transaction_size are empty; parallel jobs cannot use it."
+    )]
+    pub single_transaction: Toggle,
     #[serde(default)]
-    pub exit_on_error: bool,
+    #[schemars(
+        description = "Stop at the first error instead of continuing past it (default true). A single transaction always stops at the first error."
+    )]
+    pub exit_on_error: Toggle,
     #[serde(default)]
     #[schemars(description = "Parallel jobs as text; empty keeps one.")]
     pub jobs: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Commit every N objects as text (pg_restore 17 and later); lets a parallel or very large restore run in batches. Empty leaves it off."
+    )]
+    pub transaction_size: String,
     #[serde(default = "default_program_timeout")]
     #[schemars(description = "Seconds before the program is killed (default 3600).")]
     pub timeout_seconds: u64,
@@ -1106,13 +1187,26 @@ pub fn restore(call: Call, args: RestoreArgs) -> BoxFuture<'static, Outcome> {
             }
             .into());
         }
-        if args.single_transaction && !args.jobs.trim().is_empty() {
+        let jobs = number("jobs", &args.jobs)?;
+        let transaction_size = number("transaction_size", &args.transaction_size)?;
+        let batched = jobs.is_some() || transaction_size.is_some();
+        let single_transaction = args.single_transaction.as_bool().unwrap_or(!batched);
+        if single_transaction && batched {
             return Err(Error::ArgumentInvalid {
-                argument: "jobs".to_owned(),
-                detail: "parallel jobs cannot run inside a single transaction".to_owned(),
+                argument: if jobs.is_some() { "jobs" } else { "transaction_size" }.to_owned(),
+                detail: "parallel jobs and transaction_size cannot run inside a single transaction; leave single_transaction unset or false".to_owned(),
             }
             .into());
         }
+        if args.if_exists == Toggle::On && !args.clean {
+            return Err(Error::ArgumentInvalid {
+                argument: "if_exists".to_owned(),
+                detail: "if_exists only applies together with clean".to_owned(),
+            }
+            .into());
+        }
+        let if_exists = args.clean && args.if_exists.as_bool().unwrap_or(true);
+        let exit_on_error = !single_transaction && args.exit_on_error.as_bool().unwrap_or(true);
         let dir = output_dir(&call)?;
         let name = output_name("file", &args.file)?;
         let input = existing_input(&dir, &name)?;
@@ -1130,18 +1224,21 @@ pub fn restore(call: Call, args: RestoreArgs) -> BoxFuture<'static, Outcome> {
             ("--data-only", args.data_only),
             ("--schema-only", args.schema_only),
             ("--clean", args.clean),
-            ("--if-exists", args.if_exists),
+            ("--if-exists", if_exists),
             ("--no-owner", args.no_owner),
             ("--no-privileges", args.no_privileges),
-            ("--single-transaction", args.single_transaction),
-            ("--exit-on-error", args.exit_on_error),
+            ("--single-transaction", single_transaction),
+            ("--exit-on-error", exit_on_error),
         ] {
             if set {
                 arguments.push(flag.to_owned());
             }
         }
-        if let Some(jobs) = number("jobs", &args.jobs)? {
+        if let Some(jobs) = jobs {
             arguments.push(format!("--jobs={}", jobs.clamp(1, 64)));
+        }
+        if let Some(size) = transaction_size {
+            arguments.push(format!("--transaction-size={}", size.max(1)));
         }
         if call.progress.is_some() {
             arguments.push("--verbose".to_owned());
@@ -1431,6 +1528,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_staging_file_is_removed_when_the_run_stops_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let (output, staging) = prepared_file(dir.path(), "app.dump").unwrap();
+        assert!(staging.exists());
+        drop(StagingGuard {
+            path: Some(staging.clone()),
+            is_directory: false,
+        });
+        assert!(!staging.exists());
+        let (_, again) = prepared_file(dir.path(), "app.dump").unwrap();
+        assert_eq!(again, staging);
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn only_old_partial_outputs_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_file = dir.path().join(format!("old.dump{PARTIAL_SUFFIX}"));
+        let old_directory = dir.path().join(format!("base{PARTIAL_SUFFIX}"));
+        let fresh = dir.path().join(format!("fresh.dump{PARTIAL_SUFFIX}"));
+        let finished = dir.path().join("done.dump");
+        std::fs::write(&old_file, "x").unwrap();
+        std::fs::create_dir(&old_directory).unwrap();
+        std::fs::write(old_directory.join("part"), "x").unwrap();
+        std::fs::write(&fresh, "x").unwrap();
+        std::fs::write(&finished, "x").unwrap();
+        let long_ago = std::time::SystemTime::now() - STALE_PARTIAL_AGE - Duration::from_secs(60);
+        for path in [&old_file, &finished] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        std::fs::File::open(&old_directory)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        sweep_stale_partials(dir.path());
+        assert!(!old_file.exists());
+        assert!(!old_directory.exists());
+        assert!(fresh.exists());
+        assert!(finished.exists());
+    }
+
+    #[test]
     fn output_names_stay_inside_the_output_directory() {
         assert_eq!(output_name("file", " app.dump ").unwrap(), "app.dump");
         for bad in [
@@ -1483,11 +1627,7 @@ mod tests {
             Some(dir.path().to_path_buf()),
             None,
         );
-        let paths = crate::config::AppPaths::from_base(
-            dir.path().join("c"),
-            dir.path().join("d"),
-            dir.path().join("k"),
-        );
+        let paths = crate::config::AppPaths::from_base(dir.path().join("c"), dir.path().join("d"));
         let (settings, _) = crate::config::resolve(
             crate::config::FlagLayer {
                 pg_bindir: Some(dir.path().to_path_buf()),

@@ -6,7 +6,7 @@ expression: tools
   {
     "name": "pg_list_objects",
     "title": "List objects in the scoped schema",
-    "description": "List objects in the scoped schema: tables, views, materialized views, sequences, functions, procedures, types, indexes, extensions, and the schemas of the database. Filter by object type and by a LIKE pattern on the name (% and _ are wildcards). The list is sorted by schema, then name, then OID, so repeated calls return the same order. At most 200 objects return per call; when more remain, truncated is true and cursor carries a token to pass back for the next page.",
+    "description": "List objects in the scoped schema: tables, views, materialized views, sequences, functions, procedures, types, and indexes, plus the database's extensions, publications, event triggers, and schemas. Publications and event triggers belong to no schema, so their schema is empty; pg_replication reports what a publication publishes. Filter by object type and by a LIKE pattern on the name (% and _ are wildcards). The list is sorted by schema, then name, then OID, so repeated calls return the same order. At most 200 objects return per call; when more remain, truncated is true and cursor carries a token to pass back for the next page.",
     "inputSchema": {
       "$defs": {
         "DetailLevel": {
@@ -27,7 +27,9 @@ expression: tools
             "procedure",
             "type",
             "index",
-            "extension"
+            "extension",
+            "publication",
+            "event_trigger"
           ],
           "type": "string"
         }
@@ -130,7 +132,9 @@ expression: tools
             "procedure",
             "type",
             "index",
-            "extension"
+            "extension",
+            "publication",
+            "event_trigger"
           ],
           "type": "string"
         }
@@ -367,7 +371,9 @@ expression: tools
             "procedure",
             "type",
             "index",
-            "extension"
+            "extension",
+            "publication",
+            "event_trigger"
           ],
           "type": "string"
         },
@@ -1100,6 +1106,12 @@ expression: tools
         "server_version": {
           "type": "string"
         },
+        "server_warning": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "status": {
           "$ref": "#/$defs/Status"
         }
@@ -1270,6 +1282,12 @@ expression: tools
         "server_version": {
           "type": "string"
         },
+        "server_warning": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "settings": {
           "items": {
             "$ref": "#/$defs/SettingLine"
@@ -1335,7 +1353,7 @@ expression: tools
   {
     "name": "pg_insert",
     "title": "Insert rows",
-    "description": "Insert one or more rows into a table of the scoped schema. Rows are JSON objects keyed by column name; values are converted to the column types by PostgreSQL. One statement inserts every row with the union of the columns the rows name: a column a row leaves out becomes NULL, and only a column no row names takes its default. on_conflict can ignore duplicates or update the listed columns. returning lists the columns to return (\"*\" for all). dry_run shows the statement without running it; transaction runs it inside an open handle.",
+    "description": "Insert one or more rows into a table of the scoped schema. Rows are JSON objects keyed by column name; values are converted to the column types by PostgreSQL. One statement inserts every row with the union of the columns the rows name: a column a row leaves out becomes NULL, and only a column no row names takes its default. Send a decimal with more than 15 significant digits as a JSON string so it arrives exactly; PostgreSQL converts the string to the column type. on_conflict can ignore duplicates or update the listed columns; with update, every row must name the same columns. returning lists the columns to return (\"*\" for all). dry_run shows the statement without running it; transaction runs it inside an open handle.",
     "inputSchema": {
       "$defs": {
         "OnConflict": {
@@ -1420,6 +1438,12 @@ expression: tools
             },
             {
               "type": "boolean"
+            },
+            {
+              "type": "object"
+            },
+            {
+              "type": "array"
             }
           ]
         },
@@ -1438,6 +1462,131 @@ expression: tools
           ],
           "type": "object"
         },
+        "DryRun": {
+          "properties": {
+            "cascades_to": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "class": {
+              "type": "string"
+            },
+            "destructive": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dry_run": {
+              "type": "boolean"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "notice": {
+              "type": "string"
+            },
+            "sql": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "dry_run",
+            "sql",
+            "kind",
+            "class",
+            "fingerprint",
+            "notice"
+          ],
+          "type": "object"
+        },
+        "ResultSet": {
+          "properties": {
+            "cells_cut": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "columns": {
+              "items": {
+                "$ref": "#/$defs/Column"
+              },
+              "type": "array"
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "estimate": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "notice": {
+              "type": "string"
+            },
+            "row_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "items": {
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Cell"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "rows_affected": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "truncated_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Truncation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "columns",
+            "rows",
+            "row_count",
+            "truncated",
+            "cells_cut",
+            "notice"
+          ],
+          "type": "object"
+        },
         "Truncation": {
           "enum": [
             "row_cap",
@@ -1448,86 +1597,14 @@ expression: tools
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "cells_cut": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResultSet"
         },
-        "columns": {
-          "items": {
-            "$ref": "#/$defs/Column"
-          },
-          "type": "array"
-        },
-        "cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "estimate": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "notice": {
-          "type": "string"
-        },
-        "row_count": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rows": {
-          "items": {
-            "items": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Cell"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "type": "array"
-          },
-          "type": "array"
-        },
-        "rows_affected": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "truncated": {
-          "type": "boolean"
-        },
-        "truncated_by": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Truncation"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        {
+          "$ref": "#/$defs/DryRun"
         }
-      },
-      "required": [
-        "columns",
-        "rows",
-        "row_count",
-        "truncated",
-        "cells_cut",
-        "notice"
-      ],
-      "type": "object"
+      ]
     },
     "annotations": {
       "title": "Insert rows",
@@ -1540,7 +1617,7 @@ expression: tools
   {
     "name": "pg_update",
     "title": "Update rows",
-    "description": "Update rows of a table in the scoped schema. set is a JSON object of column values; filter is a SQL boolean expression placed after WHERE. An update without a filter, or with a filter that is always true, touches every row and needs confirm: true (or the confirmation prompt when the client supports it). returning lists columns to return; on PostgreSQL 18, returning_old_new adds the old and new row images.",
+    "description": "Update rows of a table in the scoped schema. set is a JSON object of column values (send a decimal with more than 15 significant digits as a JSON string); filter is a SQL boolean expression placed after WHERE. An update without a filter, or with a filter that is always true, touches every row and needs confirm: true (or the confirmation prompt when the client supports it). returning lists columns to return; on PostgreSQL 18, returning_old_new adds the old and new row images.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -1606,6 +1683,12 @@ expression: tools
             },
             {
               "type": "boolean"
+            },
+            {
+              "type": "object"
+            },
+            {
+              "type": "array"
             }
           ]
         },
@@ -1624,6 +1707,131 @@ expression: tools
           ],
           "type": "object"
         },
+        "DryRun": {
+          "properties": {
+            "cascades_to": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "class": {
+              "type": "string"
+            },
+            "destructive": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dry_run": {
+              "type": "boolean"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "notice": {
+              "type": "string"
+            },
+            "sql": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "dry_run",
+            "sql",
+            "kind",
+            "class",
+            "fingerprint",
+            "notice"
+          ],
+          "type": "object"
+        },
+        "ResultSet": {
+          "properties": {
+            "cells_cut": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "columns": {
+              "items": {
+                "$ref": "#/$defs/Column"
+              },
+              "type": "array"
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "estimate": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "notice": {
+              "type": "string"
+            },
+            "row_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "items": {
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Cell"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "rows_affected": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "truncated_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Truncation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "columns",
+            "rows",
+            "row_count",
+            "truncated",
+            "cells_cut",
+            "notice"
+          ],
+          "type": "object"
+        },
         "Truncation": {
           "enum": [
             "row_cap",
@@ -1634,86 +1842,14 @@ expression: tools
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "cells_cut": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResultSet"
         },
-        "columns": {
-          "items": {
-            "$ref": "#/$defs/Column"
-          },
-          "type": "array"
-        },
-        "cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "estimate": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "notice": {
-          "type": "string"
-        },
-        "row_count": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rows": {
-          "items": {
-            "items": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Cell"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "type": "array"
-          },
-          "type": "array"
-        },
-        "rows_affected": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "truncated": {
-          "type": "boolean"
-        },
-        "truncated_by": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Truncation"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        {
+          "$ref": "#/$defs/DryRun"
         }
-      },
-      "required": [
-        "columns",
-        "rows",
-        "row_count",
-        "truncated",
-        "cells_cut",
-        "notice"
-      ],
-      "type": "object"
+      ]
     },
     "annotations": {
       "title": "Update rows",
@@ -1781,6 +1917,12 @@ expression: tools
             },
             {
               "type": "boolean"
+            },
+            {
+              "type": "object"
+            },
+            {
+              "type": "array"
             }
           ]
         },
@@ -1799,6 +1941,131 @@ expression: tools
           ],
           "type": "object"
         },
+        "DryRun": {
+          "properties": {
+            "cascades_to": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "class": {
+              "type": "string"
+            },
+            "destructive": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dry_run": {
+              "type": "boolean"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "notice": {
+              "type": "string"
+            },
+            "sql": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "dry_run",
+            "sql",
+            "kind",
+            "class",
+            "fingerprint",
+            "notice"
+          ],
+          "type": "object"
+        },
+        "ResultSet": {
+          "properties": {
+            "cells_cut": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "columns": {
+              "items": {
+                "$ref": "#/$defs/Column"
+              },
+              "type": "array"
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "estimate": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "notice": {
+              "type": "string"
+            },
+            "row_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "items": {
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Cell"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "rows_affected": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "truncated_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Truncation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "columns",
+            "rows",
+            "row_count",
+            "truncated",
+            "cells_cut",
+            "notice"
+          ],
+          "type": "object"
+        },
         "Truncation": {
           "enum": [
             "row_cap",
@@ -1809,86 +2076,14 @@ expression: tools
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "cells_cut": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResultSet"
         },
-        "columns": {
-          "items": {
-            "$ref": "#/$defs/Column"
-          },
-          "type": "array"
-        },
-        "cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "estimate": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "notice": {
-          "type": "string"
-        },
-        "row_count": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rows": {
-          "items": {
-            "items": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Cell"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "type": "array"
-          },
-          "type": "array"
-        },
-        "rows_affected": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "truncated": {
-          "type": "boolean"
-        },
-        "truncated_by": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Truncation"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        {
+          "$ref": "#/$defs/DryRun"
         }
-      },
-      "required": [
-        "columns",
-        "rows",
-        "row_count",
-        "truncated",
-        "cells_cut",
-        "notice"
-      ],
-      "type": "object"
+      ]
     },
     "annotations": {
       "title": "Delete rows",
@@ -1901,7 +2096,7 @@ expression: tools
   {
     "name": "pg_merge",
     "title": "Upsert rows with MERGE",
-    "description": "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. Matched rows have update_columns set from the source (default: every column except match_on); unmatched rows are inserted when insert_unmatched is true. returning (PostgreSQL 17 and later) lists columns to return. dry_run shows the statement without running it; confirm is accepted for the same reason it exists on pg_update and pg_delete, though match_on always builds a real join on named columns, so this tool never generates the unconditional MERGE the classifier would flag.",
+    "description": "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. A matched row updates only the update_columns it names (default: every column the rows name except match_on), so a column a row leaves out keeps its stored value; unmatched rows are inserted when insert_unmatched is true. Two sessions that MERGE the same new key at the same time can hit a unique violation instead of one updating the other's row; for upserts that race, use pg_insert with on_conflict update, which PostgreSQL resolves safely. Send a decimal with more than 15 significant digits as a JSON string. returning (PostgreSQL 17 and later) lists columns to return. dry_run shows the statement without running it; confirm is accepted for the same reason it exists on pg_update and pg_delete, though match_on always builds a real join on named columns, so this tool never generates the unconditional MERGE the classifier would flag.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -1981,6 +2176,12 @@ expression: tools
             },
             {
               "type": "boolean"
+            },
+            {
+              "type": "object"
+            },
+            {
+              "type": "array"
             }
           ]
         },
@@ -1999,6 +2200,131 @@ expression: tools
           ],
           "type": "object"
         },
+        "DryRun": {
+          "properties": {
+            "cascades_to": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "class": {
+              "type": "string"
+            },
+            "destructive": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dry_run": {
+              "type": "boolean"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "notice": {
+              "type": "string"
+            },
+            "sql": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "dry_run",
+            "sql",
+            "kind",
+            "class",
+            "fingerprint",
+            "notice"
+          ],
+          "type": "object"
+        },
+        "ResultSet": {
+          "properties": {
+            "cells_cut": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "columns": {
+              "items": {
+                "$ref": "#/$defs/Column"
+              },
+              "type": "array"
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "estimate": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "notice": {
+              "type": "string"
+            },
+            "row_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "items": {
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Cell"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "rows_affected": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "truncated_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Truncation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "columns",
+            "rows",
+            "row_count",
+            "truncated",
+            "cells_cut",
+            "notice"
+          ],
+          "type": "object"
+        },
         "Truncation": {
           "enum": [
             "row_cap",
@@ -2009,86 +2335,14 @@ expression: tools
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "cells_cut": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResultSet"
         },
-        "columns": {
-          "items": {
-            "$ref": "#/$defs/Column"
-          },
-          "type": "array"
-        },
-        "cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "estimate": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "notice": {
-          "type": "string"
-        },
-        "row_count": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rows": {
-          "items": {
-            "items": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Cell"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "type": "array"
-          },
-          "type": "array"
-        },
-        "rows_affected": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "truncated": {
-          "type": "boolean"
-        },
-        "truncated_by": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Truncation"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        {
+          "$ref": "#/$defs/DryRun"
         }
-      },
-      "required": [
-        "columns",
-        "rows",
-        "row_count",
-        "truncated",
-        "cells_cut",
-        "notice"
-      ],
-      "type": "object"
+      ]
     },
     "annotations": {
       "title": "Upsert rows with MERGE",
@@ -2143,6 +2397,12 @@ expression: tools
             },
             {
               "type": "boolean"
+            },
+            {
+              "type": "object"
+            },
+            {
+              "type": "array"
             }
           ]
         },
@@ -2161,6 +2421,131 @@ expression: tools
           ],
           "type": "object"
         },
+        "DryRun": {
+          "properties": {
+            "cascades_to": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "class": {
+              "type": "string"
+            },
+            "destructive": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dry_run": {
+              "type": "boolean"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "notice": {
+              "type": "string"
+            },
+            "sql": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "dry_run",
+            "sql",
+            "kind",
+            "class",
+            "fingerprint",
+            "notice"
+          ],
+          "type": "object"
+        },
+        "ResultSet": {
+          "properties": {
+            "cells_cut": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "columns": {
+              "items": {
+                "$ref": "#/$defs/Column"
+              },
+              "type": "array"
+            },
+            "cursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "estimate": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "notice": {
+              "type": "string"
+            },
+            "row_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "items": {
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Cell"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "rows_affected": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "truncated_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Truncation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "columns",
+            "rows",
+            "row_count",
+            "truncated",
+            "cells_cut",
+            "notice"
+          ],
+          "type": "object"
+        },
         "Truncation": {
           "enum": [
             "row_cap",
@@ -2171,86 +2556,14 @@ expression: tools
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "cells_cut": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ResultSet"
         },
-        "columns": {
-          "items": {
-            "$ref": "#/$defs/Column"
-          },
-          "type": "array"
-        },
-        "cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "estimate": {
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "notice": {
-          "type": "string"
-        },
-        "row_count": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "rows": {
-          "items": {
-            "items": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/Cell"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "type": "array"
-          },
-          "type": "array"
-        },
-        "rows_affected": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "truncated": {
-          "type": "boolean"
-        },
-        "truncated_by": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Truncation"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        {
+          "$ref": "#/$defs/DryRun"
         }
-      },
-      "required": [
-        "columns",
-        "rows",
-        "row_count",
-        "truncated",
-        "cells_cut",
-        "notice"
-      ],
-      "type": "object"
+      ]
     },
     "annotations": {
       "title": "Run one write statement",
@@ -2348,30 +2661,105 @@ expression: tools
       "type": "object"
     },
     "outputSchema": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "properties": {
-        "data": {
-          "type": "string"
+      "$defs": {
+        "CopyInResult": {
+          "properties": {
+            "rows_loaded": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sql": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "rows_loaded",
+            "sql"
+          ],
+          "type": "object"
         },
-        "data_bytes": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
+        "CopyOutResult": {
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "data_bytes": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "notice": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "data",
+            "data_bytes",
+            "truncated",
+            "notice"
+          ],
+          "type": "object"
         },
-        "notice": {
-          "type": "string"
-        },
-        "truncated": {
-          "type": "boolean"
+        "DryRun": {
+          "properties": {
+            "cascades_to": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "class": {
+              "type": "string"
+            },
+            "destructive": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "dry_run": {
+              "type": "boolean"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string"
+            },
+            "notice": {
+              "type": "string"
+            },
+            "sql": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "dry_run",
+            "sql",
+            "kind",
+            "class",
+            "fingerprint",
+            "notice"
+          ],
+          "type": "object"
         }
       },
-      "required": [
-        "data",
-        "data_bytes",
-        "truncated",
-        "notice"
-      ],
-      "type": "object"
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CopyOutResult"
+        },
+        {
+          "$ref": "#/$defs/CopyInResult"
+        },
+        {
+          "$ref": "#/$defs/DryRun"
+        }
+      ]
     },
     "annotations": {
       "title": "Load or return rows in bulk",

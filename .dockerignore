@@ -1,0 +1,17 @@
+.git
+target
+dist
+secrets
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+.remember
+.claude
+.idea
+.vscode
+**/.DS_Store
+**/*.profraw
+**/*.rs.bk
+mutants.out*
+THIRD-PARTY.txt

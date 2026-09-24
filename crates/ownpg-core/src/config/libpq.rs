@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::environment::Environment;
 use super::profile::{handle_permissions, open_file, read_capped, read_capped_handle};
-use super::{ChannelBinding, Secret, SslMode};
+use super::{ChannelBinding, Secret, SslMode, SslNegotiation};
 use crate::error::{Error, Result};
 
 pub const LOCALHOST: &str = "localhost";
@@ -28,37 +28,105 @@ pub struct LibpqLayer {
     pub channel_binding: Option<ChannelBinding>,
     pub application_name: Option<String>,
     pub options: Option<String>,
-    pub sslnegotiation: Option<String>,
+    pub sslnegotiation: Option<SslNegotiation>,
+    pub ignored: Vec<String>,
 }
 
+const ENVIRONMENT_KEYWORDS: [(&str, &str); 36] = [
+    ("PGHOST", "host"),
+    ("PGHOSTADDR", "hostaddr"),
+    ("PGPORT", "port"),
+    ("PGDATABASE", "dbname"),
+    ("PGUSER", "user"),
+    ("PGPASSWORD", "password"),
+    ("PGPASSFILE", "passfile"),
+    ("PGSERVICE", "service"),
+    ("PGSSLMODE", "sslmode"),
+    ("PGSSLROOTCERT", "sslrootcert"),
+    ("PGSSLCERT", "sslcert"),
+    ("PGSSLKEY", "sslkey"),
+    ("PGCONNECT_TIMEOUT", "connect_timeout"),
+    ("PGCHANNELBINDING", "channel_binding"),
+    ("PGAPPNAME", "application_name"),
+    ("PGOPTIONS", "options"),
+    ("PGSSLNEGOTIATION", "sslnegotiation"),
+    ("PGREQUIREAUTH", "require_auth"),
+    ("PGREQUIRESSL", "requiressl"),
+    ("PGSSLCOMPRESSION", "sslcompression"),
+    ("PGSSLCERTMODE", "sslcertmode"),
+    ("PGSSLCRL", "sslcrl"),
+    ("PGSSLCRLDIR", "sslcrldir"),
+    ("PGSSLSNI", "sslsni"),
+    ("PGREQUIREPEER", "requirepeer"),
+    ("PGSSLMINPROTOCOLVERSION", "ssl_min_protocol_version"),
+    ("PGSSLMAXPROTOCOLVERSION", "ssl_max_protocol_version"),
+    ("PGGSSENCMODE", "gssencmode"),
+    ("PGKRBSRVNAME", "krbsrvname"),
+    ("PGGSSLIB", "gsslib"),
+    ("PGGSSDELEGATION", "gssdelegation"),
+    ("PGCLIENTENCODING", "client_encoding"),
+    ("PGTARGETSESSIONATTRS", "target_session_attrs"),
+    ("PGLOADBALANCEHOSTS", "load_balance_hosts"),
+    ("PGMINPROTOCOLVERSION", "min_protocol_version"),
+    ("PGMAXPROTOCOLVERSION", "max_protocol_version"),
+];
+
+const IGNORED_KEYWORDS: [&str; 15] = [
+    "keepalives",
+    "keepalives_idle",
+    "keepalives_interval",
+    "keepalives_count",
+    "tcp_user_timeout",
+    "client_encoding",
+    "sslcompression",
+    "sslsni",
+    "sslkeylogfile",
+    "ssl_max_protocol_version",
+    "load_balance_hosts",
+    "target_session_attrs",
+    "krbsrvname",
+    "gsslib",
+    "gssdelegation",
+];
+
+const REFUSED_KEYWORDS: [&str; 12] = [
+    "require_auth",
+    "requiressl",
+    "sslcrl",
+    "sslcrldir",
+    "sslpassword",
+    "requirepeer",
+    "replication",
+    "oauth_issuer",
+    "oauth_client_id",
+    "oauth_client_secret",
+    "oauth_scope",
+    "scram_client_key",
+];
+
 impl LibpqLayer {
-    #[must_use]
-    pub fn from_environment(env: &Environment) -> Self {
+    pub fn from_environment(env: &Environment) -> Result<Self> {
         let mut pairs = BTreeMap::new();
-        for (variable, key) in [
-            ("PGHOST", "host"),
-            ("PGHOSTADDR", "hostaddr"),
-            ("PGPORT", "port"),
-            ("PGDATABASE", "dbname"),
-            ("PGUSER", "user"),
-            ("PGPASSWORD", "password"),
-            ("PGPASSFILE", "passfile"),
-            ("PGSERVICE", "service"),
-            ("PGSSLMODE", "sslmode"),
-            ("PGSSLROOTCERT", "sslrootcert"),
-            ("PGSSLCERT", "sslcert"),
-            ("PGSSLKEY", "sslkey"),
-            ("PGCONNECT_TIMEOUT", "connect_timeout"),
-            ("PGCHANNELBINDING", "channel_binding"),
-            ("PGAPPNAME", "application_name"),
-            ("PGOPTIONS", "options"),
-            ("PGSSLNEGOTIATION", "sslnegotiation"),
-        ] {
+        for (variable, key) in ENVIRONMENT_KEYWORDS {
             if let Some(value) = env.var(variable) {
                 pairs.insert(key.to_owned(), value.to_owned());
             }
         }
-        Self::from_pairs(&pairs).unwrap_or_default()
+        Self::from_pairs(&pairs).map_err(|error| match error {
+            Error::ConfigInvalid {
+                setting,
+                value,
+                detail,
+            } => Error::ConfigInvalid {
+                setting: ENVIRONMENT_KEYWORDS
+                    .iter()
+                    .find(|(_, key)| *key == setting)
+                    .map_or(setting, |(variable, _)| (*variable).to_owned()),
+                value,
+                detail,
+            },
+            other => other,
+        })
     }
 
     pub fn from_pairs(pairs: &BTreeMap<String, String>) -> Result<Self> {
@@ -107,9 +175,48 @@ impl LibpqLayer {
                     )?);
                 }
                 "application_name" => layer.application_name = Some(value.to_owned()),
+                "fallback_application_name" => {
+                    if layer.application_name.is_none() {
+                        layer.application_name = Some(value.to_owned());
+                    }
+                }
                 "options" => layer.options = Some(value.to_owned()),
-                "sslnegotiation" => layer.sslnegotiation = Some(value.to_owned()),
-                _ => {}
+                "sslnegotiation" => {
+                    layer.sslnegotiation =
+                        Some(
+                            SslNegotiation::parse(value).ok_or_else(|| Error::ConfigInvalid {
+                                setting: "sslnegotiation".to_owned(),
+                                value: value.to_owned(),
+                                detail: "expected postgres or direct".to_owned(),
+                            })?,
+                        );
+                }
+                "gssencmode" if value == "require" => return Err(cannot_honor(key, value)),
+                "gssencmode" | "sslcertmode" if value == "disable" || value == "allow" => {}
+                "gssencmode" => layer.ignored.push(key.clone()),
+                "ssl_min_protocol_version" if matches!(value, "TLSv1" | "TLSv1.1" | "TLSv1.2") => {}
+                "min_protocol_version" | "max_protocol_version"
+                    if value == "3.0" || (key == "max_protocol_version" && value == "latest") => {}
+                "sslcertmode"
+                | "ssl_min_protocol_version"
+                | "min_protocol_version"
+                | "max_protocol_version"
+                | "scram_server_key" => return Err(cannot_honor(key, value)),
+                other if IGNORED_KEYWORDS.contains(&other) => {
+                    if !layer.ignored.iter().any(|seen| seen == other) {
+                        layer.ignored.push(other.to_owned());
+                    }
+                }
+                other if REFUSED_KEYWORDS.contains(&other) => {
+                    return Err(cannot_honor(other, value));
+                }
+                other => {
+                    return Err(Error::ConfigInvalid {
+                        setting: other.to_owned(),
+                        value: value.to_owned(),
+                        detail: "not a libpq connection keyword".to_owned(),
+                    });
+                }
             }
         }
         Ok(layer)
@@ -135,7 +242,24 @@ impl LibpqLayer {
             application_name: self.application_name.or(lower.application_name),
             options: self.options.or(lower.options),
             sslnegotiation: self.sslnegotiation.or(lower.sslnegotiation),
+            ignored: {
+                let mut ignored = self.ignored;
+                for keyword in lower.ignored {
+                    if !ignored.contains(&keyword) {
+                        ignored.push(keyword);
+                    }
+                }
+                ignored
+            },
         }
+    }
+}
+
+fn cannot_honor(keyword: &str, value: &str) -> Error {
+    Error::ConfigInvalid {
+        setting: keyword.to_owned(),
+        value: value.to_owned(),
+        detail: "OwnPG cannot honor this libpq setting, so it refuses to connect without it; remove it or connect with a client that supports it".to_owned(),
     }
 }
 
@@ -499,7 +623,7 @@ mod tests {
             .with_var("PGCONNECT_TIMEOUT", "7")
             .with_var("PGCHANNELBINDING", "require")
             .with_var("PGAPPNAME", "custom");
-        let layer = LibpqLayer::from_environment(&env);
+        let layer = LibpqLayer::from_environment(&env).unwrap();
         assert_eq!(layer.host.as_deref(), Some("db.internal"));
         assert_eq!(layer.port, Some(5433));
         assert_eq!(layer.dbname.as_deref(), Some("app"));
@@ -508,6 +632,44 @@ mod tests {
         assert_eq!(layer.connect_timeout, Some(Duration::from_secs(7)));
         assert_eq!(layer.channel_binding, Some(ChannelBinding::Require));
         assert_eq!(layer.application_name.as_deref(), Some("custom"));
+    }
+
+    #[test]
+    fn an_invalid_environment_value_is_refused_and_named_by_its_variable() {
+        let env = Environment::default()
+            .with_var("PGHOST", "a,b")
+            .with_var("PGSSLMODE", "verify-full");
+        let error = LibpqLayer::from_environment(&env).unwrap_err();
+        assert!(error.to_string().contains("PGHOST"), "{error}");
+        let env = Environment::default().with_var("PGCONNECT_TIMEOUT", "10s");
+        let error = LibpqLayer::from_environment(&env).unwrap_err();
+        assert!(error.to_string().contains("PGCONNECT_TIMEOUT"), "{error}");
+        let env = Environment::default().with_var("PGREQUIREAUTH", "scram-sha-256");
+        let error = LibpqLayer::from_environment(&env).unwrap_err();
+        assert!(error.to_string().contains("PGREQUIREAUTH"), "{error}");
+    }
+
+    #[test]
+    fn libpq_keywords_are_honored_ignored_or_refused_but_never_silently_dropped() {
+        let layer = parse_dsn(
+            "host=db port=5432 sslmode=require sslnegotiation=direct keepalives=1 client_encoding=UTF8 fallback_application_name=tool gssencmode=disable sslcertmode=allow ssl_min_protocol_version=TLSv1.2",
+        )
+        .unwrap();
+        assert_eq!(layer.sslnegotiation, Some(SslNegotiation::Direct));
+        assert_eq!(layer.application_name.as_deref(), Some("tool"));
+        assert_eq!(layer.ignored, ["client_encoding", "keepalives"]);
+        for refused in [
+            "host=db require_auth=scram-sha-256",
+            "host=db sslcrl=/etc/crl.pem",
+            "host=db gssencmode=require",
+            "host=db sslcertmode=require",
+            "host=db ssl_min_protocol_version=TLSv1.3",
+            "host=db min_protocol_version=3.2",
+            "host=db sslmodee=require",
+        ] {
+            assert!(parse_dsn(refused).is_err(), "{refused} was accepted");
+        }
+        assert!(parse_dsn("postgresql://db/app?sslnegotiation=sideways").is_err());
     }
 
     #[test]

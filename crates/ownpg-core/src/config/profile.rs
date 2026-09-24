@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ChannelBinding, FILE_CAP_BYTES, Mode, PROFILE_FORMAT, SshTransport, SslMode, ToolGroup,
+    AuditFailure, ChannelBinding, FILE_CAP_BYTES, KeychainScope, Mode, PROFILE_FORMAT, ResultText,
+    SshTransport, SslMode, SslNegotiation, ToolGroup,
 };
 use crate::error::{Error, Result};
 
@@ -47,6 +48,10 @@ pub struct ProfileEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_keychain: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keychain_scope: Option<KeychainScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_text: Option<ResultText>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sslmode: Option<SslMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sslrootcert: Option<PathBuf>,
@@ -56,6 +61,8 @@ pub struct ProfileEntry {
     pub sslkey: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_binding: Option<ChannelBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sslnegotiation: Option<SslNegotiation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,6 +97,10 @@ pub struct ProfileEntry {
     pub audit_max_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_keep_files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_keep_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_on_failure: Option<AuditFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pg_bindir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,11 +255,19 @@ pub fn read_capped(path: &Path) -> Result<String> {
     read_capped_handle(open_file(path)?, path)
 }
 
-pub fn read_capped_handle(mut file: fs::File, path: &Path) -> Result<String> {
-    let mut buffer = String::new();
+pub fn read_capped_handle(file: fs::File, path: &Path) -> Result<String> {
+    let bytes = read_capped_bytes(file, path)?;
+    String::from_utf8(bytes).map_err(|error| Error::ConfigUnreadable {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+    })
+}
+
+pub fn read_capped_bytes(mut file: fs::File, path: &Path) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
     Read::by_ref(&mut file)
         .take(FILE_CAP_BYTES + 1)
-        .read_to_string(&mut buffer)
+        .read_to_end(&mut buffer)
         .map_err(|source| Error::ConfigUnreadable {
             path: path.to_path_buf(),
             source,
@@ -309,7 +328,18 @@ pub fn open_private(path: &Path) -> Result<fs::File> {
     }
 }
 
+const TEMPORARY_PREFIX: &str = ".ownpg-";
+const STALE_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_secs(86_400);
+
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_private_file(path, bytes, true)
+}
+
+pub fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_private_file(path, bytes, false)
+}
+
+fn write_private_file(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
     let unwritable = |source: std::io::Error| Error::ConfigUnwritable {
         path: path.to_path_buf(),
         source,
@@ -318,31 +348,109 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .ok_or_else(|| unwritable(std::io::Error::other("the path has no parent directory")))?;
     create_private_directory(directory).map_err(unwritable)?;
+    sweep_stale_temporaries(directory);
     let mut temporary = tempfile::Builder::new()
-        .prefix(".ownpg-")
+        .prefix(TEMPORARY_PREFIX)
         .tempfile_in(directory)
         .map_err(unwritable)?;
     temporary.write_all(bytes).map_err(unwritable)?;
     temporary.flush().map_err(unwritable)?;
     temporary.as_file().sync_all().map_err(unwritable)?;
     restrict_to_owner(temporary.path()).map_err(unwritable)?;
-    temporary
-        .persist(path)
-        .map_err(|error| unwritable(error.error))?;
+    if replace {
+        temporary
+            .persist(path)
+            .map_err(|error| unwritable(error.error))?;
+    } else {
+        temporary.persist_noclobber(path).map_err(|error| {
+            if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                unwritable(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "the file exists; pass --force to replace it",
+                ))
+            } else {
+                unwritable(error.error)
+            }
+        })?;
+    }
     #[cfg(unix)]
     {
-        if let Ok(handle) = fs::File::open(directory) {
-            let _ = handle.sync_all();
+        if let Ok(handle) = fs::File::open(directory)
+            && let Err(error) = handle.sync_all()
+        {
+            tracing::debug!(%error, directory = %directory.display(), "the directory entry could not be flushed");
         }
     }
     Ok(())
+}
+
+fn sweep_stale_temporaries(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(TEMPORARY_PREFIX) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > STALE_TEMPORARY_AGE);
+        if metadata.is_file()
+            && stale
+            && let Err(error) = fs::remove_file(entry.path())
+        {
+            tracing::warn!(%error, path = %entry.path().display(), "a stale temporary file could not be removed");
+        }
+    }
+}
+
+pub fn lock_profiles(path: &Path) -> Result<fs::File> {
+    let mut lock_name = path.as_os_str().to_owned();
+    lock_name.push(".lock");
+    let lock_path = std::path::PathBuf::from(lock_name);
+    let unwritable = |source: std::io::Error| Error::ConfigUnwritable {
+        path: lock_path.clone(),
+        source,
+    };
+    if let Some(directory) = lock_path.parent() {
+        create_private_directory(directory).map_err(unwritable)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&lock_path).map_err(unwritable)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(unwritable(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "another ownpg config command is changing the profile file; try again when it finishes",
+        ))),
+        Err(fs::TryLockError::Error(source)) => Err(unwritable(source)),
+    }
 }
 
 pub fn create_private_directory(directory: &Path) -> std::io::Result<()> {
     if directory.as_os_str().is_empty() || directory.is_dir() {
         return Ok(());
     }
-    fs::create_dir_all(directory)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(directory)?;
     restrict_directory_to_owner(directory)
 }
 

@@ -3,7 +3,7 @@ use ownpg_core::{Error, ExitClass, Result};
 
 use crate::cli::{Cli, Command, ServeArgs, ShellArg};
 use crate::output::{emit, report_error, stdout_error};
-use crate::{audit_cmd, config_cmd, context, doctor, logging, serve};
+use crate::{audit_cmd, config_cmd, context, doctor, health, logging, serve};
 
 pub(crate) fn run(args: Cli) -> ExitClass {
     let outcome = dispatch(args);
@@ -41,6 +41,7 @@ fn dispatch(args: Cli) -> Result<ExitClass> {
         }
         Some(Command::Serve(serve_args)) => serve::run(&args.global, &serve_args, &process),
         Some(Command::Doctor(doctor_args)) => doctor::run(&args.global, &doctor_args, &process),
+        Some(Command::Health(health_args)) => health::run(&health_args, &process),
         Some(Command::Config(config)) => config_cmd::run(&args.global, &config, &process),
         Some(Command::Audit(crate::cli::AuditCommand::Verify { path })) => audit_cmd::verify(&path),
         Some(Command::Man { .. } | Command::Completions { .. }) => Ok(ExitClass::Success),

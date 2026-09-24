@@ -14,12 +14,17 @@ use crate::error::Error;
 
 pub const CONFIRMATION_TTL: Duration = Duration::from_secs(300);
 pub const REQUEST_KEY: &str = "confirm";
+pub const PENDING_FORMAT: u32 = 1;
+const TARGET_DIGEST_HEX_CHARS: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pending {
+    pub v: u32,
     pub tool: String,
     pub sql_sha256: String,
     pub principal: String,
+    pub target: String,
+    pub issued_at: u64,
     pub nonce: u64,
 }
 
@@ -27,6 +32,32 @@ pub struct Pending {
 pub struct Gate {
     codec: RequestStateCodec,
     consumed: std::sync::Mutex<VecDeque<(u64, Instant)>>,
+    started_at: u64,
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+#[must_use]
+pub fn target_digest(settings: &crate::config::Settings) -> String {
+    let connection = &settings.connection;
+    let identity = format!(
+        "{}\n{}\n{}\n{}",
+        connection
+            .host
+            .as_ref()
+            .map_or("", |host| host.value.as_str()),
+        connection.port.value,
+        settings.database.value,
+        settings.schema.value
+    );
+    crate::audit::sha256_hex(identity.as_bytes())
+        .chars()
+        .take(TARGET_DIGEST_HEX_CHARS)
+        .collect()
 }
 
 impl Default for Gate {
@@ -53,7 +84,45 @@ impl Gate {
         Self {
             codec: RequestStateCodec::new_unchecked(key.to_vec()),
             consumed: std::sync::Mutex::new(VecDeque::new()),
+            started_at: unix_seconds(),
         }
+    }
+
+    fn matches(
+        &self,
+        pending: &Pending,
+        tool: &str,
+        sql_sha256: &str,
+        principal: &str,
+        target: &str,
+    ) -> Result<(), Error> {
+        let refusal = |detail: &str| Error::ConfirmationRequired {
+            operation: format!("{detail}; confirm again"),
+        };
+        if pending.v != PENDING_FORMAT {
+            return Err(refusal(
+                "the confirmation was issued by another version of OwnPG",
+            ));
+        }
+        if pending.tool != tool
+            || pending.sql_sha256 != sql_sha256
+            || pending.principal != principal
+        {
+            return Err(Error::ConfirmationRequired {
+                operation: "the confirmation belongs to a different statement or caller".to_owned(),
+            });
+        }
+        if pending.target != target {
+            return Err(refusal(
+                "the confirmation was issued for another database or schema",
+            ));
+        }
+        if pending.issued_at < self.started_at {
+            return Err(refusal(
+                "the confirmation was issued before this server started",
+            ));
+        }
+        Ok(())
     }
 
     fn consume(&self, nonce: u64) -> Result<(), Error> {
@@ -77,14 +146,8 @@ impl Gate {
     }
 
     pub fn from_key_file(path: &std::path::Path) -> Result<Self, Error> {
-        let mut file = crate::config::profile::open_private(path)?;
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|source| {
-            Error::ConfigUnreadable {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
+        let file = crate::config::profile::open_private(path)?;
+        let bytes = crate::config::profile::read_capped_bytes(file, path)?;
         if bytes.len() < 32 {
             return Err(Error::ConfigInvalid {
                 setting: "http.state_key_file".to_owned(),
@@ -120,9 +183,12 @@ impl Gate {
         rule: &str,
     ) -> Result<Verdict, ToolFailure> {
         let sealed = self.seal(&Pending {
+            v: PENDING_FORMAT,
             tool: tool.to_owned(),
             sql_sha256: classification.sql_sha256.clone(),
             principal: call.principal.clone(),
+            target: target_digest(call.settings()),
+            issued_at: unix_seconds(),
             nonce: rand::random(),
         })?;
         let message = format!(
@@ -171,16 +237,13 @@ impl Gate {
         }
         if let Some(sealed) = call.request_state.as_deref() {
             let pending = self.open(sealed)?;
-            if pending.tool != tool
-                || pending.sql_sha256 != classification.sql_sha256
-                || pending.principal != call.principal
-            {
-                return Err(Error::ConfirmationRequired {
-                    operation: "the confirmation belongs to a different statement or caller"
-                        .to_owned(),
-                }
-                .into());
-            }
+            self.matches(
+                &pending,
+                tool,
+                &classification.sql_sha256,
+                &call.principal,
+                &target_digest(call.settings()),
+            )?;
             return match answer(call.input_responses.as_ref()) {
                 Answer::Accepted => {
                     self.consume(pending.nonce)?;
@@ -192,7 +255,7 @@ impl Gate {
                 })
                 .with_facts(AuditFacts {
                     decision: Some(Decision::Refused),
-                    ..AuditFacts::default()
+                    ..crate::tools::read::facts_for(classification)
                 })),
                 Answer::Missing => self.ask(call, tool, classification, rule),
             };
@@ -259,17 +322,60 @@ mod tests {
     #[test]
     fn a_sealed_confirmation_round_trips_and_a_foreign_one_is_refused() {
         let gate = Gate::new();
-        let pending = Pending {
-            tool: "pg_delete".to_owned(),
-            sql_sha256: "abc".to_owned(),
-            principal: "tester".to_owned(),
-            nonce: 7,
-        };
+        let pending = pending();
         let sealed = gate.seal(&pending).unwrap();
         assert_eq!(gate.open(&sealed).unwrap(), pending);
         let other = Gate::new();
         assert!(other.open(&sealed).is_err());
         assert!(gate.open("not-a-token").is_err());
+    }
+
+    fn pending() -> Pending {
+        Pending {
+            v: PENDING_FORMAT,
+            tool: "pg_delete".to_owned(),
+            sql_sha256: "abc".to_owned(),
+            principal: "tester".to_owned(),
+            target: "t1".to_owned(),
+            issued_at: unix_seconds(),
+            nonce: 7,
+        }
+    }
+
+    #[test]
+    fn a_confirmation_only_fits_its_statement_caller_target_and_server_run() {
+        let gate = Gate::new();
+        let fresh = pending();
+        gate.matches(&fresh, "pg_delete", "abc", "tester", "t1")
+            .unwrap();
+        for (tool, sql, principal, target) in [
+            ("pg_update", "abc", "tester", "t1"),
+            ("pg_delete", "abd", "tester", "t1"),
+            ("pg_delete", "abc", "mallory", "t1"),
+            ("pg_delete", "abc", "tester", "t2"),
+        ] {
+            let refused = gate
+                .matches(&fresh, tool, sql, principal, target)
+                .unwrap_err();
+            assert_eq!(refused.id().as_str(), "confirmation.required");
+        }
+        let earlier = Pending {
+            issued_at: gate.started_at - 1,
+            ..pending()
+        };
+        let refused = gate
+            .matches(&earlier, "pg_delete", "abc", "tester", "t1")
+            .unwrap_err();
+        assert!(
+            refused.remedy().contains("before this server started"),
+            "{}",
+            refused.remedy()
+        );
+        let older_format = Pending { v: 0, ..pending() };
+        assert!(
+            gate.matches(&older_format, "pg_delete", "abc", "tester", "t1")
+                .is_err()
+        );
     }
 
     #[test]

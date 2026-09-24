@@ -13,13 +13,13 @@ use crate::render::{QualifiedName, expression, ident_list, quote_ident, quote_li
 use crate::shape::{ResultSet, UNTRUSTED_NOTICE};
 use crate::tool_specs;
 
-const INSERT_DESCRIPTION: &str = "Insert one or more rows into a table of the scoped schema. Rows are JSON objects keyed by column name; values are converted to the column types by PostgreSQL. One statement inserts every row with the union of the columns the rows name: a column a row leaves out becomes NULL, and only a column no row names takes its default. on_conflict can ignore duplicates or update the listed columns. returning lists the columns to return (\"*\" for all). dry_run shows the statement without running it; transaction runs it inside an open handle.";
+const INSERT_DESCRIPTION: &str = "Insert one or more rows into a table of the scoped schema. Rows are JSON objects keyed by column name; values are converted to the column types by PostgreSQL. One statement inserts every row with the union of the columns the rows name: a column a row leaves out becomes NULL, and only a column no row names takes its default. Send a decimal with more than 15 significant digits as a JSON string so it arrives exactly; PostgreSQL converts the string to the column type. on_conflict can ignore duplicates or update the listed columns; with update, every row must name the same columns. returning lists the columns to return (\"*\" for all). dry_run shows the statement without running it; transaction runs it inside an open handle.";
 
-const UPDATE_DESCRIPTION: &str = "Update rows of a table in the scoped schema. set is a JSON object of column values; filter is a SQL boolean expression placed after WHERE. An update without a filter, or with a filter that is always true, touches every row and needs confirm: true (or the confirmation prompt when the client supports it). returning lists columns to return; on PostgreSQL 18, returning_old_new adds the old and new row images.";
+const UPDATE_DESCRIPTION: &str = "Update rows of a table in the scoped schema. set is a JSON object of column values (send a decimal with more than 15 significant digits as a JSON string); filter is a SQL boolean expression placed after WHERE. An update without a filter, or with a filter that is always true, touches every row and needs confirm: true (or the confirmation prompt when the client supports it). returning lists columns to return; on PostgreSQL 18, returning_old_new adds the old and new row images.";
 
 const DELETE_DESCRIPTION: &str = "Delete rows from a table in the scoped schema. filter is a SQL boolean expression placed after WHERE. A delete without a filter, or with a filter that is always true, removes every row and needs confirm: true (or the confirmation prompt). returning lists columns to return from the deleted rows.";
 
-const MERGE_DESCRIPTION: &str = "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. Matched rows have update_columns set from the source (default: every column except match_on); unmatched rows are inserted when insert_unmatched is true. returning (PostgreSQL 17 and later) lists columns to return. dry_run shows the statement without running it; confirm is accepted for the same reason it exists on pg_update and pg_delete, though match_on always builds a real join on named columns, so this tool never generates the unconditional MERGE the classifier would flag.";
+const MERGE_DESCRIPTION: &str = "Upsert rows with MERGE (PostgreSQL 15 and later). rows are JSON objects; match_on names the columns that identify a row. A matched row updates only the update_columns it names (default: every column the rows name except match_on), so a column a row leaves out keeps its stored value; unmatched rows are inserted when insert_unmatched is true. Two sessions that MERGE the same new key at the same time can hit a unique violation instead of one updating the other's row; for upserts that race, use pg_insert with on_conflict update, which PostgreSQL resolves safely. Send a decimal with more than 15 significant digits as a JSON string. returning (PostgreSQL 17 and later) lists columns to return. dry_run shows the statement without running it; confirm is accepted for the same reason it exists on pg_update and pg_delete, though match_on always builds a real join on named columns, so this tool never generates the unconditional MERGE the classifier would flag.";
 
 const RUN_WRITE_DESCRIPTION: &str = "Run one write statement written in SQL: INSERT, UPDATE, DELETE, MERGE, COPY ... FROM STDIN is refused here (use pg_copy), DO, or CALL. Exactly one statement per call. The statement is parsed and classified first: reads are refused (use pg_run_query), schema changes are refused (use the DDL tools), and destructive shapes (a DELETE or UPDATE without a narrowing WHERE) need confirm: true or the confirmation prompt. dry_run returns the classification without running anything. A statement the parser cannot read is refused in every mode and never runs, because a statement without a class cannot be held to the access mode or the scoped schema; dry_run still reports it, with the kind unparsed and the class unknown.";
 
@@ -241,8 +241,25 @@ pub struct DryRun {
     pub class: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub destructive: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cascades_to: Vec<String>,
     pub fingerprint: String,
     pub notice: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum StatementOutput {
+    Rows(ResultSet),
+    DryRun(DryRun),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum CopyOutput {
+    Out(CopyOutResult),
+    In(CopyInResult),
+    DryRun(DryRun),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -278,8 +295,79 @@ pub fn returning_prefixed(columns: &[String], prefix: &str) -> Result<String, Er
     Ok(format!(" RETURNING {}", listed.join(", ")))
 }
 
-fn json_literal(value: &serde_json::Value) -> String {
-    format!("{}::jsonb", quote_literal(&value.to_string()))
+fn exact_numbers(field: &str, value: &serde_json::Value) -> Result<(), Error> {
+    match value {
+        serde_json::Value::Number(number) if number.is_f64() => {
+            let text = number.to_string();
+            if crate::shape::significant_digits(&text) > crate::shape::SIGNIFICANT_DIGITS_KEPT {
+                return Err(Error::ArgumentInvalid {
+                    argument: field.to_owned(),
+                    detail: format!(
+                        "the number {text} has more significant digits than a JSON number keeps exactly, so its value may already be rounded; send exact decimal values as JSON strings, for example \"12345678901234567.89\""
+                    ),
+                });
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            items.iter().try_for_each(|item| exact_numbers(field, item))
+        }
+        serde_json::Value::Object(map) => {
+            map.values().try_for_each(|item| exact_numbers(field, item))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn json_literal(field: &str, value: &serde_json::Value) -> Result<String, Error> {
+    exact_numbers(field, value)?;
+    Ok(format!("{}::jsonb", quote_literal(&value.to_string())))
+}
+
+fn rows_value(rows: &[serde_json::Map<String, serde_json::Value>]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .cloned()
+            .map(serde_json::Value::Object)
+            .collect(),
+    )
+}
+
+fn update_targets(
+    columns: &[String],
+    keys: &[String],
+    update_columns: &[String],
+) -> Result<Vec<String>, Error> {
+    if update_columns.is_empty() {
+        return Ok(columns
+            .iter()
+            .filter(|column| !keys.contains(column))
+            .cloned()
+            .collect());
+    }
+    ident_list("update_columns", update_columns)?;
+    if let Some(unset) = update_columns
+        .iter()
+        .find(|column| !columns.contains(column))
+    {
+        return Err(Error::ArgumentInvalid {
+            argument: "update_columns".to_owned(),
+            detail: format!(
+                "`{unset}` is not set by any row, so there is no value to update it with"
+            ),
+        });
+    }
+    Ok(update_columns.to_vec())
+}
+
+fn unused_alias(columns: &[String], base: &str) -> String {
+    let mut alias = base.to_owned();
+    let mut counter = 0u32;
+    while columns.iter().any(|column| column == &alias) {
+        counter = counter.saturating_add(1);
+        alias = format!("{base}_{counter}");
+    }
+    alias
 }
 
 fn column_union(rows: &[serde_json::Map<String, serde_json::Value>]) -> Result<Vec<String>, Error> {
@@ -302,17 +390,31 @@ fn column_union(rows: &[serde_json::Map<String, serde_json::Value>]) -> Result<V
 }
 
 pub fn dry_run_reply(sql: &str, classification: &Classification) -> Outcome {
+    dry_run_listing(sql, classification, Vec::new())
+}
+
+fn dry_run_listing(
+    sql: &str,
+    classification: &Classification,
+    cascades_to: Vec<String>,
+) -> Outcome {
     let result = DryRun {
         dry_run: true,
         sql: sql.to_owned(),
         kind: classification.kind.clone(),
         class: classification.class.as_str().to_owned(),
         destructive: classification.destructive_reason.clone(),
+        cascades_to,
         fingerprint: classification.fingerprint.clone(),
         notice: UNTRUSTED_NOTICE,
     };
+    let cascade_text = if result.cascades_to.is_empty() {
+        String::new()
+    } else {
+        format!("\nCASCADE also drops: {}", result.cascades_to.join(", "))
+    };
     let text = format!(
-        "dry run: {} ({}){}\n{}\n",
+        "dry run: {} ({}){}{cascade_text}\n{}\n",
         result.kind,
         result.class,
         result
@@ -345,14 +447,21 @@ pub async fn execute(
     };
     classify::authorize(classification, settings.mode.value, &scope)
         .map_err(|error| ToolFailure::from(error).with_facts(facts_for(classification)))?;
+    let cascades_to = cascade_listing(call, classification)
+        .await
+        .map_err(|error| error.with_facts(facts_for(classification)))?;
     if dry_run {
-        return dry_run_reply(sql, classification);
+        return dry_run_listing(sql, classification, cascades_to);
     }
-    let decision = match call
-        .context
-        .gate
-        .check(call, tool, classification, confirm)?
-    {
+    let mut checked = classification.clone();
+    if !cascades_to.is_empty() {
+        let also = format!("CASCADE also drops {}", cascades_to.join(", "));
+        checked.destructive_reason = Some(match &classification.destructive_reason {
+            Some(reason) => format!("{reason}; {also}"),
+            None => also,
+        });
+    }
+    let decision = match call.context.gate.check(call, tool, &checked, confirm)? {
         Verdict::Proceed(decision) => decision,
         Verdict::Ask(result) => return Ok(ask(*result)),
     };
@@ -372,6 +481,37 @@ pub async fn execute(
         .await
         .map_err(|error| ToolFailure::from(error).with_facts(facts.clone()))?;
     rows_reply(result, facts)
+}
+
+async fn cascade_listing(
+    call: &Call,
+    classification: &Classification,
+) -> Result<Vec<String>, ToolFailure> {
+    if classification.cascade_targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dependents = super::cascade::dependents(call.engine(), classification).await?;
+    let served = &call.settings().schema.value;
+    let outside: Vec<&super::cascade::Dependent> = dependents
+        .iter()
+        .filter(|dependent| dependent.schema.as_deref() != Some(served.as_str()))
+        .collect();
+    if !outside.is_empty() {
+        let named: Vec<String> = outside
+            .iter()
+            .take(super::cascade::LISTED_DEPENDENTS)
+            .map(|dependent| dependent.label())
+            .collect();
+        return Err(Error::StatementRefused {
+            rule: format!(
+                "CASCADE would also drop objects outside the served schema `{served}`: {}; remove those dependencies first",
+                named.join(", ")
+            ),
+            mode: call.settings().mode.value.to_string(),
+        }
+        .into());
+    }
+    Ok(super::cascade::listed(&dependents))
 }
 
 fn rows_reply(result: ResultSet, facts: AuditFacts) -> Outcome {
@@ -404,13 +544,7 @@ pub fn insert(call: Call, args: InsertArgs) -> BoxFuture<'static, Outcome> {
             table.sql(),
             source_columns.join(", "),
             table.sql(),
-            json_literal(&serde_json::Value::Array(
-                args.rows
-                    .iter()
-                    .cloned()
-                    .map(serde_json::Value::Object)
-                    .collect()
-            ))
+            json_literal("rows", &rows_value(&args.rows))?
         );
         match args.on_conflict {
             OnConflict::Error => {}
@@ -426,16 +560,18 @@ pub fn insert(call: Call, args: InsertArgs) -> BoxFuture<'static, Outcome> {
             }
             OnConflict::Update => {
                 let targets = ident_list("conflict_columns", &args.conflict_columns)?;
-                let updates: Vec<String> = if args.update_columns.is_empty() {
-                    columns
-                        .iter()
-                        .filter(|column| !args.conflict_columns.contains(column))
-                        .cloned()
-                        .collect()
-                } else {
-                    args.update_columns.clone()
-                };
-                ident_list("update_columns", &updates)?;
+                if let Some(partial) = args.rows.iter().position(|row| row.len() != columns.len()) {
+                    return Err(Error::ArgumentInvalid {
+                        argument: "rows".to_owned(),
+                        detail: format!(
+                            "row {} names fewer columns than the others; with on_conflict update every row must name the same columns, because a missing column would overwrite the stored value with NULL. Use pg_merge to update only the columns each row names",
+                            partial.saturating_add(1)
+                        ),
+                    }
+                    .into());
+                }
+                let updates =
+                    update_targets(&columns, &args.conflict_columns, &args.update_columns)?;
                 let assignments: Vec<String> = updates
                     .iter()
                     .map(|column| {
@@ -486,7 +622,7 @@ pub fn update(call: Call, args: UpdateArgs) -> BoxFuture<'static, Outcome> {
             table.sql(),
             source_columns.join(", "),
             table.sql(),
-            json_literal(&serde_json::Value::Object(args.set.clone()))
+            json_literal("set", &serde_json::Value::Object(args.set.clone()))?
         );
         if !args.filter.trim().is_empty() {
             sql.push_str(&format!(" WHERE {}", expression("filter", &args.filter)?));
@@ -586,16 +722,12 @@ pub fn merge(call: Call, args: MergeArgs) -> BoxFuture<'static, Outcome> {
                 .into());
             }
         }
-        let updates: Vec<String> = if args.update_columns.is_empty() {
-            columns
-                .iter()
-                .filter(|column| !args.match_on.contains(column))
-                .cloned()
-                .collect()
-        } else {
-            ident_list("update_columns", &args.update_columns)?;
-            args.update_columns.clone()
-        };
+        let updates = update_targets(&columns, &args.match_on, &args.update_columns)?;
+        let given = unused_alias(&columns, "ownpg_given");
+        let selected: Vec<String> = columns
+            .iter()
+            .map(|column| format!("populated.{}", quote_ident(column)))
+            .collect();
         let joins: Vec<String> = args
             .match_on
             .iter()
@@ -605,16 +737,12 @@ pub fn merge(call: Call, args: MergeArgs) -> BoxFuture<'static, Outcome> {
             })
             .collect();
         let mut sql = format!(
-            "MERGE INTO {} AS target USING jsonb_populate_recordset(NULL::{}, {}) AS source ON {}",
+            "MERGE INTO {} AS target USING (SELECT given.item AS {}, {} FROM jsonb_array_elements({}) AS given(item), jsonb_populate_record(NULL::{}, given.item) AS populated) AS source ON {}",
             table.sql(),
+            quote_ident(&given),
+            selected.join(", "),
+            json_literal("rows", &rows_value(&args.rows))?,
             table.sql(),
-            json_literal(&serde_json::Value::Array(
-                args.rows
-                    .iter()
-                    .cloned()
-                    .map(serde_json::Value::Object)
-                    .collect()
-            )),
             joins.join(" AND ")
         );
         if updates.is_empty() {
@@ -624,7 +752,11 @@ pub fn merge(call: Call, args: MergeArgs) -> BoxFuture<'static, Outcome> {
                 .iter()
                 .map(|column| {
                     let quoted = quote_ident(column);
-                    format!("{quoted} = source.{quoted}")
+                    format!(
+                        "{quoted} = CASE WHEN source.{} ? {} THEN source.{quoted} ELSE target.{quoted} END",
+                        quote_ident(&given),
+                        quote_literal(column)
+                    )
                 })
                 .collect();
             sql.push_str(&format!(
@@ -726,7 +858,6 @@ fn unparsed_reply(sql: &str, args: &RunWriteArgs, failure: ToolFailure) -> Outco
     let mut facts = AuditFacts {
         operation: Some("unparsed".to_owned()),
         statement_hash: Some(fingerprint.clone()),
-        statement: crate::audit::short_statement(sql),
         ..AuditFacts::default()
     };
     if args.dry_run {
@@ -740,6 +871,7 @@ fn unparsed_reply(sql: &str, args: &RunWriteArgs, failure: ToolFailure) -> Outco
                 "the parser could not read this statement, so its class and effect are unknown"
                     .to_owned(),
             ),
+            cascades_to: Vec::new(),
             fingerprint,
             notice: UNTRUSTED_NOTICE,
         };
@@ -897,16 +1029,28 @@ pub fn copy(call: Call, args: CopyArgs) -> BoxFuture<'static, Outcome> {
 
 pub fn routes() -> Result<Vec<Route>, Error> {
     Ok(vec![
-        route::<InsertArgs, ResultSet, _>(&tool_specs::PG_INSERT, INSERT_DESCRIPTION, insert)?,
-        route::<UpdateArgs, ResultSet, _>(&tool_specs::PG_UPDATE, UPDATE_DESCRIPTION, update)?,
-        route::<DeleteArgs, ResultSet, _>(&tool_specs::PG_DELETE, DELETE_DESCRIPTION, delete)?,
-        route::<MergeArgs, ResultSet, _>(&tool_specs::PG_MERGE, MERGE_DESCRIPTION, merge)?,
-        route::<RunWriteArgs, ResultSet, _>(
+        route::<InsertArgs, StatementOutput, _>(
+            &tool_specs::PG_INSERT,
+            INSERT_DESCRIPTION,
+            insert,
+        )?,
+        route::<UpdateArgs, StatementOutput, _>(
+            &tool_specs::PG_UPDATE,
+            UPDATE_DESCRIPTION,
+            update,
+        )?,
+        route::<DeleteArgs, StatementOutput, _>(
+            &tool_specs::PG_DELETE,
+            DELETE_DESCRIPTION,
+            delete,
+        )?,
+        route::<MergeArgs, StatementOutput, _>(&tool_specs::PG_MERGE, MERGE_DESCRIPTION, merge)?,
+        route::<RunWriteArgs, StatementOutput, _>(
             &tool_specs::PG_RUN_WRITE,
             RUN_WRITE_DESCRIPTION,
             run_write,
         )?,
-        route::<CopyArgs, CopyOutResult, _>(&tool_specs::PG_COPY, COPY_DESCRIPTION, copy)?,
+        route::<CopyArgs, CopyOutput, _>(&tool_specs::PG_COPY, COPY_DESCRIPTION, copy)?,
     ])
 }
 
@@ -928,7 +1072,7 @@ mod tests {
     #[test]
     fn json_rows_become_a_quoted_jsonb_literal() {
         let rows = vec![serde_json::json!({"id": 1, "note": "it's"})];
-        let literal = json_literal(&serde_json::Value::Array(rows));
+        let literal = json_literal("rows", &serde_json::Value::Array(rows)).unwrap();
         assert_eq!(literal, "'[{\"id\":1,\"note\":\"it''s\"}]'::jsonb");
         let columns = column_union(&[
             serde_json::json!({"b": 1, "a": 2})
@@ -940,6 +1084,72 @@ mod tests {
         .unwrap();
         assert_eq!(columns, ["a", "b", "c"]);
         assert!(column_union(&[serde_json::Map::new()]).is_err());
+    }
+
+    #[test]
+    fn an_unparsed_statement_keeps_only_its_hash_in_the_audit_facts() {
+        let sql = "ALTER ROLE app PASSWORD 'hunter2' VALID (";
+        let unparsable = || {
+            ToolFailure::from(Error::StatementUnparsable {
+                reason: "syntax error".to_owned(),
+            })
+        };
+        let refused_args = RunWriteArgs {
+            sql: sql.to_owned(),
+            dry_run: false,
+            confirm: false,
+            transaction: String::new(),
+        };
+        let Err(refused) = unparsed_reply(sql, &refused_args, unparsable()) else {
+            panic!("an unparsed statement outside a dry run must be refused");
+        };
+        assert!(refused.facts().statement.is_none());
+        assert_eq!(
+            refused.facts().statement_hash.as_deref().map(str::len),
+            Some(16)
+        );
+        let dry_args = RunWriteArgs {
+            dry_run: true,
+            ..refused_args
+        };
+        let Ok(crate::tools::Reply::Output(output)) = unparsed_reply(sql, &dry_args, unparsable())
+        else {
+            panic!("a dry run of an unparsed statement returns a report");
+        };
+        assert!(output.facts.statement.is_none());
+        assert!(!format!("{:?}", output.facts).contains("hunter2"));
+    }
+
+    #[test]
+    fn numbers_that_may_have_lost_precision_are_refused() {
+        let exact = serde_json::json!([{"a": 0.1, "b": 123456789012.345, "c": 1e20, "d": 9007199254740993_u64, "e": -0.000123}]);
+        assert!(json_literal("rows", &exact).is_ok());
+        let rounded: serde_json::Value =
+            serde_json::from_str(r#"[{"amount": 12345678901234567.89}]"#).unwrap();
+        let error = json_literal("rows", &rounded).unwrap_err();
+        assert!(error.to_string().contains("JSON strings"), "{error}");
+        let nested: serde_json::Value =
+            serde_json::from_str(r#"{"doc": {"ratio": 0.12345678901234567}}"#).unwrap();
+        assert!(json_literal("set", &nested).is_err());
+        let as_text = serde_json::json!([{"amount": "12345678901234567.89"}]);
+        assert!(json_literal("rows", &as_text).is_ok());
+    }
+
+    #[test]
+    fn update_columns_must_be_set_by_a_row() {
+        let columns = ["id".to_owned(), "name".to_owned()];
+        assert_eq!(
+            update_targets(&columns, &["id".to_owned()], &[]).unwrap(),
+            ["name"]
+        );
+        let error =
+            update_targets(&columns, &["id".to_owned()], &["email".to_owned()]).unwrap_err();
+        assert!(error.to_string().contains("email"), "{error}");
+        assert_eq!(unused_alias(&columns, "ownpg_given"), "ownpg_given");
+        assert_eq!(
+            unused_alias(&["ownpg_given".to_owned()], "ownpg_given"),
+            "ownpg_given_1"
+        );
     }
 
     #[test]

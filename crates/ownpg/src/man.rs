@@ -53,12 +53,24 @@ pub(crate) const ENVIRONMENT: &[(&str, &str)] = &[
         "the database password (PGPASSWORD and PGPASSFILE also apply)",
     ),
     (
+        "OWNPG_KEYCHAIN_SCOPE",
+        "which keychain entry a profile's stored password and SSH secret belong to: file (the default) binds them to this profile file and the connection target; target shares them across profile files for the same user, host, port, and SSH route",
+    ),
+    (
         "OWNPG_SSLMODE, OWNPG_SSLROOTCERT, OWNPG_SSLCERT, OWNPG_SSLKEY",
         "TLS settings (PGSSLMODE, PGSSLROOTCERT, PGSSLCERT, PGSSLKEY, and PGSSLNEGOTIATION also apply)",
     ),
     (
         "PGAPPNAME, PGOPTIONS, PGCHANNELBINDING, PGCONNECT_TIMEOUT, PGSERVICEFILE, PGSYSCONFDIR",
         "the libpq settings read with the same meaning libpq gives them",
+    ),
+    (
+        "PGCLIENTENCODING, PGSSLCOMPRESSION, PGSSLSNI, PGSSLMAXPROTOCOLVERSION, PGTARGETSESSIONATTRS, PGLOADBALANCEHOSTS, PGKRBSRVNAME, PGGSSLIB, PGGSSDELEGATION",
+        "libpq settings OwnPG accepts but does not apply; each one set produces a warning",
+    ),
+    (
+        "PGREQUIREAUTH, PGREQUIRESSL, PGSSLCERTMODE, PGSSLCRL, PGSSLCRLDIR, PGREQUIREPEER, PGSSLMINPROTOCOLVERSION, PGGSSENCMODE, PGMINPROTOCOLVERSION, PGMAXPROTOCOLVERSION",
+        "libpq security requirements OwnPG cannot meet; a value that asks for more than OwnPG provides stops startup instead of being ignored",
     ),
     (
         "OWNPG_CONNECT_TIMEOUT, OWNPG_STATEMENT_TIMEOUT, OWNPG_LOCK_TIMEOUT, OWNPG_TRANSACTION_TIMEOUT",
@@ -75,10 +87,22 @@ pub(crate) const ENVIRONMENT: &[(&str, &str)] = &[
     ),
     ("OWNPG_STRICT_ROLE", "refuse elevated roles"),
     ("OWNPG_TOOLS", "the tool groups to load"),
+    (
+        "OWNPG_RESULT_TEXT",
+        "the text block sent beside each structured tool result: full (the default) repeats the rows as text for clients that read only text, and summary sends one line, for servers whose clients all read structuredContent",
+    ),
     ("OWNPG_NO_INPUT", "never prompt (CI=true also counts)"),
     (
-        "OWNPG_AUDIT, OWNPG_AUDIT_PATH, OWNPG_AUDIT_MAX_BYTES, OWNPG_AUDIT_KEEP_FILES",
-        "the audit log",
+        "OWNPG_AUDIT, OWNPG_AUDIT_PATH, OWNPG_AUDIT_MAX_BYTES",
+        "the audit log: on or off, where it goes, and the size at which a file is rotated",
+    ),
+    (
+        "OWNPG_AUDIT_KEEP_DAYS, OWNPG_AUDIT_KEEP_FILES",
+        "how long closed audit files of this profile are kept: files older than keep_days (366 by default) are removed, and keep_files, when above 0, caps how many are kept; 0 turns each limit off, and every removal is recorded in the chain",
+    ),
+    (
+        "OWNPG_AUDIT_ON_FAILURE",
+        "what happens while the audit log cannot be written: refuse-writes (the default) refuses every tool that can change the database, refuse-all refuses every tool, and continue keeps running and only warns",
     ),
     (
         "OWNPG_PG_BINDIR, OWNPG_OUTPUT_DIR",

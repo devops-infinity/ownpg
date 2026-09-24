@@ -5,6 +5,8 @@ REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 source "$REPO/tools/lib.sh"
+require_bash 4.4 "$REPO/.githooks/pre-push" "$@"
+shopt -s inherit_errexit
 
 [[ -x "$REPO/tools/verify.sh" ]] ||
 	die "tools/verify.sh is missing or not executable; run: tools/install-hooks.sh"

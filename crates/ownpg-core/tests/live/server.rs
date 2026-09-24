@@ -41,11 +41,18 @@ async fn seed_schema(scratch: &support::Scratch) {
 }
 
 async fn rig(scratch: &support::Scratch, mode: Mode) -> Rig {
-    let settings = scratch.settings(FlagLayer {
-        schema: Some("app".to_owned()),
-        mode: Some(mode),
-        ..FlagLayer::default()
-    });
+    rig_with(scratch, mode, &[]).await
+}
+
+async fn rig_with(scratch: &support::Scratch, mode: Mode, extra: &[(&str, &str)]) -> Rig {
+    let settings = scratch.settings_with(
+        FlagLayer {
+            schema: Some("app".to_owned()),
+            mode: Some(mode),
+            ..FlagLayer::default()
+        },
+        extra,
+    );
     let settings = Arc::new(settings);
     let audit = Arc::new(
         Sink::open(&settings.audit, &settings.paths.data_dir, None).expect("the audit sink opens"),
@@ -281,6 +288,177 @@ async fn run_query_pages_sanitizes_and_refuses_writes_with_structured_errors() {
         !content.contains("customer 1"),
         "row data never reaches the audit log"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publications_event_triggers_and_default_privileges_can_be_read() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    seed_schema(&scratch).await;
+    let client = scratch.client().await;
+    let version: i32 = client
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await
+        .unwrap()
+        .get(0);
+    if version < 150_000 {
+        return;
+    }
+    client
+        .batch_execute(
+            "CREATE PUBLICATION orders_feed FOR TABLE app.orders (id, customer) WHERE (id > 10), other.secrets \
+             WITH (publish = 'insert, update'); \
+             COMMENT ON PUBLICATION orders_feed IS 'feed for the warehouse'; \
+             ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;",
+        )
+        .await
+        .unwrap();
+    let rig = rig_with(
+        &scratch,
+        Mode::ReadWrite,
+        &[("OWNPG_TOOLS", "monitoring,roles")],
+    )
+    .await;
+
+    let listed = rig
+        .call(
+            "pg_list_objects",
+            json!({"object_types": ["publication", "event_trigger"]}),
+        )
+        .await;
+    assert_ne!(listed.is_error, Some(true), "{listed:?}");
+    let rows = listed.structured_content.unwrap()["rows"].clone();
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows[0]["name"], "orders_feed");
+    assert_eq!(rows[0]["kind"], "publication");
+    assert_eq!(rows[0]["schema"], "");
+    assert_eq!(rows[0]["detail"], "insert, update");
+    assert_eq!(rows[0]["comment"], "feed for the warehouse");
+
+    let replication = rig.call("pg_replication", json!({})).await;
+    assert_ne!(replication.is_error, Some(true), "{replication:?}");
+    let structured = replication.structured_content.unwrap();
+    let publication = structured["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row[0] == "publication")
+        .cloned()
+        .expect("the publication is reported");
+    assert_eq!(publication[1], "orders_feed");
+    assert_eq!(publication[2], "insert, update");
+    assert_eq!(
+        publication[5],
+        "app.orders (id, customer) where (id > 10); 1 more table outside the scoped schema"
+    );
+    assert!(!structured.to_string().contains("secrets"));
+
+    let defaults = rig
+        .call("pg_privileges", json!({"operation": "list_defaults"}))
+        .await;
+    assert_ne!(defaults.is_error, Some(true), "{defaults:?}");
+    let structured = defaults.structured_content.unwrap();
+    assert_eq!(structured["schema"], "app");
+    assert!(
+        structured["defaults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["schema"] == "app"
+                && row["object_type"] == "tables"
+                && row["grantee"] == "PUBLIC"
+                && row["privilege"] == "SELECT"),
+        "{structured}"
+    );
+    let nobody = rig
+        .call(
+            "pg_privileges",
+            json!({"operation": "list_defaults", "name": "no_such_creator"}),
+        )
+        .await;
+    assert_eq!(nobody.structured_content.unwrap()["row_count"], 0);
+    rig.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn summary_result_text_sends_one_line_beside_the_structured_rows() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    seed_schema(&scratch).await;
+    let rig = rig_with(
+        &scratch,
+        Mode::ReadOnly,
+        &[("OWNPG_RESULT_TEXT", "summary")],
+    )
+    .await;
+    let result = rig
+        .call(
+            "pg_run_query",
+            json!({"sql": "SELECT id, customer FROM orders ORDER BY id"}),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let text = result.content[0].as_text().unwrap().text.clone();
+    assert!(
+        text.starts_with("100 rows, more remain, next page cursor "),
+        "{text}"
+    );
+    assert!(text.ends_with("The full result is in structuredContent."));
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["rows"].as_array().unwrap().len(), 100);
+    assert!(text.contains(structured["cursor"].as_str().unwrap()));
+    rig.finish().await;
+}
+
+fn begun_handle(result: &CallToolResult) -> String {
+    result.structured_content.as_ref().unwrap()["handle"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handles_the_server_closes_on_its_own_reach_the_audit_log() {
+    let Some(scratch) = support::scratch().await else {
+        return;
+    };
+    seed_schema(&scratch).await;
+    let rig = rig_with(
+        &scratch,
+        Mode::ReadWrite,
+        &[("OWNPG_HANDLE_EXPIRY", "1"), ("OWNPG_CURSOR_EXPIRY", "1")],
+    )
+    .await;
+    let expired = begun_handle(
+        &rig.call("pg_transaction", json!({"operation": "begin"}))
+            .await,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(3_000)).await;
+    let open = begun_handle(
+        &rig.call("pg_transaction", json!({"operation": "begin"}))
+            .await,
+    );
+    rig.finish().await;
+    verify_chain(&audit_file_path(&scratch)).expect("the audit chain verifies");
+    let lines: Vec<Value> = std::fs::read_to_string(audit_file_path(&scratch))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let ended = |handle: &str, operation: &str, rule: &str| {
+        lines.iter().any(|line| {
+            line["handle_id"] == handle
+                && line["tool"] == "pg_transaction"
+                && line["operation"] == operation
+                && line["rule"] == rule
+                && line["principal"] == "tester"
+                && line["request_id"] == "server"
+        })
+    };
+    assert!(ended(&expired, "expired", "idle_expiry"), "{lines:#?}");
+    assert!(ended(&open, "rolled_back", "shutdown"), "{lines:#?}");
 }
 
 fn audit_file_path(scratch: &support::Scratch) -> std::path::PathBuf {

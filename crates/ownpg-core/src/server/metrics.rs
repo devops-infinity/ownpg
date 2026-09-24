@@ -7,7 +7,8 @@ use opentelemetry::metrics::{Counter, Histogram, MeterProvider as _};
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 
-use crate::audit::Decision;
+use crate::audit::{Decision, Sink};
+use crate::engine::Engine;
 use crate::error::{Error, Result};
 
 pub const EXPORT_INTERVAL: Duration = Duration::from_secs(30);
@@ -17,6 +18,7 @@ pub struct Metrics {
     provider: SdkMeterProvider,
     calls: Counter<u64>,
     refusals: Counter<u64>,
+    http_rejections: Counter<u64>,
     duration: Histogram<f64>,
     open_handles: Arc<AtomicU64>,
 }
@@ -38,7 +40,7 @@ impl Metrics {
         }
     }
 
-    pub fn start(endpoint: &str) -> Result<Self> {
+    pub fn start(endpoint: &str, audit: Arc<Sink>, engine: Arc<Engine>) -> Result<Self> {
         super::ensure_tls_provider();
         super::http::announce_proxy("metrics export");
         let exporter = opentelemetry_otlp::MetricExporter::builder()
@@ -70,7 +72,11 @@ impl Metrics {
             .build();
         let refusals = meter
             .u64_counter("ownpg.refusals")
-            .with_description("Refused tool calls by rule")
+            .with_description("Refused tool calls by error code")
+            .build();
+        let http_rejections = meter
+            .u64_counter("ownpg.http.rejections")
+            .with_description("HTTP requests refused before they reached a tool, by reason")
             .build();
         let duration = meter
             .f64_histogram("ownpg.call.duration")
@@ -86,38 +92,126 @@ impl Metrics {
                 observer.observe(observed.load(Ordering::Relaxed), &[]);
             })
             .build();
+        let dropped_source = Arc::clone(&audit);
+        let _dropped = meter
+            .u64_observable_counter("ownpg.audit.dropped")
+            .with_description("Audit lines that could not be written since the server started")
+            .with_callback(move |observer| {
+                observer.observe(dropped_source.dropped(), &[]);
+            })
+            .build();
+        let _degraded = meter
+            .u64_observable_gauge("ownpg.audit.degraded")
+            .with_description("1 while the audit log cannot be written, otherwise 0")
+            .with_callback(move |observer| {
+                observer.observe(
+                    u64::from(audit.is_degraded()),
+                    &[KeyValue::new("on_failure", audit.on_failure().as_str())],
+                );
+            })
+            .build();
+        Self::observe_pool(&meter, &engine);
         tracing::info!(endpoint, "metrics export is on");
         Ok(Self {
             provider,
             calls,
             refusals,
+            http_rejections,
             duration,
             open_handles,
         })
+    }
+
+    fn observe_pool(meter: &opentelemetry::metrics::Meter, engine: &Arc<Engine>) {
+        let pool_name = KeyValue::new(
+            "db.client.connection.pool.name",
+            engine.settings().database.value.clone(),
+        );
+        let source = Arc::clone(engine);
+        let name = pool_name.clone();
+        let _connections = meter
+            .i64_observable_up_down_counter("db.client.connection.count")
+            .with_description("Pooled database connections by state")
+            .with_unit("{connection}")
+            .with_callback(move |observer| {
+                if let Some(status) = source.pool_status() {
+                    for (state, value) in [("idle", status.idle), ("used", status.used)] {
+                        observer.observe(
+                            pool_count(value),
+                            &[
+                                name.clone(),
+                                KeyValue::new("db.client.connection.state", state),
+                            ],
+                        );
+                    }
+                }
+            })
+            .build();
+        let source = Arc::clone(engine);
+        let name = pool_name.clone();
+        let _max = meter
+            .i64_observable_up_down_counter("db.client.connection.max")
+            .with_description("The most pooled database connections allowed")
+            .with_unit("{connection}")
+            .with_callback(move |observer| {
+                if let Some(status) = source.pool_status() {
+                    observer.observe(pool_count(status.max), std::slice::from_ref(&name));
+                }
+            })
+            .build();
+        let source = Arc::clone(engine);
+        let _pending = meter
+            .i64_observable_up_down_counter("db.client.connection.pending_requests")
+            .with_description("Calls waiting for a pooled database connection")
+            .with_unit("{request}")
+            .with_callback(move |observer| {
+                if let Some(status) = source.pool_status() {
+                    observer.observe(pool_count(status.waiting), std::slice::from_ref(&pool_name));
+                }
+            })
+            .build();
     }
 
     pub fn record_call(
         &self,
         tool: &str,
         decision: Decision,
-        rule: Option<&str>,
+        error_code: Option<&str>,
         duration: Duration,
     ) {
+        let outcome = if error_code.is_some() { "error" } else { "ok" };
         let attributes = [
             KeyValue::new("tool", tool.to_owned()),
             KeyValue::new("decision", decision.as_str()),
+            KeyValue::new("outcome", outcome),
         ];
         self.calls.add(1, &attributes);
         self.duration.record(
             duration.as_secs_f64() * 1_000.0,
-            &[KeyValue::new("tool", tool.to_owned())],
+            &[
+                KeyValue::new("tool", tool.to_owned()),
+                KeyValue::new("outcome", outcome),
+            ],
         );
         if decision == Decision::Refused {
-            let rule = rule
-                .map(|rule| rule.chars().take(80).collect::<String>())
-                .unwrap_or_else(|| "unknown".to_owned());
-            self.refusals.add(1, &[KeyValue::new("rule", rule)]);
+            self.refusals.add(
+                1,
+                &[
+                    KeyValue::new("tool", tool.to_owned()),
+                    KeyValue::new("code", error_code.unwrap_or("unknown").to_owned()),
+                ],
+            );
         }
+    }
+
+    pub fn record_http_rejection(&self, reason: &'static str) {
+        self.http_rejections
+            .add(1, &[KeyValue::new("reason", reason)]);
+    }
+
+    #[must_use]
+    pub fn open_handles_gauge(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.open_handles)
     }
 
     pub fn set_open_handles(&self, count: u64) {
@@ -139,6 +233,10 @@ impl Metrics {
             tracing::debug!(%error, "the metrics shutdown task ended abnormally");
         }
     }
+}
+
+fn pool_count(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
