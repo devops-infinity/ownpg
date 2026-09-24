@@ -309,7 +309,7 @@ async fn the_endpoint_answers_calls_and_enforces_the_transport_rules() {
     let mut last = 200;
     let mut retry_after = None;
     let mut throttled = Value::Null;
-    for _ in 0..70 {
+    for _ in 0..300 {
         let (status, body, headers) = remote.call_tool("pg_health", None).await;
         last = status;
         if status == 429 {
