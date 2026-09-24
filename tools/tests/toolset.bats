@@ -3,6 +3,7 @@
 bats_require_minimum_version 1.5.0
 
 setup() {
+	unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX
 	REPO_ROOT="$(cd -- "$BATS_TEST_DIRNAME/../.." && pwd)"
 	TEST_REPO="$BATS_TEST_TMPDIR/repo"
 	mkdir -p "$TEST_REPO/tools" "$TEST_REPO/.githooks"
@@ -16,6 +17,11 @@ setup() {
 	git config user.email "test@example.com"
 	git config user.name "test"
 	TIMESTAMP='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+}
+
+@test "every test works in its own scratch repository, even under a git hook that exports GIT_DIR" {
+	[ "$(git rev-parse --absolute-git-dir)" = "$(pwd -P)/.git" ]
+	[ "$(git rev-parse --show-toplevel)" = "$(pwd -P)" ]
 }
 
 @test "lib.sh say() writes a UTC timestamp, the level, and the message to stderr, not stdout" {
