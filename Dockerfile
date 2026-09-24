@@ -3,7 +3,7 @@ ARG OWNPG_BUILD_COMMIT=unknown
 ARG SOURCE_DATE_EPOCH=
 ENV OWNPG_BUILD_COMMIT=$OWNPG_BUILD_COMMIT \
     SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
-RUN cargo install --locked cargo-auditable@0.7.5 cargo-about@0.9.2
+RUN cargo install --locked cargo-auditable@0.7.6 cargo-about@0.9.2
 RUN install -d -m 0700 /out/var/lib/ownpg /out/var/lib/ownpg/config /out/var/lib/ownpg/data /out/var/lib/ownpg/state
 WORKDIR /src
 COPY Cargo.toml Cargo.lock about.toml about.hbs LICENSE-MIT LICENSE-APACHE ./
@@ -14,7 +14,7 @@ RUN cargo auditable build --profile dist --locked -p ownpg \
     && mkdir -p /doc \
     && install -m 0644 THIRD-PARTY.txt LICENSE-MIT LICENSE-APACHE /doc/
 
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
 ARG OWNPG_VERSION=0.0.0-local
 ARG OWNPG_BUILD_COMMIT=unknown
 LABEL org.opencontainers.image.title="OwnPG" \

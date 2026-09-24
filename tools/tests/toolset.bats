@@ -181,8 +181,9 @@ setup() {
 	if ! command -v gitleaks >/dev/null 2>&1; then
 		skip "gitleaks is not installed"
 	fi
-	generated_suffix="$(date +%s%N | shasum | cut -c1-30 | tr '[:lower:]' '[:upper:]')"
-	printf 'AWS_SECRET_ACCESS_KEY="AKIA%s"\n' "$generated_suffix" >secret.txt
+	generated_suffix="$(head -c 4096 /dev/urandom | LC_ALL=C tr -dc 'A-Z2-7' | cut -c1-16)"
+	[ "${#generated_suffix}" -eq 16 ]
+	printf 'AWS_ACCESS_KEY_ID=AKIA%s\n' "$generated_suffix" >secret.txt
 	git add secret.txt
 	run git -c core.hooksPath=.githooks commit -m "secret"
 	[ "$status" -ne 0 ]

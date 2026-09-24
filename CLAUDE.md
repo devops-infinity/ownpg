@@ -24,7 +24,7 @@ This repository enforces its conventions locally, not in a hosted CI service. Ru
 - Every tracked file under `crates/`, `tools/`, and the repository root's markdown files is grepped for the em-dash character, and the same scope excluding `LICENSE-*` is grepped for a short list of words that flag borrowed or superseded code. Every tracked `.rs` file is grepped for a code comment, and every tracked shell, TOML, YAML, and Docker file for a `#` comment line. See `tools/verify.sh` for the exact patterns.
 - The repository root's markdown files are grepped against the AI-footprint word list at `$HOME/.claude/rules/banned-words.md`, when that file exists on the machine running the gate; a checkout without it skips this one check with a warning rather than failing.
 - No markdown table appears in any tracked markdown file at the repository root.
-- `cargo llvm-cov nextest --workspace --locked --fail-under-lines 80` (line coverage) and `cargo semver-checks check-release -p ownpg-core` (public-API compatibility with the published crate) are run by hand periodically; neither is part of `tools/verify.sh`, since coverage instrumentation recompiles the whole workspace and semver-checks has nothing to compare against before `ownpg-core` is first published.
+- `cargo llvm-cov nextest --workspace --locked --fail-under-lines 80` (line coverage) and `cargo semver-checks check-release -p ownpg-core` (public-API compatibility with the published crate) are run by hand periodically; neither is part of `tools/verify.sh`, since coverage instrumentation recompiles the whole workspace and semver-checks needs the registry to compare against.
 
 ## Do
 
