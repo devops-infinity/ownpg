@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "ownpg",
   "display_name": "OwnPG",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "PostgreSQL DBA tools over MCP, scoped to one database and one schema.",
   "long_description": "OwnPG connects Claude Desktop to one PostgreSQL database and one schema. Every statement is parsed and classified before it runs, the access mode decides what is allowed, destructive changes ask for confirmation, and an append-only audit log records every call.",
   "author": {
