@@ -257,6 +257,13 @@ require_minisign_key() {
 	[[ -f "$MINISIGN_KEY" ]] || die "no minisign secret key at $MINISIGN_KEY; run 'minisign -G' once, or point OWNPG_MINISIGN_KEY at the key"
 }
 
+require_llvm_tools() {
+	local sysroot
+	sysroot="$(rustc --print sysroot)" || die "rustc could not report its sysroot"
+	[[ -x "$sysroot/lib/rustlib/$(host_triple)/bin/llvm-ar" ]] ||
+		die "the llvm-tools component is missing, and cargo-xwin needs its llvm-lib for the Windows ARM64 build; run: rustup component add llvm-tools"
+}
+
 check_dist_version() {
 	local declared installed
 	declared="$(awk '
@@ -613,6 +620,13 @@ c_flags_for() {
 	esac
 }
 
+xwin_compiler_for() {
+	case "$1" in
+	aarch64-pc-windows-msvc) printf 'clang' ;;
+	*) printf 'clang-cl' ;;
+	esac
+}
+
 skip_reason() {
 	if grep -qF 'tools are required to run this task, but are missing' "$1"; then
 		printf 'missing cross-compile tool'
@@ -641,7 +655,7 @@ build_dist_artifacts() {
 	for target in "${targets[@]}"; do
 		log="$WORK_DIR/dist-build-$target.log"
 		manifest="$WORK_DIR/dist-build-$target.json"
-		if CFLAGS="$(c_flags_for "$target")" dist build --tag="v$VERSION" --artifacts=local --target="$target" --no-local-paths \
+		if CFLAGS="$(c_flags_for "$target")" XWIN_CROSS_COMPILER="$(xwin_compiler_for "$target")" dist build --tag="v$VERSION" --artifacts=local --target="$target" --no-local-paths \
 			--output-format=json >"$manifest" 2>"$log"; then
 			mkdir -p -- target/distrib
 			cp -- "$manifest" "target/distrib/$target-dist-manifest.json"
@@ -1202,6 +1216,7 @@ require_credentials
 require_gh_auth
 require_minisign_key
 check_dist_version
+require_llvm_tools
 CURRENT_VERSION="$(read_current_version)"
 [[ -n "$CURRENT_VERSION" ]] || die "could not read the version from $ROOT_MANIFEST"
 valid_version "$CURRENT_VERSION" || die "the version in $ROOT_MANIFEST is not a semver triple: $CURRENT_VERSION"
