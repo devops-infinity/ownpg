@@ -973,13 +973,13 @@ publish_github_release() {
 		grep -q '[^[:space:]]' "$notes" || die "no commits since the previous tag; nothing to write into the release notes"
 	fi
 
-	local view="$WORK_DIR/gh-view-${target_repo//\//-}.json" view_err="$WORK_DIR/gh-view-${target_repo//\//-}.err"
-	if gh release view "v$VERSION" "${repo_flag[@]}" --json assets >"$view" 2>"$view_err"; then
+	local view="$WORK_DIR/gh-view-${target_repo//\//-}.txt" view_err="$WORK_DIR/gh-view-${target_repo//\//-}.err"
+	if gh release view "v$VERSION" "${repo_flag[@]}" --json assets --jq '.assets[].name' >"$view" 2>"$view_err"; then
 		local name
 		local -a have_names=() want_names=()
 		while IFS= read -r name; do
 			[[ -n "$name" ]] && have_names+=("$name")
-		done < <(jq -r '.assets[].name' "$view" | sort)
+		done < <(sort "$view")
 		while IFS= read -r name; do
 			[[ -n "$name" ]] && want_names+=("$name")
 		done < <(printf '%s\n' "${assets[@]##*/}" | sort)
