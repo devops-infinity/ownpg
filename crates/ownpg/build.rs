@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
@@ -18,22 +19,22 @@ fn workspace_root() -> Option<PathBuf> {
     env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .and_then(|dir| dir.parent()?.parent().map(Path::to_path_buf))
-        .filter(|root| root.join(".git").is_dir())
+        .filter(|root| root.join(".git").exists())
 }
 
 fn git_state_files() -> Vec<PathBuf> {
-    let Some(git_dir) = workspace_root().map(|root| root.join(".git")) else {
+    let Some(root) = workspace_root() else {
         return Vec::new();
     };
-    let head = git_dir.join("HEAD");
-    let mut files = vec![head.clone()];
-    if let Ok(content) = fs::read_to_string(&head)
-        && let Some(reference) = content.trim().strip_prefix("ref: ")
+    let git_path = |name: &str| {
+        git_output(&root, &["rev-parse", "--git-path", name]).map(|path| root.join(path))
+    };
+    let mut files: Vec<PathBuf> = git_path("HEAD").into_iter().collect();
+    if let Some(target) = git_output(&root, &["symbolic-ref", "-q", "HEAD"])
+        .and_then(|reference| git_path(&reference))
+        .filter(|path| path.is_file())
     {
-        let target = git_dir.join(reference);
-        if target.is_file() {
-            files.push(target);
-        }
+        files.push(target);
     }
     files
 }
@@ -90,11 +91,19 @@ fn build_date() -> String {
                 .and_then(|root| git_output(&root, &["log", "-1", "--format=%ct"]))
                 .and_then(|text| text.parse::<i64>().ok())
         })
+        .or_else(current_epoch)
         .map(|epoch| {
             let (year, month, day) = civil_from_days(epoch.div_euclid(86_400));
             format!("{year:04}-{month:02}-{day:02}")
         })
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn current_epoch() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
 }
 
 #[expect(

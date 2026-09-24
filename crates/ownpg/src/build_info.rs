@@ -25,4 +25,12 @@ mod tests {
         assert!(line.contains("commit "));
         assert!(line.contains("built "));
     }
+
+    #[test]
+    fn the_build_date_is_a_calendar_date() {
+        let date = env!("OWNPG_BUILD_DATE");
+        let widths: Vec<usize> = date.split('-').map(str::len).collect();
+        assert_eq!(widths, [4, 2, 2]);
+        assert!(date.chars().all(|c| c.is_ascii_digit() || c == '-'));
+    }
 }
