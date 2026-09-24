@@ -14,7 +14,7 @@ RUN cargo auditable build --profile dist --locked -p ownpg \
     && mkdir -p /doc \
     && install -m 0644 THIRD-PARTY.txt LICENSE-MIT LICENSE-APACHE /doc/
 
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
 ARG OWNPG_VERSION=0.0.0-local
 ARG OWNPG_BUILD_COMMIT=unknown
 LABEL org.opencontainers.image.title="OwnPG" \
