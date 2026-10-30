@@ -456,13 +456,7 @@ impl Connector {
             Endpoint::Tcp { host, port } => {
                 config.host(host);
                 config.port(*port);
-                config.ssl_mode(match ssl_mode {
-                    SslMode::Disable => tokio_postgres::config::SslMode::Disable,
-                    SslMode::Allow | SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
-                    SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
-                        tokio_postgres::config::SslMode::Require
-                    }
-                });
+                config.ssl_mode(driver_ssl_mode(ssl_mode));
             }
         }
         if let Some(hostaddr) = &connection.hostaddr
@@ -621,7 +615,7 @@ impl Connector {
             candidate.endpoint.to_string(),
             via,
             Some(candidate.endpoint.clone()),
-            candidate.user.clone(),
+            candidate,
         )
         .await
     }
@@ -636,40 +630,39 @@ impl Connector {
                 detail: "a tunnel needs a TCP host and port on the far side; a socket directory cannot be forwarded".to_owned(),
                 source: None,
             })?;
-        let Endpoint::Tcp {
-            host: target_host,
-            port: target_port,
-        } = candidate.endpoint
-        else {
-            return Err(Error::SshFailed {
-                host: ssh.host.value.clone(),
-                detail: "a tunnel needs a TCP host and port on the far side".to_owned(),
-                source: None,
-            });
+        let (target_host, target_port) = match &candidate.endpoint {
+            Endpoint::Tcp { host, port } => (host.clone(), *port),
+            Endpoint::Socket { .. } => {
+                return Err(Error::SshFailed {
+                    host: ssh.host.value.clone(),
+                    detail: "a tunnel needs a TCP host and port on the far side".to_owned(),
+                    source: None,
+                });
+            }
         };
         let tunnel = ssh::open(ssh, &target_host, target_port, &self.ssh_hints).await?;
         let (stream, route, reopen, kept_alive) = tunnel.into_parts();
         let target_name = format!("{target_host}:{target_port} via {}", route.join(" -> "));
-        let mut session = self.connect_over(stream, &target_name, Via::Ssh).await?;
+        let mut session = self
+            .connect_over(stream, &target_name, Via::Ssh, &candidate)
+            .await?;
         session.reopen = Some(Arc::new(reopen));
         session.kept_alive = kept_alive;
         Ok(session)
     }
 
-    pub async fn connect_over<S>(&self, stream: S, target_name: &str, via: Via) -> Result<Session>
+    pub async fn connect_over<S>(
+        &self,
+        stream: S,
+        target_name: &str,
+        via: Via,
+        candidate: &Candidate,
+    ) -> Result<Session>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let candidate =
-            self.candidates()
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::ConnectFailed {
-                    tried: Vec::new(),
-                    source: "no connection candidate".into(),
-                })?;
         let tls = self.tls().await?;
-        let config = self.driver_config(&candidate, self.settings.connection.sslmode.value);
+        let config = self.driver_config(candidate, self.settings.connection.sslmode.value);
         let host_name = match &candidate.endpoint {
             Endpoint::Tcp { host, .. } => host.clone(),
             Endpoint::Socket { .. } => "localhost".to_owned(),
@@ -708,7 +701,7 @@ impl Connector {
             target_name.to_owned(),
             via,
             None,
-            candidate.user.clone(),
+            candidate,
         )
         .await
         .map_err(|error| Error::ConnectFailed {
@@ -725,8 +718,12 @@ impl Connector {
         target: String,
         via: Via,
         endpoint: Option<Endpoint>,
-        user: String,
+        candidate: &Candidate,
     ) -> std::result::Result<Session, Box<dyn std::error::Error + Send + Sync>> {
+        let used_ssl = match &candidate.endpoint {
+            Endpoint::Socket { .. } => tokio_postgres::config::SslMode::Disable,
+            Endpoint::Tcp { .. } => driver_ssl_mode(self.settings.connection.sslmode.value),
+        };
         let pooled = self.settings.connection.pooled.value == Some(true);
         let schema = self.settings.schema.value.clone();
         let search_path = if pooled {
@@ -756,14 +753,7 @@ impl Connector {
                 .batch_execute(&format!("SET transaction_timeout = {millis}"))
                 .await?;
         }
-        let tls_used = match via {
-            Via::Socket => Some(false),
-            Via::Tcp | Via::Ssh => match tls.plan.driver_mode {
-                tokio_postgres::config::SslMode::Disable => Some(false),
-                tokio_postgres::config::SslMode::Require => Some(true),
-                _ => None,
-            },
-        };
+        let tls_used = tls_used_from(used_ssl);
         let cancel = client.cancel_token();
         Ok(Session {
             client,
@@ -772,7 +762,7 @@ impl Connector {
                 target,
                 via,
                 endpoint,
-                user,
+                user: candidate.user.clone(),
                 tls: (via != Via::Socket).then_some(tls.plan),
                 tls_used,
                 server_version,
@@ -870,6 +860,24 @@ pub fn describe_sqlstate(error: &tokio_postgres::Error) -> Error {
             sqlstate: None,
             message: error.to_string(),
         },
+    }
+}
+
+fn driver_ssl_mode(mode: SslMode) -> tokio_postgres::config::SslMode {
+    match mode {
+        SslMode::Disable => tokio_postgres::config::SslMode::Disable,
+        SslMode::Allow | SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
+        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
+            tokio_postgres::config::SslMode::Require
+        }
+    }
+}
+
+fn tls_used_from(driver_mode: tokio_postgres::config::SslMode) -> Option<bool> {
+    match driver_mode {
+        tokio_postgres::config::SslMode::Disable => Some(false),
+        tokio_postgres::config::SslMode::Require => Some(true),
+        _ => None,
     }
 }
 

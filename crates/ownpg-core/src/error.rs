@@ -421,7 +421,7 @@ impl Error {
                     .to_owned()
             }
             Self::StatementRefused { mode, .. } => {
-                format!("Start the server in a mode that allows it, or rewrite the statement for {mode} mode.")
+                format!("Follow the rule above: it names the tool family that runs this, or the mode that allows it. This server runs in {mode} mode.")
             }
             Self::ConfigUnreadable { .. } => {
                 "Check that the file exists and that you can read it.".to_owned()
@@ -525,7 +525,7 @@ impl Error {
                 "Retry in a moment, close transaction handles that are no longer needed, or raise the pool size.".to_owned()
             }
             Self::AuditDegraded { detail, .. } => {
-                format!("Fix the audit log ({detail}); calls resume on their own once a line can be written. Reads still run.")
+                format!("Fix the audit log ({detail}); calls resume on their own once a line can be written.")
             }
             Self::ServerNotReady { .. } => {
                 "Start `ownpg serve --http`, or point --bind or OWNPG_BIND at the address it listens on; a 503 answer names the part that is not ready.".to_owned()

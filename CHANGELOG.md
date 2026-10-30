@@ -6,6 +6,17 @@ The format follows [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/
 
 ## [Unreleased]
 
+### Added
+
+- `tools/smoke.sh` probes a running HTTP server: the two health routes, the MCP handshake, and `tools/list`, reading `OWNPG_BEARER_TOKENS` when the server wants a token.
+- `tools/check-suppressions.py` fails the gate when a `deny.toml` suppression has no recheck date or has passed it.
+- `.gitleaks.toml`, the shared scan configuration the pre-commit hook and the gate both read.
+
+### Changed
+
+- `tools/release.sh` pushes the container image to `ghcr.io/devops-infinity/ownpg` under the version and `latest`, as `linux/amd64`, beside the crates, npm, Homebrew, and GitHub release steps. `OWNPG_SKIP_CONTAINER=1` skips it on a host without docker or without a `ghcr.io` login.
+- `tools/verify.sh` gains the steps it was missing: the MSRV check against Rust 1.89, the suppression recheck dates, the manifest versions against `Cargo.toml`, the 80 percent coverage floor, and a secret scan of the tree and of the commit history.
+
 ## [0.1.2] - 2026-09-24
 
 ### Added

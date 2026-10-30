@@ -838,6 +838,30 @@ publish_npm_package() {
 	say SUCCESS "npm package published"
 }
 
+publish_container_image() {
+	local image="ghcr.io/devops-infinity/$BIN_CRATE" log
+	if [[ "${OWNPG_SKIP_CONTAINER:-0}" == "1" ]]; then
+		say INFO "OWNPG_SKIP_CONTAINER=1; no container image is pushed"
+		return 0
+	fi
+	if ! command -v docker >/dev/null 2>&1; then
+		say WARNING "docker is not installed, so no container image was pushed; run the build on a host that has docker, or set OWNPG_SKIP_CONTAINER=1 to silence this"
+		return 0
+	fi
+	STEP="container image"
+	log="$(log_path_for "container image")"
+	if ! docker buildx build --platform linux/amd64 \
+		--build-arg OWNPG_VERSION="$VERSION" \
+		--build-arg OWNPG_BUILD_COMMIT="$(git rev-parse HEAD)" \
+		--build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+		-t "$image:$VERSION" -t "$image:latest" --push . >"$log" 2>&1; then
+		say INFO "last 40 lines of output:"
+		tail -n 40 "$log" >&2
+		die "the container image push failed for $image:$VERSION; run docker login ghcr.io and retry, or set OWNPG_SKIP_CONTAINER=1"
+	fi
+	say SUCCESS "container image published to $image:$VERSION and $image:latest"
+}
+
 mcpb_platform() {
 	case "$1" in
 	aarch64-apple-darwin) printf 'darwin arm64\n' ;;
@@ -1398,5 +1422,8 @@ publish_homebrew_formula
 
 step "npm package"
 publish_npm_package
+
+step "container image"
+publish_container_image
 
 say SUCCESS "released $VERSION"

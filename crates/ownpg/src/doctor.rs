@@ -334,12 +334,21 @@ async fn run_connected_checks(
     let audit_path = match audit_probe(settings) {
         Ok(path) => {
             checks.push(match &path {
-                Some(path) => check(
-                    "audit",
-                    CheckStatus::Ok,
-                    false,
-                    format!("writable at {}", path.display()),
-                ),
+                Some(path) => {
+                    let directory = path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .map_or_else(|| path.as_path(), |parent| parent);
+                    check(
+                        "audit",
+                        CheckStatus::Ok,
+                        false,
+                        format!(
+                            "writable in {}; the running server writes its own file there",
+                            directory.display()
+                        ),
+                    )
+                }
                 None => check("audit", CheckStatus::Warning, false, "off"),
             });
             path
