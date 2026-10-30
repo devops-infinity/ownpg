@@ -717,22 +717,37 @@ pub async fn serve(
     stop.cancel();
     limiter_sweeper.abort();
     drop(listener);
+    let mut second_signal = false;
     let drained = tokio::select! {
         drained = tokio::time::timeout(deadline, graceful.shutdown()) => drained.is_ok(),
         _ = shutdown_signal() => {
-            tracing::warn!("a second signal arrived; exiting at once");
-            gatekeeper.cancel.cancel();
-            return Ok(super::stdio::exit_for(reason));
+            second_signal = true;
+            false
         }
     };
-    if !drained {
+    if second_signal {
+        tracing::warn!("a second signal arrived; releasing handles and flushing the audit log now");
+    } else if !drained {
         tracing::warn!(
             "in-flight calls did not finish within {} ms; closing them",
             deadline.as_millis()
         );
     }
     gatekeeper.cancel.cancel();
-    gatekeeper.server.shutdown().await;
+    let teardown = if second_signal {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(10)
+    };
+    if tokio::time::timeout(teardown, gatekeeper.server.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "the audited teardown did not finish within {} seconds",
+            teardown.as_secs()
+        );
+    }
     Ok(super::stdio::exit_for(reason))
 }
 

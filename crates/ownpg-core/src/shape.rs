@@ -290,8 +290,15 @@ impl ResultSet {
         }
         if self.truncated {
             footer.push_str(match self.truncated_by {
-                Some(Truncation::Bytes) => " (truncated by the byte cap)",
-                Some(Truncation::Cells) => " (truncated by the cell cap)",
+                Some(Truncation::Bytes) => {
+                    " (truncated by the byte cap; raise byte_cap or select fewer columns)"
+                }
+                Some(Truncation::Cells) => {
+                    " (truncated by the cell cap; select that column in parts)"
+                }
+                Some(Truncation::Rows) if self.cursor.is_none() => {
+                    " (truncated by the row cap; raise row_cap up to 1000, or narrow the query)"
+                }
                 _ => " (truncated by the row cap)",
             });
         }
@@ -567,6 +574,39 @@ mod tests {
         let result = collector.finish(None, None);
         assert_eq!(result.row_count, 1);
         assert_eq!(result.truncated_by, Some(Truncation::Bytes));
+    }
+
+    #[test]
+    fn every_truncation_names_a_way_to_get_the_rest() {
+        let caps = Caps {
+            row_cap: 1,
+            byte_cap: 1_000,
+            cell_cap: CELL_CAP_BYTES,
+        };
+        let mut collector = Collector::new(vec![column("a")]);
+        assert!(collector.push(caps, vec![Some("1".to_owned())]));
+        assert!(!collector.push(caps, vec![Some("2".to_owned())]));
+        let rows = collector.finish(None, None);
+        assert!(rows.render_text().contains("raise row_cap up to 1000"));
+
+        let mut paged = Collector::new(vec![column("a")]);
+        assert!(paged.push(caps, vec![Some("1".to_owned())]));
+        assert!(!paged.push(caps, vec![Some("2".to_owned())]));
+        let paged = paged.finish(Some("abc".to_owned()), None);
+        let paged_text = paged.render_text();
+        assert!(paged_text.contains("pass cursor abc"));
+        assert!(!paged_text.contains("raise row_cap"));
+
+        let tight = Caps {
+            row_cap: 10,
+            byte_cap: 12,
+            cell_cap: CELL_CAP_BYTES,
+        };
+        let mut bytes = Collector::new(vec![column("a")]);
+        assert!(bytes.push(tight, vec![Some("12345".to_owned())]));
+        assert!(!bytes.push(tight, vec![Some("67890".to_owned())]));
+        let bytes = bytes.finish(None, None);
+        assert!(bytes.render_text().contains("raise byte_cap"));
     }
 
     #[test]

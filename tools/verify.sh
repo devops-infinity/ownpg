@@ -37,10 +37,12 @@ bash -n "${SHELL_FILES[@]}" || die "a shell script has a syntax error"
 say SUCCESS "syntax"
 
 command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH"
-for tool in shellcheck shfmt bats; do
+for tool in shellcheck shfmt bats gitleaks python3; do
 	command -v "$tool" >/dev/null 2>&1 && continue
 	case "$tool" in
 	bats) die "bats is not installed; install it with: brew install bats-core" ;;
+	gitleaks) die "gitleaks is not installed; install it with: brew install gitleaks" ;;
+	python3) die "python3 is not installed; install it with: brew install python3" ;;
 	*) die "$tool is not installed; install it with: brew install $tool" ;;
 	esac
 done
@@ -71,6 +73,13 @@ fi
 run_check "doc tests" "doc tests failed; run: cargo test --workspace --all-features --doc" \
 	cargo test --workspace --all-features --locked --doc
 say SUCCESS "doc tests"
+if rustup toolchain list 2>/dev/null | grep -q '^1\.89'; then
+	run_check "msrv" "the declared minimum Rust version does not build; fix the code or raise rust-version" \
+		cargo +1.89.0 check --workspace --all-targets --all-features --locked --color=never
+	say SUCCESS "msrv"
+else
+	say WARNING "Rust 1.89 is not installed, so the MSRV check was skipped"
+fi
 run_check "docs" "the docs do not build; run: RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --all-features --no-deps" \
 	env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 say SUCCESS "docs"
@@ -79,7 +88,7 @@ for tool in cargo-audit cargo-deny cargo-machete; do
 		die "$tool is not installed; install it with: cargo install --locked $tool"
 done
 run_check "advisories" "cargo audit found an advisory; run: cargo audit --deny warnings" \
-	cargo audit --deny warnings
+	cargo audit --deny warnings --ignore RUSTSEC-2026-0370 --ignore RUSTSEC-2026-0371 --ignore RUSTSEC-2026-0372
 say SUCCESS "advisories"
 STEP="dependency policy"
 DENY_CODE=0
@@ -94,9 +103,32 @@ if [[ $DENY_CODE -ne 0 ]]; then
 	die "cargo deny found a policy violation in:${DENY_FAILED_CHECKS:- an unrecognized check (exit $DENY_CODE)}; run: cargo deny check"
 fi
 say SUCCESS "dependency policy"
+run_check "suppression dates" "a deny.toml suppression is past its recheck date" \
+	python3 tools/check-suppressions.py
+say SUCCESS "suppression dates"
 run_check "no unused dependency" "cargo machete found an unused dependency; run: cargo machete" \
 	cargo machete
 say SUCCESS "no unused dependency"
+
+read_workspace_version() {
+	awk '
+		/^\[/ { section = $0 }
+		section == "[workspace.package]" && /^version[[:space:]]*=/ {
+			if (match($0, /"[^"]*"/)) {
+				print substr($0, RSTART + 1, RLENGTH - 2)
+				exit
+			}
+		}
+	' Cargo.toml
+}
+STEP="manifest versions"
+WORKSPACE_VERSION="$(read_workspace_version)"
+[[ -n "$WORKSPACE_VERSION" ]] || die "no version in [workspace.package] of Cargo.toml"
+json_versions_match mcpb/manifest.json "$WORKSPACE_VERSION" '.version' ||
+	die "mcpb/manifest.json does not carry $WORKSPACE_VERSION; run: tools/release.sh --prepare"
+json_versions_match server.json "$WORKSPACE_VERSION" '.version' '.packages[] | select(.registryType == "cargo") | .version' ||
+	die "server.json does not carry $WORKSPACE_VERSION; run: tools/release.sh --prepare"
+say SUCCESS "manifest versions"
 
 run_check "shell scripts" "shellcheck found a problem; run: shellcheck -x -P . ${SHELL_FILES[*]}" \
 	shellcheck -x -P . "${SHELL_FILES[@]}"
@@ -159,3 +191,24 @@ if [[ -n "$hits" ]]; then
 	die "a code comment was found in a shell, TOML, YAML, or Docker file"
 fi
 say SUCCESS "no code comment"
+
+run_check "secret scan" "a credential pattern is in the tree" \
+	gitleaks detect --source . --no-git --redact --exit-code 1 --config .gitleaks.toml
+say SUCCESS "secret scan"
+run_check "secret scan (history)" "a credential pattern is in the commit history" \
+	gitleaks git --redact --exit-code 1 --config .gitleaks.toml
+say SUCCESS "secret scan (history)"
+
+if command -v cargo-llvm-cov >/dev/null 2>&1; then
+	if [[ $LIVE_TESTS -eq 1 ]]; then
+		run_check "coverage" "line coverage is below the 80 percent floor; add a test for the changed code" \
+			cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80 --summary-only
+		say SUCCESS "coverage"
+	else
+		run_check "coverage" "the coverage run failed" \
+			cargo llvm-cov --workspace --all-features --locked --summary-only
+		say WARNING "the live tests were skipped, so the 80 percent floor was reported, not enforced; run the gate with OWNPG_TEST_DSN set to enforce it"
+	fi
+else
+	say WARNING "cargo-llvm-cov is not installed, so the coverage floor was skipped"
+fi

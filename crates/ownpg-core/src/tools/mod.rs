@@ -215,18 +215,24 @@ fn summary_text(structured: &serde_json::Value, text: String) -> String {
             format!("{rows} rows")
         });
     }
-    if structured
+    let truncated = structured
         .get("truncated")
         .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
+        == Some(true);
+    if truncated {
         parts.push("more remain".to_owned());
     }
     if let Some(cursor) = structured.get("cursor").and_then(serde_json::Value::as_str) {
         parts.push(format!("next page cursor {cursor}"));
     }
     if parts.is_empty() {
-        "The full result is in structuredContent.".to_owned()
+        return "The full result is in structuredContent.".to_owned();
+    }
+    if truncated {
+        format!(
+            "{}. The full result is not in this text; structuredContent holds this page only.",
+            parts.join(", ")
+        )
     } else {
         format!(
             "{}. The full result is in structuredContent.",
@@ -497,9 +503,19 @@ mod tests {
         let summary = output(100, Some("c1")).into_call_result(ResultText::Summary);
         assert_eq!(
             text_of(&summary),
-            "100 rows, more remain, next page cursor c1. The full result is in structuredContent."
+            "100 rows, more remain, next page cursor c1. The full result is not in this text; structuredContent holds this page only."
         );
         assert_eq!(summary.structured_content.unwrap()["row_count"], 100);
+        let cut = output(60, None);
+        let cut = ToolOutput {
+            structured: serde_json::json!({"row_count": 60, "truncated": true}),
+            ..cut
+        }
+        .into_call_result(ResultText::Summary);
+        assert_eq!(
+            text_of(&cut),
+            "60 rows, more remain. The full result is not in this text; structuredContent holds this page only."
+        );
         let one = output(60, None);
         let one = ToolOutput {
             structured: serde_json::json!({"row_count": 1, "truncated": false}),

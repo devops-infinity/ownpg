@@ -1,6 +1,6 @@
 # Releasing OwnPG
 
-This is the checklist for shipping an OwnPG release from the maintainer's Mac. One release puts the same version on crates.io, on the GitHub release pages of `devops-infinity/ownpg` and `devops-infinity/ownpg-releases`, in the Homebrew tap, on npm, and in the MCP Registry. `tools/release.sh` does all of it except the MCP Registry, which you publish by hand at the end.
+This is the checklist for shipping an OwnPG release from the maintainer's Mac. One release puts the same version on crates.io, on the GitHub release pages of `devops-infinity/ownpg` and `devops-infinity/ownpg-releases`, in the Homebrew tap, on npm, in the container registry, and in the MCP Registry. `tools/release.sh` does all of it except the MCP Registry, which you publish by hand at the end.
 
 A release takes about an hour. Most of that is building the eight prebuilt binaries.
 
@@ -37,6 +37,7 @@ Do this once per machine. `tools/release.sh` checks these before it publishes an
 
 - crates.io: run `cargo login` with a token from an account that owns both `ownpg-core` and `ownpg`. `CARGO_REGISTRY_TOKEN` in the environment works too.
 - GitHub: run `gh auth login` with push access to `devops-infinity/ownpg`, `devops-infinity/ownpg-releases`, and `devops-infinity/homebrew-tap`.
+- Container registry: run `docker login ghcr.io` with a token that carries `write:packages` for this account, so the release can push the image. A host without docker, or without that login, skips the image step when `OWNPG_SKIP_CONTAINER=1` is set.
 - Signed tags: when `user.signingkey` is set in your git config, the release tag is signed. Without it, the tag is annotated but unsigned.
 - minisign: the release signs `sha256.sum` with the secret key at `~/.minisign/minisign.key`. The key has no password, so the release runs unattended. Its public key is `minisign.pub` at the repository root (key ID `E60F7CB18005C98F`), and the README prints it for users. Keep a copy of the secret key in your password manager. If it's ever lost, make a new pair with `minisign -G -W -p ~/.minisign/minisign.pub -s ~/.minisign/minisign.key`, then commit the new `minisign.pub` and update the key in the README.
 - npm: `~/.npmrc` holds a granular access token for `@devops-infinity/ownpg`, with read and write access and "Bypass two-factor authentication" checked. `npm whoami` should print `sharkar`. Running `npm login` replaces that token, and the next release then stops at the npm check, so put a new bypass token back in `~/.npmrc` after any `npm login`. Renew it before it expires.
@@ -80,7 +81,7 @@ The script asks you to type the version before it publishes. Add `--yes` to skip
 5. Tag `vX.Y.Z` and push the tag. `main` itself isn't pushed.
 6. Build the eight binaries with dist, run the macOS one as a check, pack six MCPB bundles, and sign `sha256.sum`.
 7. Write `target/distrib/server.json` for the MCP Registry.
-8. Create the GitHub release on both repositories, push the Homebrew formula, and publish the npm package.
+8. Create the GitHub release on both repositories, push the Homebrew formula, publish the npm package, and push the container image to `ghcr.io` under the version and `latest`. The image is `linux/amd64` only. Set `OWNPG_SKIP_CONTAINER=1` when the release runs on a host without docker or without a `ghcr.io` login, and push the image from the host that has both.
 
 It ends with `released X.Y.Z`.
 
@@ -109,9 +110,12 @@ npm view @devops-infinity/ownpg version --color=false
 curl -s "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.devops-infinity/ownpg&version=latest" | jq -r '.servers[].server.version'
 curl -sL https://raw.githubusercontent.com/devops-infinity/homebrew-tap/main/Formula/ownpg.rb | grep 'version "'
 gh release view --repo devops-infinity/ownpg-releases --json tagName --jq .tagName
+docker buildx imagetools inspect ghcr.io/devops-infinity/ownpg:X.Y.Z
 ```
 
 Each one should print the new version. npm's public side can lag a few minutes behind the publish.
+
+After a deployment, `tools/smoke.sh [base-url]` probes the running server: `/healthz/live`, `/healthz/ready`, the MCP handshake, and `tools/list`. It reads `OWNPG_BEARER_TOKENS` when the server runs with `--auth bearer`, and it defaults to `http://127.0.0.1:8765`.
 
 ## When something goes wrong
 
