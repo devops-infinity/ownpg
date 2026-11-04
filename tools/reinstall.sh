@@ -11,6 +11,7 @@ INSTALL_DIR="${OWNPG_INSTALL_DIR:-$HOME/.local/bin}"
 SKIP_GATE=0
 FULL_CLEAN=0
 KEEP_BUILD=0
+PRUNE_ONLY=0
 STALE_DAYS="${OWNPG_STALE_DAYS:-7}"
 KEEP_INCREMENTAL=8
 BUILD_DIR=""
@@ -26,6 +27,7 @@ Usage: tools/reinstall.sh [options]
   --full-clean      empty target/ first, so the next build starts cold
   --keep-build      leave target/ alone this run
   --stale-days <n>  drop unused build data older than this (default 7)
+  --prune-only      drop stale build data and exit without building
   -h, --help        show this
 
 Every run drops stale and orphaned build data from target/ and says how much
@@ -65,6 +67,10 @@ while [[ $# -gt 0 ]]; do
 		[[ $# -ge 2 ]] || die "--stale-days needs a number of days"
 		STALE_DAYS="$2"
 		shift 2
+		;;
+	--prune-only)
+		PRUNE_ONLY=1
+		shift
 		;;
 	-h | --help)
 		usage
@@ -374,6 +380,10 @@ if [[ $FULL_CLEAN -eq 1 || $KEEP_BUILD -eq 0 ]]; then
 	clean_build_dir
 else
 	say INFO "leaving target/ alone"
+fi
+
+if [[ $PRUNE_ONLY -eq 1 ]]; then
+	exit 0
 fi
 
 if [[ $SKIP_GATE -eq 0 ]]; then
