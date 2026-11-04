@@ -405,7 +405,11 @@ async fn summary_result_text_sends_one_line_beside_the_structured_rows() {
         text.starts_with("100 rows, more remain, next page cursor "),
         "{text}"
     );
-    assert!(text.ends_with("The full result is in structuredContent."));
+    assert!(
+        text.ends_with(
+            "The full result is not in this text; structuredContent holds this page only."
+        )
+    );
     let structured = result.structured_content.unwrap();
     assert_eq!(structured["rows"].as_array().unwrap().len(), 100);
     assert!(text.contains(structured["cursor"].as_str().unwrap()));
