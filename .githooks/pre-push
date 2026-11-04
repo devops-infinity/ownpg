@@ -20,6 +20,12 @@ on_failure() {
 }
 trap on_failure EXIT
 
+if [[ -x "$REPO/tools/reinstall.sh" ]]; then
+	say INFO "pruning stale build data from target/"
+	"$REPO/tools/reinstall.sh" --prune-only ||
+		say WARNING "the build cache prune did not finish; the gate still runs"
+fi
+
 say INFO "running the pre-push verification gate"
 "$REPO/tools/verify.sh"
 say SUCCESS "pre-push checks passed"
