@@ -110,11 +110,7 @@ fn program_major(path: &str) -> Option<u32> {
         .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     text.split_whitespace()
-        .last()?
-        .split('.')
-        .next()?
-        .parse()
-        .ok()
+        .find_map(|token| token.split('.').next().and_then(|major| major.parse().ok()))
 }
 
 #[cfg(unix)]
@@ -139,6 +135,12 @@ async fn the_host_tools_dump_restore_and_report_their_programs() {
         .await
         .unwrap();
     let output_dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(output_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+    }
     let rig = rig(&scratch, Some(output_dir.path().to_path_buf())).await;
     let names = rig.names().await;
     for expected in [
